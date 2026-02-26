@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+uploads/
+venv/
+.git/
+tests/
+*.md
+agent_design/
+.next/
+.pytest_cache/
+test_*.py

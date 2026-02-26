@@ -1,0 +1,234 @@
+{
+  "template_type": "Purchase Order Template",
+  "language": "Mixed",
+  "layout_description": "The template features a prominent 'PURCHASE ORDER' title across the top (A1:L2). Key order details such as Date, Invoice, and Voyage are positioned on the right side (J4:L6). Supplier contact information is listed on the left (A7:A18). Delivery and payment terms, along with a summary total, occupy the middle-right section (F8:L18). The core of the template is a product table (A20:L32) with a two-row header (20-21) and 11 data rows (22-32). Within the product table, the 'Description' column (F:G) is merged for each data row. The table is followed by a totals section (I33:L35) for Sub Total, Tax, and Grand Total, with currency in column J and calculated values in column L. A footer message 'THANK YOU FOR YOUR BUSINESS!' spans the bottom (A37:L37).",
+  "sections": [
+    {
+      "name": "Header",
+      "row_range": "Row 1-2",
+      "description": "Main title of the document."
+    },
+    {
+      "name": "Order Details",
+      "row_range": "Row 4-6",
+      "description": "Key information about the purchase order, invoice, and voyage."
+    },
+    {
+      "name": "Supplier Information",
+      "row_range": "Row 7-18",
+      "description": "Contact details for the supplier (Merit Trading Co., Ltd.)."
+    },
+    {
+      "name": "Delivery & Payment Information",
+      "row_range": "Row 8-18",
+      "description": "Details regarding delivery date, address, payment terms, and contact person, including a displayed total."
+    },
+    {
+      "name": "Product Table",
+      "row_range": "Row 20-32",
+      "description": "Table listing all products being ordered with their details, quantities, and prices."
+    },
+    {
+      "name": "Summary Totals",
+      "row_range": "Row 33-35",
+      "description": "Calculated subtotal, tax, and grand total for the order."
+    },
+    {
+      "name": "Footer",
+      "row_range": "Row 37-37",
+      "description": "A concluding thank you message."
+    }
+  ],
+  "variables": [
+    {
+      "key": "po_date",
+      "label": "DATE：",
+      "cell": "K4",
+      "data_type": "date",
+      "sample_value": "2025-07-11",
+      "description": "The date the purchase order is issued. (Merged K4:L4)"
+    },
+    {
+      "key": "invoice_number",
+      "label": "Invoice：",
+      "cell": "K5",
+      "data_type": "string",
+      "sample_value": "20250716-02 ML",
+      "description": "The associated invoice number."
+    },
+    {
+      "key": "voyage_number",
+      "label": "Voyage：",
+      "cell": "K6",
+      "data_type": "string",
+      "sample_value": "ML-1017",
+      "description": "The voyage number for the shipment. (Merged K6:L6)"
+    },
+    {
+      "key": "delivery_date",
+      "label": "Delivery Date:",
+      "cell": "H8",
+      "data_type": "date",
+      "sample_value": "2025-07-15",
+      "description": "The requested delivery date. (Merged H8:J8)"
+    },
+    {
+      "key": "delivery_address_line1",
+      "label": "Delivery Address:",
+      "cell": "H9",
+      "data_type": "string",
+      "sample_value": "神奈川県横浜市中区海岸通り1-1-4",
+      "description": "First line of the delivery address. (Merged H9:L9)"
+    },
+    {
+      "key": "delivery_address_line2",
+      "label": null,
+      "cell": "H10",
+      "data_type": "string",
+      "sample_value": "株式会社松武",
+      "description": "Second line of the delivery address, often company name."
+    },
+    {
+      "key": "delivery_contact",
+      "label": null,
+      "cell": "H11",
+      "data_type": "string",
+      "sample_value": "担当：Ms.トウ　080-6259-5888",
+      "description": "Contact person and phone number for delivery."
+    },
+    {
+      "key": "ship_name",
+      "label": null,
+      "cell": "I12",
+      "data_type": "string",
+      "sample_value": "船名【CELEBRITY MILLENNIUM】",
+      "description": "Name of the ship for delivery."
+    },
+    {
+      "key": "payment_terms",
+      "label": "Payment Date:",
+      "cell": "H13",
+      "data_type": "string",
+      "sample_value": "前振り込み",
+      "description": "Payment terms (e.g., 'pre-payment'). (Merged H13:J13)"
+    },
+    {
+      "key": "payment_method",
+      "label": "Payment Method:",
+      "cell": "H14",
+      "data_type": "string",
+      "sample_value": "口座振り込み",
+      "description": "Method of payment (e.g., 'bank transfer')."
+    },
+    {
+      "key": "contact_person_po",
+      "label": "担当者及び連絡先：",
+      "cell": "H15",
+      "data_type": "string",
+      "sample_value": "邢　080-4311-1145",
+      "description": "Contact person and phone number for the purchase order. (Merged H15:J15)"
+    },
+    {
+      "key": "displayed_grand_total",
+      "label": "TOTAL:",
+      "cell": "H16",
+      "data_type": "number",
+      "sample_value": null,
+      "description": "The grand total amount displayed in the summary section. This is a calculated field.",
+      "formula": "=L35"
+    }
+  ],
+  "product_table": {
+    "header_rows": "Row 20-21",
+    "data_start_row": 22,
+    "template_rows": 11,
+    "columns": [
+      {
+        "col_letter": "A",
+        "header": "NO.",
+        "key": "row_number",
+        "data_type": "number",
+        "description": "Sequential row number for each product item."
+      },
+      {
+        "col_letter": "B",
+        "header": "PO No.",
+        "key": "po_line_item_number",
+        "data_type": "string",
+        "description": "Purchase order line item number."
+      },
+      {
+        "col_letter": "C",
+        "header": "Code",
+        "key": "product_code",
+        "data_type": "string",
+        "description": "Supplier product code or SKU."
+      },
+      {
+        "col_letter": "D",
+        "header": "English",
+        "key": "product_name_english",
+        "data_type": "string",
+        "description": "Product name in English."
+      },
+      {
+        "col_letter": "E",
+        "header": "Local Name",
+        "key": "product_name_local",
+        "data_type": "string",
+        "description": "Product name in the local language (Japanese)."
+      },
+      {
+        "col_letter": "F",
+        "header": "Description (Details)",
+        "key": "product_description",
+        "data_type": "string",
+        "description": "Detailed description or specifications of the product.",
+        "merged_cells_in_data_row": "F{row}:G{row}"
+      },
+      {
+        "col_letter": "H",
+        "header": "Quantity (Qty)",
+        "key": "quantity",
+        "data_type": "number",
+        "description": "Quantity of the product ordered."
+      },
+      {
+        "col_letter": "I",
+        "header": "Unit of Measure",
+        "key": "unit_of_measure",
+        "data_type": "string",
+        "description": "Unit of measure for the quantity (e.g., CT for carton, EA for each)."
+      },
+      {
+        "col_letter": "J",
+        "header": "Currency",
+        "key": "currency",
+        "data_type": "string",
+        "description": "Currency for the unit price (e.g., JPY)."
+      },
+      {
+        "col_letter": "K",
+        "header": "Unit Price",
+        "key": "unit_price",
+        "data_type": "number",
+        "description": "Price per unit of the product."
+      },
+      {
+        "col_letter": "L",
+        "header": "Amount",
+        "key": "amount",
+        "data_type": "number",
+        "description": "Calculated total amount for the line item (Quantity * Unit Price).",
+        "formula": "=H{row}*K{row}"
+      }
+    ],
+    "totals": {
+      "subtotal_row": 33,
+      "tax_row": 34,
+      "grand_total_row": 35,
+      "tax_rate": 0.08,
+      "formula_column": "L"
+    }
+  }
+}

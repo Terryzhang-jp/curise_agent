@@ -1,0 +1,329 @@
+{
+  "template_type": "Purchase Order Template",
+  "language": "Mixed (Japanese/English)",
+  "layout_description": "The template is structured with a main title 'PURCHASE ORDER' spanning A1:L1, followed by a subtitle 'CELEBRITY MILLENNIUM［OSAKA］' in A2:L2. The main body is divided into two conceptual columns. The left column (A-E) contains fixed supplier and buyer information (A4-A8 for supplier, A13-A18 for buyer). The right column (F-L) contains order-specific details like DATE, Invoice, Voyage, Delivery Date, Delivery Address, Payment terms, and contact information (J4-L4, J5-K5, J6-L6, F8-K8, F9-L12, F13-J15). Key merged cells in this section include K4:L4 (DATE value), K6:L6 (Voyage value), F8:G8 (Delivery Date label), H8:J8 (Delivery Date value), F9:G9 (Delivery Address label), H9:L9 (Delivery Address value), F13:G13 (Payment Date label), H13:J13 (Payment Date value), F15:G15 (Contact label), H15:J15 (Contact value). A 'TOTAL:' label is in F16:G18, with its value in H16:J18, which is a display of the grand total. The product table starts at Row 20. Its headers span two rows (20-21) with significant merged cells: A20:A21 (NO.), B20:B21 (PO No.), C20:E20 (Product（商品名）), F20:G20 (Description), H20:I20 (Quantity), J20:K20 (Unit price), L20:L21 (Amount(JPY)). Sub-headers for Product and Description are in row 21. The product data rows start from row 22. The totals section (Sub Total, Tax, GRAND TOTAL) is located in rows 33-35, with labels in column I, currency in J, and calculated values in column L. A footer message 'THANK YOU FOR YOUR BUSINESS!' is merged across A37:L37.",
+  "sections": [
+    {
+      "name": "Header",
+      "row_range": "Row 1-2",
+      "description": "Main title and subtitle of the purchase order."
+    },
+    {
+      "name": "Supplier Information",
+      "row_range": "Row 4-8",
+      "description": "Details of the supplier, including name, address, and contact information. These are typically fixed for a template instance but can be configured."
+    },
+    {
+      "name": "Buyer Information",
+      "row_range": "Row 13-18",
+      "description": "Details of the buyer, including name, address, and contact information. These are typically fixed for a template instance but can be configured."
+    },
+    {
+      "name": "Order & Delivery Details",
+      "row_range": "Row 4-15",
+      "description": "Specifics of the order such as date, invoice number, voyage, delivery date and address, payment terms, and contact persons. This section is primarily on the right side of the template."
+    },
+    {
+      "name": "Product Table",
+      "row_range": "Row 20-32",
+      "description": "Table listing all products being ordered, including product codes, descriptions, quantities, unit prices, and calculated amounts."
+    },
+    {
+      "name": "Totals",
+      "row_range": "Row 33-35",
+      "description": "Summary of costs including subtotal, tax, and grand total."
+    },
+    {
+      "name": "Footer",
+      "row_range": "Row 37",
+      "description": "A concluding thank you message."
+    }
+  ],
+  "variables": [
+    {
+      "key": "supplier_name",
+      "label": "タカナシ販売株式会社　横浜営業所",
+      "cell": "A4",
+      "data_type": "string",
+      "sample_value": "タカナシ販売株式会社　横浜営業所",
+      "description": "Name of the supplier. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "supplier_postal_code",
+      "label": "〒224-0042",
+      "cell": "A5",
+      "data_type": "string",
+      "sample_value": "〒224-0042",
+      "description": "Postal code of the supplier. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "supplier_address",
+      "label": "横浜市都筑区大熊町１０５－２",
+      "cell": "A6",
+      "data_type": "string",
+      "sample_value": "横浜市都筑区大熊町１０５－２",
+      "description": "Address of the supplier. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "supplier_phone",
+      "label": "TEL:045-472-9171",
+      "cell": "A7",
+      "data_type": "string",
+      "sample_value": "TEL:045-472-9171",
+      "description": "Phone number of the supplier. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "supplier_fax",
+      "label": "FAX: 0445-472-6365",
+      "cell": "A8",
+      "data_type": "string",
+      "sample_value": "FAX: 0445-472-6365",
+      "description": "Fax number of the supplier. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "buyer_name",
+      "label": "株式会社メリットトレーディング",
+      "cell": "A13",
+      "data_type": "string",
+      "sample_value": "株式会社メリットトレーディング",
+      "description": "Name of the buyer. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "buyer_postal_code",
+      "label": "〒900-0003",
+      "cell": "A14",
+      "data_type": "string",
+      "sample_value": "〒900-0003",
+      "description": "Postal code of the buyer. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "buyer_address",
+      "label": "沖縄県那覇市安謝1-2-21 アーバンウエスト秋桜201",
+      "cell": "A15",
+      "data_type": "string",
+      "sample_value": "沖縄県那覇市安謝1-2-21 アーバンウエスト秋桜201",
+      "description": "Address of the buyer. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "buyer_phone",
+      "label": "TEL:098-917-2295",
+      "cell": "A16",
+      "data_type": "string",
+      "sample_value": "TEL:098-917-2295",
+      "description": "Phone number of the buyer. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "buyer_fax",
+      "label": "FAX:098-917-2296",
+      "cell": "A17",
+      "data_type": "string",
+      "sample_value": "FAX:098-917-2296",
+      "description": "Fax number of the buyer. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "buyer_email",
+      "label": "E-mail:cruise.merit@gmail.com",
+      "cell": "A18",
+      "data_type": "string",
+      "sample_value": "E-mail:cruise.merit@gmail.com",
+      "description": "Email address of the buyer. Typically fixed for a template instance but can be changed."
+    },
+    {
+      "key": "order_date",
+      "label": "DATE：",
+      "cell": "K4",
+      "data_type": "date",
+      "sample_value": "2025-07-11",
+      "description": "Date the purchase order was issued."
+    },
+    {
+      "key": "invoice_number",
+      "label": "Invoice：",
+      "cell": "K5",
+      "data_type": "string",
+      "sample_value": "20250716-02 ML",
+      "description": "Invoice number for this order."
+    },
+    {
+      "key": "voyage_number",
+      "label": "Voyage：",
+      "cell": "K6",
+      "data_type": "string",
+      "sample_value": "ML-1017",
+      "description": "Voyage number associated with the delivery."
+    },
+    {
+      "key": "delivery_date",
+      "label": "Delivery Date:",
+      "cell": "H8",
+      "data_type": "date",
+      "sample_value": "2025-07-15",
+      "description": "Requested delivery date."
+    },
+    {
+      "key": "delivery_time_notes",
+      "label": "(Delivery Time Notes)",
+      "cell": "K8",
+      "data_type": "string",
+      "sample_value": "[午前中]厳守",
+      "description": "Specific delivery time instructions (e.g., 'morning strict adherence')."
+    },
+    {
+      "key": "delivery_address_line1",
+      "label": "Delivery Address:",
+      "cell": "H9",
+      "data_type": "string",
+      "sample_value": "神奈川県横浜市中区海岸通り1-1-4",
+      "description": "First line of the delivery address."
+    },
+    {
+      "key": "delivery_address_company",
+      "label": "(Delivery Company)",
+      "cell": "H10",
+      "data_type": "string",
+      "sample_value": "株式会社松武",
+      "description": "Company name at the delivery address."
+    },
+    {
+      "key": "delivery_contact_person",
+      "label": "(Delivery Contact)",
+      "cell": "H11",
+      "data_type": "string",
+      "sample_value": "担当：Ms.トウ　080-6259-5888",
+      "description": "Contact person and phone number for delivery."
+    },
+    {
+      "key": "vessel_name",
+      "label": "(Vessel Name)",
+      "cell": "I12",
+      "data_type": "string",
+      "sample_value": "船名【CELEBRITY MILLENNIUM】",
+      "description": "Name of the vessel for which the order is intended."
+    },
+    {
+      "key": "payment_date_terms",
+      "label": "Payment Date:",
+      "cell": "H13",
+      "data_type": "string",
+      "sample_value": "前振り込み",
+      "description": "Payment terms regarding date (e.g., 'pre-payment')."
+    },
+    {
+      "key": "payment_method",
+      "label": "Payment Method:",
+      "cell": "H14",
+      "data_type": "string",
+      "sample_value": "口座振り込み",
+      "description": "Method of payment (e.g., 'bank transfer')."
+    },
+    {
+      "key": "buyer_contact_person",
+      "label": "担当者及び連絡先：",
+      "cell": "H15",
+      "data_type": "string",
+      "sample_value": "邢　080-4311-1145",
+      "description": "Contact person and phone number for the buyer."
+    }
+  ],
+  "product_table": {
+    "header_rows": "Row 20-21",
+    "data_start_row": 22,
+    "template_rows": 11,
+    "columns": [
+      {
+        "col_letter": "A",
+        "header": "NO.",
+        "key": "row_number",
+        "data_type": "number",
+        "description": "Sequential number for each product item."
+      },
+      {
+        "col_letter": "B",
+        "header": "PO No.",
+        "key": "product_po_number",
+        "data_type": "string",
+        "sample_value": "68222927",
+        "description": "Purchase order number specific to the product item."
+      },
+      {
+        "col_letter": "C",
+        "header": "商品コード",
+        "key": "product_code",
+        "data_type": "string",
+        "sample_value": "99PRD010783",
+        "description": "Internal product code."
+      },
+      {
+        "col_letter": "D",
+        "header": "英語表記",
+        "key": "product_name_english",
+        "data_type": "string",
+        "sample_value": "CHEESEAMERICAN SLICED",
+        "description": "Product name in English."
+      },
+      {
+        "col_letter": "E",
+        "header": "日本語表記",
+        "key": "product_name_japanese",
+        "data_type": "string",
+        "sample_value": "雪印チェダースライスチーズ75",
+        "description": "Product name in Japanese."
+      },
+      {
+        "col_letter": "F",
+        "header": "（詳細）",
+        "key": "product_description",
+        "data_type": "string",
+        "sample_value": "378*24EA/CT",
+        "description": "Detailed description or specifications of the product."
+      },
+      {
+        "col_letter": "H",
+        "header": "(数量)",
+        "key": "quantity",
+        "data_type": "number",
+        "sample_value": 16,
+        "description": "Quantity of the product ordered."
+      },
+      {
+        "col_letter": "I",
+        "header": "(Unit of Measure)",
+        "key": "unit_of_measure",
+        "data_type": "string",
+        "sample_value": "CT",
+        "description": "Unit of measure for the quantity (e.g., CT for carton). This column has no explicit header but contains unit values."
+      },
+      {
+        "col_letter": "J",
+        "header": "通貨",
+        "key": "currency",
+        "data_type": "string",
+        "sample_value": "JPY",
+        "description": "Currency for the unit price."
+      },
+      {
+        "col_letter": "K",
+        "header": "単価",
+        "key": "unit_price",
+        "data_type": "number",
+        "sample_value": 14112,
+        "description": "Unit price of the product."
+      },
+      {
+        "col_letter": "L",
+        "header": "Amount(JPY)",
+        "key": "amount",
+        "data_type": "number",
+        "formula": "=H{row}*K{row}",
+        "description": "Calculated total amount for the product item (Quantity * Unit Price)."
+      }
+    ],
+    "totals": {
+      "subtotal_row": 33,
+      "tax_row": 34,
+      "grand_total_row": 35,
+      "tax_rate": 0.08,
+      "formula_column": "L"
+    }
+  }
+}
