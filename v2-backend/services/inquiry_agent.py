@@ -1,680 +1,1125 @@
 """
-Agentic Inquiry Generator — uses ReActAgent engine with tools for smart inquiry generation.
+Inquiry Generator v6.2 — Single LLM call + deterministic code enforcement.
 
-Tools available to the agent:
-1. get_order_metadata — view order data
-2. list_templates — see available templates
-3. select_template — pick the best template
-4. map_fields — build field mapping (code-first + AI fallback)
-5. fill_and_generate — fill template and generate Excel
-6. review_result — self-review the filled Excel
-7. apply_fix — apply a review fix and regenerate
+Replaces the multi-turn ReActAgent approach (v5) with:
+1. Single Gemini JSON-mode call for semantic field mapping (~2s)
+2. Deterministic enforce_annotation() for format correctness
+3. Code-driven workbook write + formula rebuild + save
 
-The agent decides the path:
-- Simple case (exact match): select → fill → done (~2s)
-- Complex case (mismatched fields): select → map → fill → review → fix → done (~8s)
+Each supplier still gets its own thread via the orchestrator, but the per-supplier
+logic is now a straight-line function (~6 stages) instead of an agent loop.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
+import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any
 
-from services.agent.config import LLMConfig, AgentConfig, Config, load_api_key, create_provider
-from services.agent.engine import ReActAgent
-from services.agent.tool_registry import ToolRegistry, ToolDef
-from services.agent.tool_context import ToolContext
-from services.agent.storage import Session, Message, text_part, tool_result_part, finish_part
+from google import genai
+from google.genai import types
+from openpyxl import load_workbook as _load_workbook_raw
+
+from services.agent.config import load_api_key
 
 logger = logging.getLogger(__name__)
 
-# ─── Tool name → Chinese labels for streaming UI ──────────────
-TOOL_LABELS = {
-    "get_order_metadata": "读取订单数据",
-    "list_templates": "查询模板列表",
-    "select_template": "选择模板",
-    "map_fields": "AI 字段映射",
-    "fill_and_generate": "生成 Excel",
-    "review_result": "AI 审查",
-    "apply_fix": "应用修复",
-    "finish_inquiry": "完成汇总",
-    "think": "思考中",
-}
 
+# ─── Pre-Analysis (no LLM, pure code) ────────────────────────
 
-# ─── Minimal in-memory Storage (no DB needed) ──────────────────
+def run_inquiry_pre_analysis(order, db) -> dict:
+    """Analyze order for inquiry generation — pure code, no LLM.
 
-class MemoryStorage:
-    """Lightweight in-memory storage for one-shot agent runs."""
-
-    def __init__(self):
-        self._sessions: dict[str, Session] = {}
-        self._messages: dict[str, list[Message]] = {}
-        self._seq: int = 0
-
-    def get_session(self, session_id: str) -> Session | None:
-        return self._sessions.get(session_id)
-
-    def create_session(self, title: str = "") -> Session:
-        sid = uuid.uuid4().hex[:12]
-        s = Session(id=sid, title=title)
-        self._sessions[sid] = s
-        self._messages[sid] = []
-        return s
-
-    def update_session(self, session_id: str, **kwargs):
-        s = self._sessions.get(session_id)
-        if s:
-            for k, v in kwargs.items():
-                setattr(s, k, v)
-
-    def list_messages(self, session_id: str, after_id: int | None = None) -> list[Message]:
-        msgs = self._messages.get(session_id, [])
-        if after_id is not None:
-            msgs = [m for m in msgs if m.id > after_id]
-        return msgs
-
-    def create_message(self, session_id: str, role: str, parts: list[dict], **kwargs) -> Message:
-        self._seq += 1
-        m = Message(id=self._seq, session_id=session_id, role=role, parts=parts,
-                    model=kwargs.get("model"))
-        self._messages.setdefault(session_id, []).append(m)
-        return m
-
-    def add_user_message(self, session_id: str, text: str):
-        self.create_message(session_id, "user", [text_part(text)])
-
-    def add_assistant_message(self, session_id: str, parts: list[dict], model: str = ""):
-        self.create_message(session_id, "assistant", parts, model=model)
-
-    def stream_final_answer(self, session_id: str, parts: list[dict], text: str, model: str = ""):
-        self.add_assistant_message(session_id, parts, model=model)
-
-    def update_token_usage(self, session_id: str, prompt: int, completion: int):
-        pass
-
-
-# ─── Tool Registration ─────────────────────────────────────────
-
-def _create_inquiry_tools(
-    registry: ToolRegistry,
-    order,  # Order ORM object
-    db,  # SQLAlchemy session
-):
-    """Register inquiry-specific tools. Closure pattern captures order + db."""
+    Groups products by supplier, resolves templates, checks data completeness.
+    Returns dict to be stored as order.inquiry_data.
+    """
     from models import SupplierTemplate
-    from sqlalchemy import text as sql_text
+    import sqlalchemy
 
-    # Shared state across tools
-    state: dict[str, Any] = {
-        "selected_templates": {},  # supplier_id -> (template, method)
-        "field_mappings": {},  # supplier_id -> mapping dict
-        "generated_files": [],  # final results
+    match_results = order.match_results or []
+    order_meta = order.order_metadata or {}
+
+    # Group products by supplier_id
+    products_by_supplier: dict[int, list] = {}
+    for p in match_results:
+        mp = p.get("matched_product") or {}
+        sid = mp.get("supplier_id")
+        if not sid:
+            continue
+        products_by_supplier.setdefault(sid, []).append(p)
+
+    # Load all templates
+    all_templates = db.query(SupplierTemplate).all()
+
+    # Load supplier info in one query
+    supplier_ids = list(products_by_supplier.keys())
+    supplier_rows = {}
+    if supplier_ids:
+        rows = db.execute(
+            sqlalchemy.text(
+                "SELECT id, name, contact, email, phone FROM suppliers WHERE id = ANY(:ids)"
+            ),
+            {"ids": supplier_ids},
+        ).fetchall()
+        for row in rows:
+            supplier_rows[row[0]] = {
+                "name": row[1],
+                "contact": row[2],
+                "email": row[3],
+                "phone": row[4],
+            }
+
+    # Analyze each supplier
+    suppliers = {}
+    for sid, products in products_by_supplier.items():
+        # Subtotal
+        subtotal = 0.0
+        for p in products:
+            mp = p.get("matched_product") or {}
+            qty = p.get("quantity") or 0
+            price = p.get("unit_price") or mp.get("price") or 0
+            try:
+                subtotal += float(qty) * float(price)
+            except (TypeError, ValueError):
+                pass
+
+        # Template resolution
+        template, method, candidates = resolve_template(sid, all_templates)
+        template_info = None
+        if method == "exact" and template:
+            template_info = {"id": template.id, "name": template.template_name, "method": "exact"}
+        elif candidates:
+            template_info = {"method": "candidates", "count": len(candidates)}
+        else:
+            template_info = {"method": "generic"}
+
+        # Supplier data completeness
+        info = supplier_rows.get(sid, {})
+        missing_fields = []
+        for field in ["contact", "email", "phone"]:
+            if not info.get(field):
+                missing_fields.append(field)
+
+        suppliers[str(sid)] = {
+            "status": "pending",
+            "supplier_name": info.get("name") or f"供应商 #{sid}",
+            "product_count": len(products),
+            "subtotal": round(subtotal, 2),
+            "currency": order_meta.get("currency", ""),
+            "template": template_info,
+            "missing_fields": missing_fields if missing_fields else None,
+        }
+
+    return {
+        "status": "pre_analyzed",
+        "supplier_count": len(suppliers),
+        "total_products": len(match_results),
+        "suppliers": suppliers,
     }
 
-    order_meta = order.order_metadata or {}
-    match_results = order.match_results or []
-    upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
 
-    # ── Tool 1: get_order_metadata ──
-    def get_order_metadata(fields: str = "") -> str:
-        """查看订单的元数据和产品分组信息。"""
-        # Group by supplier
-        groups: dict[int, int] = {}
-        unassigned = 0
-        for item in match_results:
-            matched = item.get("matched_product")
-            if matched and matched.get("supplier_id"):
-                sid = matched["supplier_id"]
-                groups[sid] = groups.get(sid, 0) + 1
-            else:
-                unassigned += 1
+# ─── Pure Functions ───────────────────────────────────────────
 
-        result = {
-            "order_id": order.id,
-            "country_id": order.country_id,
-            "metadata_keys": list(order_meta.keys()),
-            "metadata": {k: str(v)[:100] for k, v in order_meta.items() if v},
-            "supplier_groups": groups,
-            "unassigned_count": unassigned,
-        }
-        return json.dumps(result, ensure_ascii=False)
+def resolve_template(supplier_id: int, all_templates: list) -> tuple[Any | None, str, list]:
+    """Resolve which template to use for a supplier.
 
-    registry.register(ToolDef(
-        name="get_order_metadata",
-        fn=get_order_metadata,
-        description="查看订单元数据和按供应商分组的产品数量",
-        parameters={"fields": {"type": "string", "description": "可选: 要查看的特定字段"}},
-        group="inquiry",
-    ))
+    Returns (template, method, candidates):
+    - Exact match found:  (template, "exact", [])
+    - No exact match:     (None, "candidates", [{id, name, country_id}, ...])
+    """
+    # Step 1: exact binding — supplier_ids array
+    for t in all_templates:
+        if t.supplier_ids and supplier_id in t.supplier_ids:
+            return t, "exact", []
 
-    # ── Tool 2: list_templates ──
-    def list_templates() -> str:
-        """列出所有可用的供应商模板。"""
-        templates = db.query(SupplierTemplate).all()
-        result = []
-        for t in templates:
-            fp = t.field_positions or {}
-            result.append({
+    # Step 2: exact binding — legacy supplier_id field
+    for t in all_templates:
+        if t.supplier_id == supplier_id:
+            return t, "exact", []
+
+    # Step 3: no exact match → return candidate list
+    candidates = []
+    for t in all_templates:
+        if t.field_positions:  # only templates with usable config
+            candidates.append({
                 "id": t.id,
-                "template_name": t.template_name,
-                "supplier_id": t.supplier_id,
+                "name": t.template_name,
                 "country_id": t.country_id,
-                "field_count": len(fp),
-                "fields": list(fp.keys()),
-                "has_file": bool(t.template_file_url),
-                "has_product_table": t.has_product_table,
             })
-        return json.dumps(result, ensure_ascii=False)
+    return None, "candidates", candidates
 
-    registry.register(ToolDef(
-        name="list_templates",
-        fn=list_templates,
-        description="列出所有供应商询价模板及其字段配置",
-        parameters={},
-        group="inquiry",
-    ))
 
-    # ── Tool 3: select_template ──
-    def select_template(supplier_id: int, reason: str = "") -> str:
-        """为指定供应商选择最佳模板。返回模板信息和匹配方式。"""
-        # Level 1: exact supplier match
-        t = db.query(SupplierTemplate).filter(
-            SupplierTemplate.supplier_id == supplier_id
-        ).first()
-        if t:
-            state["selected_templates"][supplier_id] = (t, "supplier")
-            return json.dumps({"template_id": t.id, "name": t.template_name,
-                               "method": "supplier", "fields": list((t.field_positions or {}).keys())},
-                              ensure_ascii=False)
+def _try_parse_date(val: str) -> datetime | None:
+    """Try to parse a date string from various formats.
 
-        # Level 2: country match
-        if order.country_id:
-            t = db.query(SupplierTemplate).filter(
-                SupplierTemplate.country_id == order.country_id
-            ).first()
-            if t:
-                state["selected_templates"][supplier_id] = (t, "country")
-                return json.dumps({"template_id": t.id, "name": t.template_name,
-                                   "method": "country", "fields": list((t.field_positions or {}).keys())},
-                                  ensure_ascii=False)
+    Supports: Reiwa (R8.02.23), YYYY/MM/DD, YYYY-MM-DD, Chinese 年月日,
+    ISO format, English month names, etc.
+    """
+    if not val or not val.strip():
+        return None
 
-        # Level 3: single template
-        all_t = db.query(SupplierTemplate).all()
-        if len(all_t) == 1:
-            t = all_t[0]
-            state["selected_templates"][supplier_id] = (t, "single")
-            return json.dumps({"template_id": t.id, "name": t.template_name,
-                               "method": "single", "fields": list((t.field_positions or {}).keys())},
-                              ensure_ascii=False)
-
-        # Level 4: none
-        state["selected_templates"][supplier_id] = (None, "none")
-        return json.dumps({"template_id": None, "method": "none",
-                           "message": f"没有找到匹配的模板，将使用通用格式 (共{len(all_t)}个模板)"}, ensure_ascii=False)
-
-    registry.register(ToolDef(
-        name="select_template",
-        fn=select_template,
-        description="为指定供应商选择最佳询价模板（4级回退: 供应商→国家→唯一→无）",
-        parameters={
-            "supplier_id": {"type": "integer", "description": "供应商 ID", "required": True},
-            "reason": {"type": "string", "description": "选择原因（可选）"},
-        },
-        group="inquiry",
-    ))
-
-    # ── Tool 4: map_fields ──
-    def map_fields(supplier_id: int) -> str:
-        """为指定供应商建立字段映射（精确匹配 + AI 语义映射）。"""
-        tpl_info = state["selected_templates"].get(supplier_id)
-        if not tpl_info or not tpl_info[0]:
-            return json.dumps({"error": "没有选择模板，无法映射字段"}, ensure_ascii=False)
-
-        template = tpl_info[0]
-        if not template.field_positions:
-            return json.dumps({"error": "模板没有字段配置"}, ensure_ascii=False)
-
-        from services.inquiry_bridge import build_field_mapping
-        mapping = build_field_mapping(order_meta, template.field_positions)
-        state["field_mappings"][supplier_id] = mapping
-
-        # Classify: exact vs AI-mapped
-        exact = {k: v for k, v in mapping.items() if k == v}
-        ai_mapped = {k: v for k, v in mapping.items() if k != v}
-        unmapped = [k for k in template.field_positions if k not in mapping]
-
-        return json.dumps({
-            "total_fields": len(template.field_positions),
-            "exact_match": len(exact),
-            "ai_mapped": len(ai_mapped),
-            "unmapped": len(unmapped),
-            "mapping": mapping,
-            "ai_details": ai_mapped,
-            "unmapped_fields": unmapped,
-        }, ensure_ascii=False)
-
-    registry.register(ToolDef(
-        name="map_fields",
-        fn=map_fields,
-        description="为指定供应商建立模板字段到订单元数据的映射（先精确匹配，再 AI 语义映射）",
-        parameters={
-            "supplier_id": {"type": "integer", "description": "供应商 ID", "required": True},
-        },
-        group="inquiry",
-    ))
-
-    # ── Tool 5: fill_and_generate ──
-    def fill_and_generate(supplier_id: int) -> str:
-        """填充模板并生成 Excel 文件。"""
-        from services.excel_writer import generate_inquiry_excel as gen_excel
-
-        # Guard: skip if already generated for this supplier (unless called from apply_fix)
-        existing = [f for f in state["generated_files"] if f.get("supplier_id") == supplier_id and f.get("filename")]
-        if existing:
-            return json.dumps({"status": "already_generated", "filename": existing[0]["filename"],
-                               "message": f"供应商 {supplier_id} 已生成询价单，如需重新生成请使用 apply_fix"}, ensure_ascii=False)
-
-        tpl_info = state["selected_templates"].get(supplier_id)
-        template = tpl_info[0] if tpl_info else None
-        method = tpl_info[1] if tpl_info else "none"
-        field_mapping = state["field_mappings"].get(supplier_id)
-
-        # Collect products for this supplier
-        products = []
-        for item in match_results:
-            matched = item.get("matched_product")
-            if matched and matched.get("supplier_id") == supplier_id:
-                products.append(item)
-
-        # Resolve template file
-        template_file_path = None
-        if template and template.template_file_url:
-            template_file_path = os.path.join(
-                upload_dir, os.path.basename(template.template_file_url)
-            )
-            if not os.path.exists(template_file_path):
-                template_file_path = None
-
+    # Try Reiwa format first: R8.02.23 or R8/02/23
+    reiwa_match = re.match(r"R(\d+)[./](\d+)[./](\d+)", val.strip())
+    if reiwa_match:
+        year = int(reiwa_match.group(1)) + 2018
+        month = int(reiwa_match.group(2))
+        day = int(reiwa_match.group(3))
         try:
-            excel_bytes = gen_excel(
-                template=template,
-                order_metadata=order_meta,
-                products=products,
-                supplier_id=supplier_id,
-                template_file_path=template_file_path,
-                field_mapping=field_mapping,
-            )
+            return datetime(year, month, day)
+        except ValueError:
+            pass
 
-            os.makedirs(upload_dir, exist_ok=True)
-            po_number = str(order_meta.get("po_number") or "unknown").replace("/", "_").replace("\\", "_")
-            filename = f"inquiry_{po_number}_supplier{supplier_id}_{uuid.uuid4().hex[:6]}.xlsx"
-            filepath = os.path.join(upload_dir, filename)
-            with open(filepath, "wb") as f:
-                f.write(excel_bytes)
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d", "%m/%d/%Y", "%d/%m/%Y",
+                "%Y年%m月%d日", "%B %d, %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(val.strip(), fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(val.strip())
+    except (ValueError, TypeError):
+        return None
 
-            file_info = {
-                "supplier_id": supplier_id,
-                "filename": filename,
-                "file_url": f"/uploads/{filename}",
-                "product_count": len(products),
-                "has_template": template is not None,
-                "template_name": template.template_name if template else None,
-                "template_id": template.id if template else None,
-                "selection_method": method,
-                "field_mapping": field_mapping,
+
+def enforce_annotation(value: str, annotation: str) -> str:
+    """Deterministic format enforcement based on annotation rules.
+
+    Handles 10 patterns in priority order:
+    1. 和暦 (Reiwa era dates)
+    2. YYYY/MM/DD
+    3. DD/MM/YYYY
+    4. Decimal places (小数点N位)
+    5. Integer only (整数のみ)
+    6. Uppercase (大写/大文字のみ)
+    7. Strip prefix (不含XX前缀)
+    8. Remove hyphens (ハイフンなし)
+    9. ISO 4217 currency code
+    10. Max length (N文字以内)
+    """
+    if not value or not annotation:
+        return value
+    val = str(value).strip()
+
+    # 1. 和暦 (Japanese era): "和暦表記" / "令和" → convert to R{year}.MM.DD
+    if re.search(r"和暦|令和|Reiwa", annotation, re.IGNORECASE):
+        parsed = _try_parse_date(val)
+        if parsed:
+            reiwa_year = parsed.year - 2018
+            if reiwa_year > 0:
+                return f"R{reiwa_year}.{parsed.month:02d}.{parsed.day:02d}"
+        return val
+
+    # 2. YYYY/MM/DD
+    if re.search(r"YYYY[/\-.]MM[/\-.]DD", annotation, re.IGNORECASE):
+        parsed = _try_parse_date(val)
+        if parsed:
+            return parsed.strftime("%Y/%m/%d")
+        return val
+
+    # 3. DD/MM/YYYY
+    if re.search(r"DD[/\-.]MM[/\-.]YYYY", annotation, re.IGNORECASE):
+        parsed = _try_parse_date(val)
+        if parsed:
+            return parsed.strftime("%d/%m/%Y")
+        return val
+
+    # 4. Decimal places: "小数点3位", "小数点后面两位", "3 decimal"
+    decimal_match = re.search(
+        r"小数点\s*(?:后面|まで)?\s*(\d+|[一二两三四五六七八九十]+)\s*位|(\d+)\s*decimal",
+        annotation, re.IGNORECASE,
+    )
+    if decimal_match:
+        raw = decimal_match.group(1) or decimal_match.group(2)
+        cn_digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5}
+        places = cn_digits.get(raw, None) if not raw.isdigit() else int(raw)
+        if places is not None:
+            try:
+                return f"{float(val):.{places}f}"
+            except (ValueError, TypeError):
+                return val
+
+    # 5. Integer only: "整数のみ" / "integer only" / "小数点不可"
+    if re.search(r"整数のみ|integer only|小数点不可", annotation, re.IGNORECASE):
+        try:
+            return str(int(float(val)))
+        except (ValueError, TypeError):
+            return val
+
+    # 6. Uppercase: "大写" / "uppercase" / "英語大文字のみ"
+    if re.search(r"大写|uppercase|大文字のみ", annotation, re.IGNORECASE):
+        return val.upper()
+
+    # 7. Strip prefix: "不含ROL-前缀" / "strip prefix XXX"
+    prefix_match = re.search(r"不含(.+?)前缀|strip prefix[: ]*(.+)", annotation, re.IGNORECASE)
+    if prefix_match:
+        prefix = (prefix_match.group(1) or prefix_match.group(2)).strip()
+        if val.upper().startswith(prefix.upper()):
+            return val[len(prefix):].strip()
+        for sep in ("-", " ", "_"):
+            pf = prefix + sep
+            if val.upper().startswith(pf.upper()):
+                return val[len(pf):].strip()
+
+    # 8. Remove hyphens: "ハイフンなし"
+    if re.search(r"ハイフンなし|no hyphen|remove hyphen", annotation, re.IGNORECASE):
+        return val.replace("-", "").replace("\u2010", "").replace("\u2212", "")
+
+    # 9. ISO currency code: "ISO 4217" / "3文字コード"
+    if re.search(r"ISO\s*4217|3文字コード", annotation, re.IGNORECASE):
+        return val.upper().strip()[:3]
+
+    # 10. Max length: "XX文字以内" / "max XX chars"
+    len_match = re.search(r"(\d+)\s*文字以内|max\s*(\d+)\s*char", annotation, re.IGNORECASE)
+    if len_match:
+        max_len = int(len_match.group(1) or len_match.group(2))
+        if len(val) > max_len:
+            return val[:max_len]
+
+    return val
+
+
+def _code_check(value, annotation: str) -> dict:
+    """Code-level check of a cell value against its annotation.
+
+    Returns {status: "pass"|"fail"|"unchecked", reason, suggestion?}
+    """
+    val_str = str(value).strip() if value is not None and value != "" else ""
+
+    # 和暦 format check
+    if re.search(r"和暦|令和", annotation, re.IGNORECASE):
+        if not val_str:
+            return {"status": "fail", "reason": "日期为空", "suggestion": "填写和暦格式日期 (例: R8.02.23)"}
+        if re.match(r"^R\d+\.\d{2}\.\d{2}$", val_str):
+            return {"status": "pass", "reason": "和暦格式正确"}
+        return {"status": "fail", "reason": f"格式不符: {val_str}", "suggestion": "应为 R{年}.MM.DD 格式"}
+
+    # YYYY/MM/DD format check
+    date_match = re.search(r'YYYY[/\-.]MM[/\-.]DD', annotation, re.IGNORECASE)
+    if date_match:
+        if not val_str:
+            return {"status": "fail", "reason": "日期为空", "suggestion": "填写 YYYY/MM/DD 格式日期"}
+        if re.match(r'^\d{4}/\d{2}/\d{2}$', val_str):
+            try:
+                datetime.strptime(val_str, "%Y/%m/%d")
+                return {"status": "pass", "reason": "日期格式正确"}
+            except ValueError:
+                return {"status": "fail", "reason": f"日期无效: {val_str}", "suggestion": "检查日期是否合法"}
+        return {"status": "fail", "reason": f"格式不符: {val_str}", "suggestion": "应为 YYYY/MM/DD 格式"}
+
+    # DD/MM/YYYY format check
+    if re.search(r'DD[/\-.]MM[/\-.]YYYY', annotation, re.IGNORECASE):
+        if not val_str:
+            return {"status": "fail", "reason": "日期为空", "suggestion": "填写 DD/MM/YYYY 格式日期"}
+        if re.match(r'^\d{2}/\d{2}/\d{4}$', val_str):
+            return {"status": "pass", "reason": "日期格式正确"}
+        return {"status": "fail", "reason": f"格式不符: {val_str}", "suggestion": "应为 DD/MM/YYYY 格式"}
+
+    # Decimal places check (e.g. "小数点2位", "2 decimal places")
+    decimal_match = re.search(r'小数点\s*(?:后面|まで)?\s*(\d+)\s*位|(\d+)\s*decimal', annotation, re.IGNORECASE)
+    if decimal_match:
+        required_places = int(decimal_match.group(1) or decimal_match.group(2))
+        if not val_str:
+            return {"status": "fail", "reason": "值为空", "suggestion": f"填写保留{required_places}位小数的数字"}
+        dot_match = re.match(r'^-?\d+\.(\d+)$', val_str)
+        if dot_match:
+            actual_places = len(dot_match.group(1))
+            if actual_places == required_places:
+                return {"status": "pass", "reason": f"小数点{required_places}位正确"}
+            return {
+                "status": "fail",
+                "reason": f"小数点{actual_places}位，需要{required_places}位",
+                "suggestion": f"改为 {float(val_str):.{required_places}f}",
             }
-            state["generated_files"].append(file_info)
-
-            return json.dumps({"status": "success", "filename": filename,
-                               "product_count": len(products)}, ensure_ascii=False)
-        except Exception as e:
-            error_info = {
-                "supplier_id": supplier_id,
-                "filename": None,
-                "error": str(e),
-                "product_count": len(products),
+        try:
+            float(val_str)
+            return {
+                "status": "fail",
+                "reason": "缺少小数点",
+                "suggestion": f"改为 {float(val_str):.{required_places}f}",
             }
-            state["generated_files"].append(error_info)
-            return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+        except (ValueError, TypeError):
+            return {"status": "fail", "reason": f"非数字: {val_str}", "suggestion": "应为数字"}
 
-    registry.register(ToolDef(
-        name="fill_and_generate",
-        fn=fill_and_generate,
-        description="用选定的模板和字段映射填充并生成 Excel 询价单文件",
-        parameters={
-            "supplier_id": {"type": "integer", "description": "供应商 ID", "required": True},
-        },
-        group="inquiry",
-    ))
+    # Integer only check
+    if re.search(r"整数のみ|integer only|小数点不可", annotation, re.IGNORECASE):
+        if not val_str:
+            return {"status": "fail", "reason": "值为空", "suggestion": "填写整数"}
+        try:
+            f = float(val_str)
+            if f == int(f):
+                return {"status": "pass", "reason": "整数正确"}
+            return {"status": "fail", "reason": f"非整数: {val_str}", "suggestion": str(int(f))}
+        except (ValueError, TypeError):
+            return {"status": "fail", "reason": f"非数字: {val_str}", "suggestion": "应为整数"}
 
-    # ── Tool 6: review_result ──
-    def review_result(supplier_id: int) -> str:
-        """AI 审查生成的询价单，检查遗漏和错误。"""
-        tpl_info = state["selected_templates"].get(supplier_id)
-        template = tpl_info[0] if tpl_info else None
-        field_mapping = state["field_mappings"].get(supplier_id)
+    # Uppercase check
+    if re.search(r"大写|uppercase|大文字のみ", annotation, re.IGNORECASE):
+        if not val_str:
+            return {"status": "unchecked"}
+        if val_str == val_str.upper():
+            return {"status": "pass", "reason": "大文字正確"}
+        return {"status": "fail", "reason": f"非大文字: {val_str}", "suggestion": val_str.upper()}
 
-        if not template or not template.field_positions or not field_mapping:
-            return json.dumps({"issues": [], "message": "没有模板或映射，跳过审查"}, ensure_ascii=False)
+    # Remove hyphens check
+    if re.search(r"ハイフンなし|no hyphen", annotation, re.IGNORECASE):
+        if not val_str:
+            return {"status": "unchecked"}
+        if "-" in val_str or "\u2010" in val_str or "\u2212" in val_str:
+            return {"status": "fail", "reason": f"含ハイフン: {val_str}", "suggestion": val_str.replace("-", "").replace("\u2010", "").replace("\u2212", "")}
+        return {"status": "pass", "reason": "ハイフンなし正確"}
 
-        # Build filled_cells
-        filled_cells: dict = {}
-        for field_key, pos_info in template.field_positions.items():
-            position = pos_info if isinstance(pos_info, str) else pos_info.get("position", "")
-            if not position:
-                continue
-            mapped_key = field_mapping.get(field_key, field_key)
-            value = order_meta.get(mapped_key, "")
-            filled_cells[position] = value
+    # Max length check
+    len_match = re.search(r"(\d+)\s*文字以内|max\s*(\d+)\s*char", annotation, re.IGNORECASE)
+    if len_match:
+        max_len = int(len_match.group(1) or len_match.group(2))
+        if not val_str:
+            return {"status": "unchecked"}
+        if len(val_str) <= max_len:
+            return {"status": "pass", "reason": f"{len(val_str)}文字 <= {max_len}文字"}
+        return {"status": "fail", "reason": f"{len(val_str)}文字 > {max_len}文字", "suggestion": val_str[:max_len]}
 
-        from services.inquiry_bridge import review_filled_data
-        issues = review_filled_data(filled_cells, template.field_positions, order_meta)
-
-        # Attach to generated_files
-        for f in state["generated_files"]:
-            if f.get("supplier_id") == supplier_id:
-                f["review_issues"] = issues if issues else None
-
-        return json.dumps({"issue_count": len(issues), "issues": issues}, ensure_ascii=False)
-
-    registry.register(ToolDef(
-        name="review_result",
-        fn=review_result,
-        description="AI 审查填充结果，检查遗漏字段、错位、格式问题",
-        parameters={
-            "supplier_id": {"type": "integer", "description": "供应商 ID", "required": True},
-        },
-        group="inquiry",
-    ))
-
-    # ── Tool 7: apply_fix ──
-    def apply_fix(supplier_id: int, field: str, metadata_key: str) -> str:
-        """手动修正一个字段映射并重新生成 Excel。"""
-        mapping = state["field_mappings"].get(supplier_id, {})
-        if field not in (state["selected_templates"].get(supplier_id, (None,))[0] or
-                         type('', (), {'field_positions': {}})()).field_positions:
-            return json.dumps({"error": f"字段 {field} 不在模板中"}, ensure_ascii=False)
-        if metadata_key not in order_meta:
-            return json.dumps({"error": f"元数据中没有 {metadata_key}"}, ensure_ascii=False)
-
-        mapping[field] = metadata_key
-        state["field_mappings"][supplier_id] = mapping
-
-        # Remove old file entry and regenerate
-        state["generated_files"] = [f for f in state["generated_files"] if f.get("supplier_id") != supplier_id]
-        return fill_and_generate(supplier_id)
-
-    registry.register(ToolDef(
-        name="apply_fix",
-        fn=apply_fix,
-        description="修正一个字段映射（template_field → metadata_key）并重新生成 Excel",
-        parameters={
-            "supplier_id": {"type": "integer", "description": "供应商 ID", "required": True},
-            "field": {"type": "string", "description": "模板字段名", "required": True},
-            "metadata_key": {"type": "string", "description": "订单元数据中对应的键名", "required": True},
-        },
-        group="inquiry",
-    ))
-
-    # ── Tool 8: finish ──
-    def finish_inquiry(summary: str = "") -> str:
-        """标记询价单生成完成，返回最终结果。"""
-        return json.dumps({
-            "status": "completed",
-            "generated_files": state["generated_files"],
-            "supplier_count": len(set(f["supplier_id"] for f in state["generated_files"])),
-            "summary": summary,
-        }, ensure_ascii=False)
-
-    registry.register(ToolDef(
-        name="finish_inquiry",
-        fn=finish_inquiry,
-        description="标记询价单生成完成，返回所有生成的文件列表",
-        parameters={
-            "summary": {"type": "string", "description": "生成过程的简要总结"},
-        },
-        group="inquiry",
-    ))
-
-    return state
+    # No matching pattern → unchecked
+    return {"status": "unchecked"}
 
 
-# ─── Main Entry Point ──────────────────────────────────────────
+# ─── LLM Mapping Prompt ──────────────────────────────────────
 
-INQUIRY_SYSTEM_PROMPT = """你是一个高效的邮轮供应链询价单生成专家。你深谙这个领域——你理解订单数据的结构、供应商模板的意义、以及如何高效地桥接两者。
+MAPPING_PROMPT = """你是询价单填写专家。根据模板字段定义和订单数据，决定每个字段应该填入什么值。
 
-## 你的认知框架
+## 模板字段（需要你填写的）
+{fields_json}
 
-### 领域理解
-邮轮订单的元数据字段名称变化多端，但本质相同：
-- 交货日期: delivery_date = deliver_on_date = delivery = 納期
-- 船名: ship_name = vessel_name = vessel = 船名
-- PO号: po_number = order_number = order_no
-- 供应商: vendor_name = supplier_name = vendor
-- 目的港: destination_port = port_name = delivery_port = 納品先
-- 航次: voyage = voyage_number = voyage_no
-- 币种: currency = ccy
+## 订单数据
+{order_data_json}
 
-你看到任何字段名，应该立即理解它是什么意思，不需要额外思考。
+## 供应商信息
+{supplier_json}
 
-### 效率思维
-你的时间成本等于 LLM 调用次数。每一轮思考都在消耗时间和金钱。
-- 一次 get_order_metadata 告诉你所有的信息：有几个供应商、数据长什么样
-- 一次 list_templates 告诉你有什么模板可用
-- 拿到这两个信息后，你对所有供应商的处理路径已经清晰了
+## 规则
+1. **order 类字段**（ship_name, delivery_date, po_number, voyage 等）→ 从订单数据中取对应值。**如果数据中没有对应值，填空字符串 ""**（清除模板残留）
+2. **supplier 类字段**（supplier_name, supplier_contact, supplier_tel, supplier_email, supplier_address）→ 从供应商信息中取值。**如果供应商信息中该字段为空字符串，必须填空字符串 ""**（清除模板残留）
+3. **company 类字段**（company_name, company_address, company_tel, company_fax, company_email, company_zip_code）→ 填 null（保留模板原值，这是买方公司固定信息）
+4. **formula 类字段** → 填 null（Excel 自动计算）
+5. **delivery 类字段**（delivery_company_name, delivery_contact, delivery_time_notes）→ 从订单数据取值（如有），没有则填 ""（清除模板残留）。delivery_address → 从订单数据取值
+6. **payment 类字段**（payment_date, payment_method）→ 从订单数据取值，没有则填 ""
+7. 注意 annotation 中的格式要求，但代码会做最终格式强制，你只需填正确的原始值
+8. 如果 annotation 要求特殊格式（和暦、去前缀等），你可以尝试转换，但不必完美（代码会修正）
 
-### 决策直觉
-- **无模板（method=none）** → 直接 fill_and_generate，不需要 map_fields 或 review
-- **全部精确匹配（exact_match == total_fields）** → 直接 fill_and_generate，跳过 review
-- **有 AI 映射** → fill_and_generate 后 review_result，但只在 issue_count > 0 时才 apply_fix
-- **review 发现问题** → 读懂问题本质，一次性 apply_fix 所有可修复的，不要逐个修
-- 你不是流水线工人，你是专家。专家看一眼就知道该走哪条路。
+## 特殊字段
+- 如果某个字段 annotation 说"前面是XX 后面是YY"，组合两个值（缺失的部分省略，不要写 "null"）
+- invoice_number 语义上等同于 po_number
 
-## 执行范式（严格遵循）
+## 语义映射参考
+- delivery_date = deliver_on_date = 納期 = Delivery Date
+- ship_name = vessel_name = 船名 = Vessel
+- po_number = order_number = invoice_number = 注文番号
+- destination_port = port_name = 納品先
+- supplier_tel = phone, supplier_email = email
+- remarks = 備考 = notes
 
-工具之间有依赖关系。**每一步必须等上一步完成后再执行**：
-
-**第 1 步**: 同时调用 get_order_metadata + list_templates（这两个无依赖，可以并行）
-**第 2 步**: 对所有供应商同时调用 select_template（等第 1 步完成后。可以一次性并行调用多个 select_template）
-**第 3 步**: 对所有有模板的供应商同时调用 map_fields（等第 2 步完成后。无模板的跳过此步）
-**第 4 步**: 对所有供应商同时调用 fill_and_generate（等第 3 步完成后。可以一次性并行）
-**第 5 步（可选）**: 对有 AI 映射的供应商调用 review_result，无问题则跳过 apply_fix
-**第 6 步**: finish_inquiry
-
-⚠️ 关键：select_template、map_fields、fill_and_generate 三者有严格顺序依赖！
-- map_fields 必须在 select_template 完成后才能调用（它依赖选好的模板）
-- fill_and_generate 必须在 map_fields 完成后才能调用（它依赖字段映射）
-- 不要在同一轮中同时调用 select_template 和 map_fields！
-
-正确的并行方式是"同层并行"：
-- ✅ 同时为 supplier 1,2,3 调用 select_template（同一层级，并行）
-- ✅ 等全部 select 完成后，同时为 supplier 1,2,3 调用 map_fields
-- ❌ 不要为 supplier 1 同时调用 select + map + fill（跨层级，会失败）
-
-典型的简单订单（1个供应商）= 5轮。复杂订单（6个供应商）= 6-7轮。
-
-## 你绝不应该做的事
-- 不要在同一轮混合不同层级的工具调用（如 select + map + fill）
-- 不要对通用格式（无模板）做 map_fields 或 review
-- 不要对精确匹配的模板做 review
-- 不要忘记调用 finish_inquiry
-"""
+## 输出 JSON
+返回 key=单元格位置, value=字符串或 null：
+- "" = 清空
+- null = 保留模板原值
+只返回 JSON。"""
 
 
-def run_inquiry_agent(order, db) -> dict:
-    """Run the agentic inquiry generator. Returns inquiry_data dict."""
-    start_time = time.time()
+# ─── Per-Supplier Generation (replaces Agent) ─────────────────
 
-    # Setup
-    api_key = load_api_key("gemini")
-    llm_config = LLMConfig(api_key=api_key, thinking_budget=1024)
-    agent_config = AgentConfig(max_turns=10, system_prompt=INQUIRY_SYSTEM_PROMPT)
-    config = Config(llm=llm_config, agent=agent_config)
+def _generate_single_supplier(
+    order_id: int, order_meta: dict, supplier_id: int, products: list[dict],
+    stream_key: str, overall_start: float,
+    template_id_override: int | None = None,
+) -> dict:
+    """Generate inquiry for one supplier via single LLM call + deterministic code.
 
-    provider = create_provider(llm_config)
-    storage = MemoryStorage()
-    session = storage.create_session("inquiry")
-    registry = ToolRegistry()
-    ctx = ToolContext()
+    Thread-safe — creates its own DB session.
 
-    # Register tools
-    tool_state = _create_inquiry_tools(registry, order, db)
+    Returns {"file_info": {...}, "verify_results": [...], "error": str|None}
+    """
+    from database import SessionLocal
+    from models import SupplierTemplate
+    from services.excel_writer import InquiryWorkbook
+    from services.agent.stream_queue import push_event
+    from sqlalchemy import text as sa_text
 
-    # Build agent
-    agent = ReActAgent(
-        provider=provider,
-        storage=storage,
-        registry=registry,
-        ctx=ctx,
-        pipeline_session_id=session.id,
-        system_prompt=INQUIRY_SYSTEM_PROMPT,
-        max_turns=15,
-        verbose=True,
+    upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    # ── Stage 1: Data loading ──
+    _db = SessionLocal()
+    try:
+        # Supplier info
+        row = _db.execute(
+            sa_text("SELECT name, contact, email, phone FROM suppliers WHERE id = :sid"),
+            {"sid": supplier_id},
+        ).fetchone()
+        supplier_info = {
+            "name": row[0] or "" if row else "",
+            "contact": row[1] or "" if row else "",
+            "email": row[2] or "" if row else "",
+            "phone": row[3] or "" if row else "",
+        }
+
+        # Port/country enrichment
+        enriched_meta = dict(order_meta)
+        order_row = _db.execute(
+            sa_text("SELECT port_id, country_id FROM v2_orders WHERE id = :oid"),
+            {"oid": order_id},
+        ).fetchone()
+        if order_row:
+            if order_row[0]:
+                p_row = _db.execute(
+                    sa_text("SELECT name, location, code FROM ports WHERE id = :pid"),
+                    {"pid": order_row[0]},
+                ).fetchone()
+                if p_row:
+                    enriched_meta.update({
+                        "port_name": p_row[0] or "", "delivery_address": p_row[1] or "",
+                        "port_code": p_row[2] or "",
+                    })
+            if order_row[1]:
+                c_row = _db.execute(
+                    sa_text("SELECT name, code FROM countries WHERE id = :cid"),
+                    {"cid": order_row[1]},
+                ).fetchone()
+                if c_row:
+                    enriched_meta.update({"country_name": c_row[0] or "", "country_code": c_row[1] or ""})
+
+        # ── Stage 2: Template resolution + parse ──
+        all_templates = _db.query(SupplierTemplate).all()
+    finally:
+        _db.close()
+
+    # Resolve template
+    chosen_template = None
+    selection_method = "none"
+
+    if template_id_override:
+        chosen_template = next((t for t in all_templates if t.id == template_id_override), None)
+        if chosen_template and chosen_template.field_positions:
+            selection_method = "user_selected"
+        else:
+            chosen_template = None
+
+    if not chosen_template:
+        template, method, candidates = resolve_template(supplier_id, all_templates)
+        if method == "exact" and template and template.field_positions:
+            chosen_template = template
+            selection_method = "exact"
+        elif candidates:
+            # Use first candidate (no Agent to decide)
+            first_candidate_id = candidates[0]["id"]
+            chosen_template = next((t for t in all_templates if t.id == first_candidate_id), None)
+            selection_method = "candidate_auto"
+
+    # Build workbook + fields
+    wb = InquiryWorkbook()
+
+    if not chosen_template or not chosen_template.field_positions:
+        # Generic fallback — no LLM needed
+        wb.create_generic(order_meta, products, supplier_id)
+        if stream_key:
+            push_event(stream_key, {
+                "type": "tool_call", "tool_name": "generate", "tool_label": "生成询价单",
+                "content": f"通用格式, {len(products)} 个产品",
+                "elapsed_seconds": round(time.time() - overall_start, 1),
+                "supplier_id": supplier_id,
+            })
+        # Save generic
+        return _save_workbook(wb, None, selection_method, order_meta, supplier_id,
+                              products, upload_dir, {}, stream_key, overall_start)
+
+    # Load template file
+    template_file_path = None
+    if chosen_template.template_file_url:
+        template_file_path = os.path.join(
+            upload_dir, os.path.basename(chosen_template.template_file_url)
+        )
+        if not os.path.exists(template_file_path):
+            template_file_path = None
+
+    if template_file_path:
+        wb.load_template(template_file_path)
+    else:
+        wb.create_from_config()
+
+    # Parse annotations
+    field_positions = chosen_template.field_positions or {}
+    fmm = chosen_template.field_mapping_metadata or {}
+    annotations: dict[str, str] = {}
+    if fmm.get("annotations"):
+        annotations.update(fmm["annotations"])
+    for item in fmm.get("items", []):
+        if item.get("note") and item.get("position"):
+            annotations[item["position"]] = item["note"]
+
+    # Detect formula cells
+    formula_cells: set[str] = set()
+    template_formulas: dict[str, str] = {}
+    if wb._ws:
+        for row in wb._ws.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    formula_cells.add(cell.coordinate)
+                    template_formulas[cell.coordinate] = cell.value
+
+    # Build fields list (excluding formula cells)
+    fields = []
+    for field_key, pos_info in field_positions.items():
+        position = pos_info.get("position", "") if isinstance(pos_info, dict) else pos_info
+        description = pos_info.get("description", "") if isinstance(pos_info, dict) else ""
+        if not position or position in formula_cells:
+            continue
+        field = {"field_key": field_key, "position": position, "description": description}
+        if position in annotations:
+            field["annotation"] = annotations[position]
+        fields.append(field)
+
+    # SSE: emit "generate" step
+    if stream_key:
+        push_event(stream_key, {
+            "type": "tool_call", "tool_name": "generate", "tool_label": "生成询价单",
+            "content": f"模板: {chosen_template.template_name}, {len(fields)} 字段, {len(products)} 产品",
+            "elapsed_seconds": round(time.time() - overall_start, 1),
+            "supplier_id": supplier_id,
+        })
+
+    # ── Stage 3: Single LLM call (with retry) ──
+    order_data = {k: str(v)[:200] for k, v in enriched_meta.items() if v}
+    prompt = MAPPING_PROMPT.format(
+        fields_json=json.dumps(fields, ensure_ascii=False, indent=2),
+        order_data_json=json.dumps(order_data, ensure_ascii=False, indent=2),
+        supplier_json=json.dumps(supplier_info, ensure_ascii=False, indent=2),
     )
 
-    # Run
-    user_msg = f"请为订单 #{order.id} 生成询价单。"
-    logger.info("Starting inquiry agent for order %d", order.id)
+    api_key = load_api_key("gemini")
+    client = genai.Client(api_key=api_key)
 
-    result_text = agent.run(user_msg)
-    elapsed = time.time() - start_time
+    cell_mapping = None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            llm_start = time.time()
+            response = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                    max_output_tokens=5000,
+                    thinking_config=types.ThinkingConfig(thinking_budget=2048),
+                ),
+            )
+            llm_elapsed = time.time() - llm_start
+            logger.info("Inquiry v6.2: supplier %d LLM mapping in %.1fs", supplier_id, llm_elapsed)
 
-    logger.info("Inquiry agent completed in %.1fs (%d steps)", elapsed, len(agent.step_log))
+            # Guard: check response has text
+            resp_text = getattr(response, "text", None)
+            if not resp_text or not resp_text.strip():
+                raise ValueError("LLM returned empty response")
 
-    # Extract result
-    generated_files = tool_state["generated_files"]
+            parsed = json.loads(resp_text.strip())
+            if not isinstance(parsed, dict):
+                raise ValueError(f"LLM returned {type(parsed).__name__}, expected dict")
 
-    # Count unassigned
-    unassigned = 0
-    for item in (order.match_results or []):
-        matched = item.get("matched_product")
-        if not matched or not matched.get("supplier_id"):
-            unassigned += 1
+            cell_mapping = parsed
+            break
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Inquiry v6.2: supplier %d attempt %d failed: %s", supplier_id, attempt + 1, e)
+            if attempt == max_retries - 1:
+                raise
+        except Exception as e:
+            logger.warning("Inquiry v6.2: supplier %d attempt %d API error: %s", supplier_id, attempt + 1, e)
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s
 
-    inquiry_data = {
-        "generated_files": generated_files,
-        "supplier_count": len(set(f["supplier_id"] for f in generated_files)),
-        "unassigned_count": unassigned,
-        "agent_summary": result_text,
-        "agent_elapsed_seconds": round(elapsed, 1),
-        "agent_steps": len(agent.step_log),
-    }
+    # ── Stage 4: Deterministic format enforcement ──
+    # Detect date fields by field_key
+    date_field_positions = set()
+    for f in fields:
+        fk = f.get("field_key", "")
+        if "date" in fk.lower() or fk in ("order_date", "delivery_date", "payment_date"):
+            date_field_positions.add(f["position"])
 
-    return inquiry_data
+    for cell_ref, value in list(cell_mapping.items()):
+        if value is None or value == "":
+            continue
+        val_str = str(value)
+
+        # Date fields — enforce based on annotation
+        if cell_ref in date_field_positions:
+            ann = annotations.get(cell_ref, "")
+            parsed = _try_parse_date(val_str)
+            if parsed:
+                if re.search(r"和暦|令和", ann):
+                    reiwa_year = parsed.year - 2018
+                    cell_mapping[cell_ref] = f"R{reiwa_year}.{parsed.month:02d}.{parsed.day:02d}"
+                elif re.search(r"DD[/\-.]MM[/\-.]YYYY", ann, re.IGNORECASE):
+                    cell_mapping[cell_ref] = parsed.strftime("%d/%m/%Y")
+                else:
+                    cell_mapping[cell_ref] = parsed.strftime("%Y/%m/%d")
+                continue
+
+        # Other annotations
+        ann = annotations.get(cell_ref, "")
+        if not ann:
+            # Check if column has an annotation (e.g. product row annotation applies to header)
+            for ann_cell, ann_text in annotations.items():
+                if ann_cell[0] == cell_ref[0] and len(ann_cell) <= 3 and len(cell_ref) <= 3:
+                    ann = ann_text
+                    break
+        if ann:
+            enforced = enforce_annotation(val_str, ann)
+            if enforced != val_str:
+                cell_mapping[cell_ref] = enforced
+
+    # ── Stage 5: Write workbook ──
+    # Write header cells (skip null = preserve template)
+    cells_to_write = [
+        {"cell": c, "value": str(v)}
+        for c, v in cell_mapping.items()
+        if v is not None
+    ]
+    wb.write_cells(cells_to_write)
+
+    # Write product rows
+    table_config = chosen_template.product_table_config or {}
+    columns = table_config.get("columns", {})
+    start_row = table_config.get("start_row", 22)
+    formula_cols = table_config.get("formula_columns", [])
+    count = wb.write_product_rows(start_row, columns, products, formula_cols)
+
+    # Post-fill: pack_size → description column
+    if wb._ws:
+        desc_col = None
+        for col_letter, field_key in columns.items():
+            if field_key == "description":
+                desc_col = col_letter
+                break
+        if desc_col:
+            for i, product in enumerate(products):
+                matched = product.get("matched_product") or {}
+                pack_size = matched.get("pack_size", "")
+                if pack_size:
+                    wb._ws[f"{desc_col}{start_row + i}"] = pack_size
+
+    # Enforce annotations on product rows + set number_format
+    if wb._ws and annotations:
+        for ann_cell, ann_text in annotations.items():
+            m = re.match(r"([A-Z]+)(\d+)", ann_cell)
+            if not m:
+                continue
+            ann_col = m.group(1)
+            ann_row_num = int(m.group(2))
+            if ann_row_num >= start_row:
+                for ri in range(start_row, start_row + count):
+                    cell_ref = f"{ann_col}{ri}"
+                    cell_val = wb._ws[cell_ref].value
+                    if cell_val is not None:
+                        original = str(cell_val)
+                        enforced = enforce_annotation(original, ann_text)
+                        if enforced != original:
+                            try:
+                                wb._ws[cell_ref] = float(enforced)
+                            except (ValueError, TypeError):
+                                wb._ws[cell_ref] = enforced
+                        # number_format for decimals
+                        dec_match = re.search(
+                            r"小数点\s*(?:后面|まで)?\s*(\d+|[一二两三四五六七八九十]+)\s*位|(\d+)\s*decimal",
+                            ann_text, re.IGNORECASE,
+                        )
+                        if dec_match:
+                            raw_d = dec_match.group(1) or dec_match.group(2)
+                            cn_d = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5}
+                            pl = cn_d.get(raw_d, None) if not raw_d.isdigit() else int(raw_d)
+                            if pl:
+                                try:
+                                    wb._ws[cell_ref].value = float(wb._ws[cell_ref].value)
+                                    wb._ws[cell_ref].number_format = "0." + "0" * pl
+                                except (ValueError, TypeError):
+                                    pass
+
+    # Rebuild formulas
+    if template_formulas and wb._ws:
+        last_data_row = start_row + count - 1
+        per_row_formulas: dict[str, tuple[str, int]] = {}
+        summary_formulas: dict[str, str] = {}
+
+        for fc_ref, fc_val in template_formulas.items():
+            col_letter = re.match(r"([A-Z]+)", fc_ref).group(1)
+            row_num = int(re.search(r"(\d+)", fc_ref).group(1))
+            if start_row <= row_num <= start_row + 10:
+                if col_letter not in per_row_formulas:
+                    per_row_formulas[col_letter] = (fc_val, row_num)
+            else:
+                summary_formulas[fc_ref] = fc_val
+
+        for col, (formula_template, orig_row) in per_row_formulas.items():
+            for row_idx in range(start_row, start_row + count):
+                new_formula = re.sub(str(orig_row), str(row_idx), formula_template)
+                wb._ws[f"{col}{row_idx}"] = new_formula
+            # Clear leftover formula rows
+            for row_idx in range(start_row + count, start_row + 20):
+                c = wb._ws[f"{col}{row_idx}"]
+                if c.value and isinstance(c.value, str) and c.value.startswith("="):
+                    wb._ws[f"{col}{row_idx}"] = None
+
+        for fc_ref, formula in summary_formulas.items():
+            new_formula = re.sub(
+                r"([A-Z]+)(\d+):([A-Z]+)(\d+)",
+                lambda m_: f"{m_.group(1)}{start_row}:{m_.group(3)}{last_data_row}",
+                formula,
+            )
+            wb._ws[fc_ref] = new_formula
+
+    # ── Stage 6: Save ──
+    return _save_workbook(wb, chosen_template, selection_method, order_meta, supplier_id,
+                          products, upload_dir, annotations, stream_key, overall_start)
 
 
-# ─── Streaming Entry Point ────────────────────────────────────
-
-def _make_on_step_callback(stream_key: str, start_time: float):
-    """Create an on_step callback that pushes events to the stream queue."""
+def _save_workbook(
+    wb, template, selection_method: str, order_meta: dict,
+    supplier_id: int, products: list[dict], upload_dir: str,
+    annotations: dict[str, str], stream_key: str, overall_start: float,
+) -> dict:
+    """Save workbook + preview HTML, run verify, return result dict."""
     from services.agent.stream_queue import push_event
 
-    def on_step(step: dict, step_index: int):
-        step_type = step.get("type", "")
-        tool_name = step.get("tool_name", "")
+    excel_bytes = wb.save_bytes()
 
-        if step_type == "tool_call":
-            push_event(stream_key, {
-                "type": "tool_call",
-                "tool_name": tool_name,
-                "tool_label": TOOL_LABELS.get(tool_name, tool_name),
-                "content": step.get("content", ""),
-                "step_index": step_index,
-                "elapsed_seconds": round(time.time() - start_time, 1),
-            })
-        elif step_type == "tool_result":
-            push_event(stream_key, {
-                "type": "tool_result",
-                "tool_name": tool_name,
-                "tool_label": TOOL_LABELS.get(tool_name, tool_name),
-                "content": step.get("content", "")[:200],
-                "step_index": step_index,
-                "elapsed_seconds": round(time.time() - start_time, 1),
-                "duration_ms": step.get("duration_ms", 0),
-            })
-        elif step_type in ("thinking", "reflection"):
-            push_event(stream_key, {
-                "type": "thinking",
-                "tool_name": "think",
-                "tool_label": TOOL_LABELS["think"],
-                "content": step.get("content", "")[:200],
-                "step_index": step_index,
-                "elapsed_seconds": round(time.time() - start_time, 1),
-            })
+    po_number = str(order_meta.get("po_number") or "unknown").replace("/", "_").replace("\\", "_")
+    filename = f"inquiry_{po_number}_supplier{supplier_id}_{uuid.uuid4().hex[:6]}.xlsx"
+    filepath = os.path.join(upload_dir, filename)
+    with open(filepath, "wb") as f:
+        f.write(excel_bytes)
 
-    return on_step
+    # Save preview HTML
+    preview_filename = filename.replace(".xlsx", ".html")
+    preview_url = None
+    try:
+        html = wb.render_html()
+        preview_path = os.path.join(upload_dir, preview_filename)
+        with open(preview_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        preview_url = f"/uploads/{preview_filename}"
+    except Exception as e:
+        logger.warning("Preview HTML save failed for supplier %d: %s", supplier_id, e)
 
+    # Run verify
+    verify_results = []
+    if annotations and wb._ws:
+        for cell_ref, annotation in annotations.items():
+            try:
+                cell = wb._ws[cell_ref]
+                current_value = cell.value if cell.value is not None else ""
+                check = _code_check(current_value, annotation)
+                verify_results.append({
+                    "cell": cell_ref,
+                    "annotation": annotation,
+                    "value": str(current_value)[:100],
+                    **check,
+                })
+            except Exception:
+                verify_results.append({
+                    "cell": cell_ref,
+                    "annotation": annotation,
+                    "value": "(无法读取)",
+                    "status": "fail",
+                    "reason": "单元格读取失败",
+                })
 
-def run_inquiry_agent_streaming(order, db, stream_key: str) -> dict:
-    """Run the agentic inquiry generator with streaming progress events.
-
-    Same logic as run_inquiry_agent() but pushes step events to stream_key queue.
-    """
-    start_time = time.time()
-    on_step = _make_on_step_callback(stream_key, start_time)
-
-    # Setup
-    api_key = load_api_key("gemini")
-    llm_config = LLMConfig(api_key=api_key, thinking_budget=1024)
-    agent_config = AgentConfig(max_turns=10, system_prompt=INQUIRY_SYSTEM_PROMPT)
-    config = Config(llm=llm_config, agent=agent_config)
-
-    provider = create_provider(llm_config)
-    storage = MemoryStorage()
-    session = storage.create_session("inquiry")
-    registry = ToolRegistry()
-    ctx = ToolContext()
-
-    # Register tools
-    tool_state = _create_inquiry_tools(registry, order, db)
-
-    # Build agent with on_step callback
-    agent = ReActAgent(
-        provider=provider,
-        storage=storage,
-        registry=registry,
-        ctx=ctx,
-        pipeline_session_id=session.id,
-        system_prompt=INQUIRY_SYSTEM_PROMPT,
-        max_turns=15,
-        verbose=True,
-        on_step=on_step,
-    )
-
-    # Run
-    user_msg = f"请为订单 #{order.id} 生成询价单。"
-    logger.info("Starting streaming inquiry agent for order %d", order.id)
-
-    result_text = agent.run(user_msg)
-    elapsed = time.time() - start_time
-
-    logger.info("Streaming inquiry agent completed in %.1fs (%d steps)", elapsed, len(agent.step_log))
-
-    # Extract result
-    generated_files = tool_state["generated_files"]
-
-    # Count unassigned
-    unassigned = 0
-    for item in (order.match_results or []):
-        matched = item.get("matched_product")
-        if not matched or not matched.get("supplier_id"):
-            unassigned += 1
-
-    inquiry_data = {
-        "generated_files": generated_files,
-        "supplier_count": len(set(f["supplier_id"] for f in generated_files)),
-        "unassigned_count": unassigned,
-        "agent_summary": result_text,
-        "agent_elapsed_seconds": round(elapsed, 1),
-        "agent_steps": len(agent.step_log),
+    file_info = {
+        "supplier_id": supplier_id,
+        "filename": filename,
+        "file_url": f"/uploads/{filename}",
+        "preview_url": preview_url,
+        "product_count": len(products),
+        "has_template": template is not None,
+        "template_name": template.template_name if template else None,
+        "template_id": template.id if template else None,
+        "selection_method": selection_method,
     }
 
-    # NOTE: done event is pushed by the caller (_run_inquiry_background)
-    # after DB commit succeeds, to avoid signaling "done" before persistence.
+    # SSE: emit "save" step
+    if stream_key:
+        push_event(stream_key, {
+            "type": "tool_result", "tool_name": "save", "tool_label": "保存文件",
+            "content": f"{filename} ({len(products)} 产品)",
+            "elapsed_seconds": round(time.time() - overall_start, 1),
+            "supplier_id": supplier_id,
+        })
+
+    return {
+        "file_info": file_info,
+        "verify_results": verify_results,
+        "error": None,
+    }
+
+
+# ─── Orchestrator ─────────────────────────────────────────────
+
+_MAX_INQUIRY_WORKERS = int(os.environ.get("INQUIRY_CONCURRENCY", "3"))
+
+
+def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides=None) -> dict:
+    """Orchestrator: run per-supplier generation in parallel via ThreadPoolExecutor.
+
+    Returns inquiry_data dict with per-supplier results.
+    """
+    from services.agent.stream_queue import push_event
+
+    overall_start = time.time()
+    order_id = order.id
+    match_results = order.match_results or []
+    order_meta = order.order_metadata or {}
+
+    # Group products by supplier_id
+    supplier_groups: dict[int, list[dict]] = {}
+    for item in match_results:
+        matched = item.get("matched_product")
+        if matched and matched.get("supplier_id"):
+            sid = matched["supplier_id"]
+            supplier_groups.setdefault(sid, []).append(item)
+
+    unassigned = sum(
+        1 for item in match_results
+        if not (item.get("matched_product") or {}).get("supplier_id")
+    )
+
+    # Pre-fetch supplier info (names, contact completeness) for all suppliers
+    import sqlalchemy
+    supplier_info_map: dict[int, dict] = {}
+    supplier_ids_list = list(supplier_groups.keys())
+    if supplier_ids_list:
+        try:
+            rows = db.execute(
+                sqlalchemy.text(
+                    "SELECT id, name, contact, email, phone FROM suppliers WHERE id = ANY(:ids)"
+                ),
+                {"ids": supplier_ids_list},
+            ).fetchall()
+            for row in rows:
+                sid_val, name, contact, email, phone = row[0], row[1], row[2], row[3], row[4]
+                missing = []
+                if not contact:
+                    missing.append("contact")
+                if not email:
+                    missing.append("email")
+                if not phone:
+                    missing.append("phone")
+                supplier_info_map[sid_val] = {
+                    "name": name or f"供应商 #{sid_val}",
+                    "missing_fields": missing if missing else None,
+                }
+        except Exception as e:
+            logger.warning("Failed to fetch supplier info: %s", e)
+
+    suppliers_result: dict[str, dict] = {}
+    generated_files: list[dict] = []
+
+    max_workers = min(len(supplier_groups), _MAX_INQUIRY_WORKERS) or 1
+
+    def _worker(sid: int, sid_products: list[dict]) -> tuple[int, dict]:
+        """Thread worker: generates one supplier's inquiry and returns (sid, result_dict)."""
+        supplier_start = time.time()
+
+        info = supplier_info_map.get(sid, {})
+
+        if stream_key:
+            push_event(stream_key, {
+                "type": "supplier_start",
+                "supplier_id": sid,
+                "supplier_name": info.get("name") or f"供应商 #{sid}",
+                "product_count": len(sid_products),
+            })
+        subtotal = 0.0
+        for p in sid_products:
+            mp = p.get("matched_product") or {}
+            qty = p.get("quantity") or 0
+            price = p.get("unit_price") or mp.get("price") or 0
+            try:
+                subtotal += float(qty) * float(price)
+            except (TypeError, ValueError):
+                pass
+
+        base_info = {
+            "supplier_name": info.get("name") or f"供应商 #{sid}",
+            "product_count": len(sid_products),
+            "subtotal": round(subtotal, 2),
+            "currency": order_meta.get("currency", ""),
+            "missing_fields": info.get("missing_fields"),
+        }
+
+        override_tid = (template_overrides or {}).get(sid)
+        try:
+            result = _generate_single_supplier(order_id, order_meta, sid, sid_products, stream_key, overall_start, template_id_override=override_tid)
+            elapsed = round(time.time() - supplier_start, 1)
+
+            fi = result.get("file_info") or {}
+            supplier_data = {
+                **base_info,
+                "status": "completed",
+                "file": result.get("file_info"),
+                "template": {
+                    "id": fi.get("template_id"),
+                    "name": fi.get("template_name"),
+                    "selection_method": fi.get("selection_method", "none"),
+                },
+                "verify_results": result.get("verify_results", []),
+                "elapsed_seconds": elapsed,
+            }
+            logger.info("Inquiry orchestrator: supplier %d completed in %.1fs", sid, elapsed)
+        except Exception as e:
+            elapsed = round(time.time() - supplier_start, 1)
+            logger.error("Inquiry orchestrator: supplier %d failed: %s", sid, e, exc_info=True)
+            supplier_data = {
+                **base_info,
+                "status": "error",
+                "error": str(e),
+                "elapsed_seconds": elapsed,
+            }
+
+        if stream_key:
+            push_event(stream_key, {
+                "type": "supplier_done",
+                "supplier_id": sid,
+                "status": supplier_data["status"],
+            })
+
+        return sid, supplier_data
+
+    logger.info("Inquiry orchestrator: %d suppliers, max_workers=%d", len(supplier_groups), max_workers)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_worker, sid, prods): sid
+            for sid, prods in supplier_groups.items()
+        }
+
+        for future in as_completed(futures):
+            sid = futures[future]
+            try:
+                _, supplier_data = future.result()
+            except Exception as e:
+                logger.error("Inquiry orchestrator: future for supplier %d raised: %s", sid, e, exc_info=True)
+                supplier_data = {"status": "error", "error": str(e), "elapsed_seconds": 0}
+
+            suppliers_result[str(sid)] = supplier_data
+            file_info = supplier_data.get("file")
+            if file_info:
+                generated_files.append(file_info)
+            elif supplier_data["status"] == "error":
+                generated_files.append({
+                    "supplier_id": sid,
+                    "filename": None,
+                    "error": supplier_data.get("error"),
+                    "product_count": len(supplier_groups.get(sid, [])),
+                })
+
+    total_elapsed = round(time.time() - overall_start, 1)
+
+    inquiry_data = {
+        "suppliers": suppliers_result,
+        "generated_files": generated_files,
+        "supplier_count": len(supplier_groups),
+        "unassigned_count": unassigned,
+        "total_elapsed_seconds": total_elapsed,
+    }
+
     return inquiry_data
+
+
+def run_inquiry_single_supplier(order, db, supplier_id: int, stream_key: str = "", template_id: int | None = None) -> dict:
+    """Run inquiry for a single supplier (for re-do). Returns per-supplier result dict."""
+    from services.agent.stream_queue import push_event
+
+    match_results = order.match_results or []
+    order_meta = order.order_metadata or {}
+    sid_products = [
+        item for item in match_results
+        if (item.get("matched_product") or {}).get("supplier_id") == supplier_id
+    ]
+
+    if not sid_products:
+        raise ValueError(f"供应商 {supplier_id} 没有匹配的产品")
+
+    # Fetch supplier info
+    import sqlalchemy
+    supplier_name = f"供应商 #{supplier_id}"
+    missing_fields = None
+    try:
+        row = db.execute(
+            sqlalchemy.text("SELECT name, contact, email, phone FROM suppliers WHERE id = :sid"),
+            {"sid": supplier_id},
+        ).fetchone()
+        if row:
+            supplier_name = row[0] or supplier_name
+            missing = []
+            if not row[1]:
+                missing.append("contact")
+            if not row[2]:
+                missing.append("email")
+            if not row[3]:
+                missing.append("phone")
+            missing_fields = missing if missing else None
+    except Exception:
+        pass
+
+    # Compute subtotal
+    subtotal = 0.0
+    for p in sid_products:
+        mp = p.get("matched_product") or {}
+        qty = p.get("quantity") or 0
+        price = p.get("unit_price") or mp.get("price") or 0
+        try:
+            subtotal += float(qty) * float(price)
+        except (TypeError, ValueError):
+            pass
+
+    start_time = time.time()
+
+    if stream_key:
+        push_event(stream_key, {
+            "type": "supplier_start",
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "product_count": len(sid_products),
+        })
+
+    result = _generate_single_supplier(order.id, order_meta, supplier_id, sid_products, stream_key, start_time, template_id_override=template_id)
+    elapsed = round(time.time() - start_time, 1)
+
+    fi = result.get("file_info") or {}
+    supplier_result = {
+        "supplier_name": supplier_name,
+        "product_count": len(sid_products),
+        "subtotal": round(subtotal, 2),
+        "currency": order_meta.get("currency", ""),
+        "missing_fields": missing_fields,
+        "status": "completed",
+        "file": result.get("file_info"),
+        "template": {
+            "id": fi.get("template_id"),
+            "name": fi.get("template_name"),
+            "selection_method": fi.get("selection_method", "none"),
+        },
+        "verify_results": result.get("verify_results", []),
+        "elapsed_seconds": elapsed,
+    }
+
+    if stream_key:
+        push_event(stream_key, {
+            "type": "supplier_done",
+            "supplier_id": supplier_id,
+            "status": "completed",
+        })
+
+    return supplier_result

@@ -41,6 +41,7 @@ export interface OrderFormatTemplate {
   extracted_fields: MetadataField[] | null;
   source_company: string | null;
   match_keywords: string[] | null;
+  notes: string | null;
   is_active: boolean;
   created_by: number | null;
   created_at: string;
@@ -78,15 +79,28 @@ export function normalizeFieldPositions(
 export interface SupplierTemplate {
   id: number;
   supplier_id: number | null;
+  supplier_ids: number[] | null;
   country_id: number | null;
   template_name: string;
   template_file_url: string | null;
   field_positions: Record<string, FieldPositionValue> | null;
   has_product_table: boolean;
   product_table_config: Record<string, unknown> | null;
+  order_format_template_id: number | null;
+  field_mapping_metadata: Record<string, unknown> | null;
   created_by: number | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface FieldMappingPreviewItem {
+  order_field_key: string;
+  order_field_label: string;
+  matched_position: string | null;
+  current_cell_value: string | null;
+  confidence: "high" | "medium" | "low";
+  source: string;
+  note?: string;
 }
 
 export interface ExcelHeader {
@@ -121,6 +135,7 @@ export interface ExcelParseResult {
   file_url: string;
   metadata?: PdfMetadata;
   layout_prompt?: string;
+  raw_text?: string;
 }
 
 export interface CellPosition {
@@ -248,6 +263,7 @@ export function createOrderTemplate(data: {
   extracted_fields?: MetadataField[];
   source_company?: string;
   match_keywords?: string[];
+  notes?: string;
   is_active?: boolean;
 }) {
   return api<OrderFormatTemplate>("/api/settings/order-templates", {
@@ -266,6 +282,7 @@ export function updateOrderTemplate(
     field_schema_id: number;
     source_company: string;
     match_keywords: string[];
+    notes: string;
     is_active: boolean;
   }>,
 ) {
@@ -279,6 +296,17 @@ export function deleteOrderTemplate(id: number) {
   return api<{ detail: string }>(`/api/settings/order-templates/${id}`, { method: "DELETE" });
 }
 
+export function inferOrderTemplate(data: {
+  raw_text: string;
+  headers: string[];
+  file_type: string;
+}): Promise<{ name: string; source_company: string; match_keywords: string[] }> {
+  return api("/api/settings/order-templates/infer", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
 // ─── Supplier Templates ────────────────────────────────────────
 
 export function listSupplierTemplates(supplierId?: number) {
@@ -288,12 +316,15 @@ export function listSupplierTemplates(supplierId?: number) {
 
 export function createSupplierTemplate(data: {
   supplier_id?: number;
+  supplier_ids?: number[];
   country_id?: number;
   template_name: string;
   template_file_url?: string;
   field_positions?: Record<string, FieldPositionValue>;
   has_product_table?: boolean;
   product_table_config?: Record<string, unknown>;
+  order_format_template_id?: number;
+  field_mapping_metadata?: Record<string, unknown>;
 }) {
   return api<SupplierTemplate>("/api/settings/supplier-templates", {
     method: "POST",
@@ -309,6 +340,8 @@ export function updateSupplierTemplate(
     field_positions: Record<string, FieldPositionValue>;
     has_product_table: boolean;
     product_table_config: Record<string, unknown>;
+    order_format_template_id: number;
+    field_mapping_metadata: Record<string, unknown>;
   }>,
 ) {
   return api<SupplierTemplate>(`/api/settings/supplier-templates/${id}`, {
@@ -439,6 +472,15 @@ export function seedSkills() {
 
 // ─── Template Analysis ────────────────────────────────────────
 
+export interface CellClassification {
+  source_type: "order" | "supplier" | "company" | "static" | "formula" | "product_header";
+  writable: boolean;
+  data_from: "order_data" | "supplier_db" | "company_config" | "formula" | "template";
+  field_key: string | null;
+  label: string;
+  formula?: string;
+}
+
 export interface TemplateAnalysisResult {
   field_positions: Record<string, string>;
   product_table_config: {
@@ -446,14 +488,25 @@ export interface TemplateAnalysisResult {
     start_row: number;
     columns: Record<string, string>;
     formula_columns?: string[];
+    formula_column_details?: Record<string, string>;
   };
+  cell_map?: Record<string, CellClassification>;
   notes: string;
   file_url: string;
+  template_html?: string;
+  field_mapping_preview?: FieldMappingPreviewItem[];
+  order_template_name?: string;
 }
 
-export async function analyzeExcelTemplate(file: File): Promise<TemplateAnalysisResult> {
+export async function analyzeExcelTemplate(
+  file: File,
+  orderTemplateId?: number,
+): Promise<TemplateAnalysisResult> {
   const form = new FormData();
   form.append("file", file);
+  if (orderTemplateId != null) {
+    form.append("order_template_id", String(orderTemplateId));
+  }
   const res = await fetchWithAuth(`${API_BASE}/api/settings/supplier-templates/analyze`, {
     method: "POST",
     body: form,

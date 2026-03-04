@@ -19,9 +19,10 @@ from dataclasses import dataclass, field
 @dataclass
 class LLMConfig:
     provider: str = "gemini"
-    model_name: str = "gemini-2.5-flash"
+    model_name: str = "gemini-3-flash-preview"
     api_key: str = ""
     thinking_budget: int = 4096
+    max_output_tokens: int = 65536
     max_retries: int = 2
     retry_delay: float = 1.0
 
@@ -176,7 +177,7 @@ def load_config(**overrides) -> Config:
     """Load configuration with defaults + environment overrides.
 
     Keyword arguments override specific fields:
-        load_config(llm=LLMConfig(model_name="gemini-2.5-pro"))
+        load_config(llm=LLMConfig(model_name="gemini-3-flash-preview"))
     """
     config = Config()
 

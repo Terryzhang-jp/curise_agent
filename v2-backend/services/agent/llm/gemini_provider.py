@@ -56,6 +56,7 @@ class GeminiProvider(LLMProvider):
             tools=gemini_tools or None,
             system_instruction=system_prompt,
             thinking_config=thinking_config,
+            max_output_tokens=self._config.max_output_tokens,
         )
 
     def generate(self, history: list[Any]) -> LLMResponse:
@@ -121,6 +122,24 @@ class GeminiProvider(LLMProvider):
     # ----------------------------------------------------------
 
     @staticmethod
+    def _build_schema(param_info: dict) -> types.Schema:
+        """Recursively build Gemini Schema. Supports string/number/integer/boolean/array/object."""
+        type_str = param_info.get("type", "STRING").upper()
+        kwargs: dict = {"type": type_str}
+        if "description" in param_info:
+            kwargs["description"] = param_info["description"]
+        if type_str == "ARRAY" and "items" in param_info:
+            kwargs["items"] = GeminiProvider._build_schema(param_info["items"])
+        if type_str == "OBJECT" and "properties" in param_info:
+            props = {}
+            for name, info in param_info["properties"].items():
+                props[name] = GeminiProvider._build_schema(info)
+            kwargs["properties"] = props
+            if isinstance(param_info.get("required"), list):
+                kwargs["required"] = param_info["required"]
+        return types.Schema(**kwargs)
+
+    @staticmethod
     def _convert_tools(declarations: list[ToolDeclaration]) -> list[types.Tool]:
         """Convert provider-agnostic ToolDeclarations to Gemini SDK Tools."""
         if not declarations:
@@ -131,10 +150,7 @@ class GeminiProvider(LLMProvider):
             properties = {}
             required = []
             for param_name, param_info in td.parameters.items():
-                properties[param_name] = types.Schema(
-                    type=param_info.get("type", "STRING"),
-                    description=param_info.get("description", ""),
-                )
+                properties[param_name] = GeminiProvider._build_schema(param_info)
                 if param_info.get("required", True):
                     required.append(param_name)
 

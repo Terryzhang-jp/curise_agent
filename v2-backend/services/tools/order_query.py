@@ -93,6 +93,55 @@ _TABLE_SCHEMAS = {
 注意: products/match_results/order_metadata 等是 JSON 字段。
 用 PostgreSQL JSON 操作符查询: products::text, order_metadata->>'po_number', jsonb_array_length(products) 等。
 """,
+    "v2_upload_batches": """### v2_upload_batches (产品数据上传批次)
+- id (INTEGER, PK)
+- session_id (VARCHAR) — 关联的聊天会话ID
+- user_id (INTEGER) — 上传用户
+- file_name (VARCHAR) — 上传的文件名
+- file_hash (VARCHAR) — 文件哈希（去重）
+- status (VARCHAR) — staging / validating / previewing / executing / completed / failed / rolled_back
+- supplier_id (INTEGER) — 关联供应商
+- supplier_name (VARCHAR) — 供应商名称
+- country_id (INTEGER) — 关联国家
+- country_name (VARCHAR) — 国家名称
+- column_mapping (JSON) — 列映射关系
+- summary (JSON) — 执行结果摘要（inserted/updated/skipped/failed 等）
+- created_at (DATETIME)
+- completed_at (DATETIME)
+
+注意: 这是产品数据导入的批次表，与 v2_orders（订单上传）不同。
+查今日上传: SELECT * FROM v2_upload_batches WHERE created_at >= CURRENT_DATE ORDER BY created_at DESC
+""",
+    "v2_staging_products": """### v2_staging_products (暂存产品行)
+- id (INTEGER, PK)
+- batch_id (INTEGER, FK → v2_upload_batches.id) — 所属批次
+- row_number (INTEGER) — 原始文件行号
+- raw_data (JSON) — 原始行数据
+- product_name (VARCHAR) — 产品名称
+- product_code (VARCHAR) — 产品代码
+- price (NUMERIC) — 价格
+- unit (VARCHAR) — 单位
+- pack_size (VARCHAR) — 包装规格
+- brand (VARCHAR) — 品牌
+- currency (VARCHAR) — 货币
+- country_of_origin (VARCHAR) — 原产国
+- validation_status (VARCHAR) — pending / valid / invalid / quarantined
+- validation_errors (JSON) — 验证错误
+- match_result (JSON) — 匹配结果（含 action, confidence, db_product_id, price_change_pct 等）
+- resolved_supplier_id (INTEGER)
+- resolved_country_id (INTEGER)
+""",
+    "v2_product_changelog": """### v2_product_changelog (产品变更日志)
+- id (INTEGER, PK)
+- product_id (INTEGER) — 被变更的产品ID
+- batch_id (INTEGER, FK → v2_upload_batches.id) — 来源批次
+- change_type (VARCHAR) — created / updated / rolled_back
+- field_changes (JSON) — 字段级变更详情 {"field": {"old": x, "new": y}}
+- created_at (DATETIME)
+
+查某批次的变更: SELECT * FROM v2_product_changelog WHERE batch_id = ?
+查某产品的变更历史: SELECT * FROM v2_product_changelog WHERE product_id = ? ORDER BY created_at
+""",
 }
 
 _QUERY_HINTS = """
@@ -108,6 +157,9 @@ _QUERY_HINTS = """
 - 查订单元数据: SELECT id, filename, order_metadata FROM v2_orders WHERE id = ?
 - 按状态筛选订单: SELECT id, filename, status, created_at FROM v2_orders WHERE status = 'ready'
 - 订单产品数量统计: SELECT id, filename, product_count, jsonb_array_length(products) FROM v2_orders
+- 查上传批次: SELECT id, file_name, status, supplier_name, country_name, created_at FROM v2_upload_batches ORDER BY created_at DESC
+- 查今日上传: SELECT id, file_name, status, supplier_name, summary, created_at FROM v2_upload_batches WHERE created_at >= CURRENT_DATE
+- 查批次变更日志: SELECT cl.*, p.product_name_en FROM v2_product_changelog cl JOIN products p ON cl.product_id = p.id WHERE cl.batch_id = ?
 """
 
 # SQL keywords that indicate write operations
@@ -119,7 +171,7 @@ _FORBIDDEN_PATTERN = re.compile(
 _LIMIT_PATTERN = re.compile(r"\bLIMIT\b", re.IGNORECASE)
 
 # Tables to probe for availability
-_TABLES_TO_CHECK = ["countries", "ports", "products", "suppliers", "categories", "supplier_categories", "v2_orders"]
+_TABLES_TO_CHECK = ["countries", "ports", "products", "suppliers", "categories", "supplier_categories", "v2_orders", "v2_upload_batches", "v2_staging_products", "v2_product_changelog"]
 
 
 def create_order_query_tools(registry, ctx):

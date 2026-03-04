@@ -114,7 +114,7 @@ class ReActAgent:
             self.max_turns = max_turns
             self.thinking_budget = thinking_budget
             self.warn_turns_remaining = warn_turns_remaining
-            self.model_name = "gemini-2.5-flash"
+            self.model_name = "gemini-3-flash-preview"
             self._parallel_workers = 4
             self._loop_window = 20
             self.loop_threshold = 3

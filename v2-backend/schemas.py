@@ -130,6 +130,7 @@ class OrderFormatTemplateCreate(BaseModel):
     extracted_fields: Optional[list[dict[str, Any]]] = None
     source_company: Optional[str] = None
     match_keywords: Optional[list[str]] = None
+    notes: Optional[str] = None
     is_active: bool = True
 
 
@@ -144,6 +145,7 @@ class OrderFormatTemplateUpdate(BaseModel):
     extracted_fields: Optional[list[dict[str, Any]]] = None
     source_company: Optional[str] = None
     match_keywords: Optional[list[str]] = None
+    notes: Optional[str] = None
     is_active: Optional[bool] = None
 
 
@@ -161,6 +163,7 @@ class OrderFormatTemplateResponse(BaseModel):
     extracted_fields: Optional[list[dict[str, Any]]] = None
     source_company: Optional[str] = None
     match_keywords: Optional[list[str]] = None
+    notes: Optional[str] = None
     is_active: bool = True
     created_by: Optional[int] = None
     created_at: datetime
@@ -172,13 +175,16 @@ class OrderFormatTemplateResponse(BaseModel):
 # ─── Supplier Template ──────────────────────────────────────────
 
 class SupplierTemplateCreate(BaseModel):
-    supplier_id: Optional[int] = None
+    supplier_id: Optional[int] = None  # legacy, 优先用 supplier_ids
+    supplier_ids: Optional[list[int]] = None
     country_id: Optional[int] = None
     template_name: str
     template_file_url: Optional[str] = None
     field_positions: Optional[dict[str, Any]] = None  # {key: {position, data_type, description}} or legacy {key: "A4"}
     has_product_table: bool = True
     product_table_config: Optional[dict[str, Any]] = None
+    order_format_template_id: Optional[int] = None
+    field_mapping_metadata: Optional[dict[str, Any]] = None
 
 
 class SupplierTemplateUpdate(BaseModel):
@@ -188,17 +194,22 @@ class SupplierTemplateUpdate(BaseModel):
     field_positions: Optional[dict[str, Any]] = None
     has_product_table: Optional[bool] = None
     product_table_config: Optional[dict[str, Any]] = None
+    order_format_template_id: Optional[int] = None
+    field_mapping_metadata: Optional[dict[str, Any]] = None
 
 
 class SupplierTemplateResponse(BaseModel):
     id: int
     supplier_id: Optional[int] = None
+    supplier_ids: Optional[list[int]] = None
     country_id: Optional[int] = None
     template_name: str
     template_file_url: Optional[str] = None
     field_positions: Optional[dict[str, Any]] = None
     has_product_table: bool
     product_table_config: Optional[dict[str, Any]] = None
+    order_format_template_id: Optional[int] = None
+    field_mapping_metadata: Optional[dict[str, Any]] = None
     created_by: Optional[int] = None
     created_at: datetime
     updated_at: datetime
@@ -213,7 +224,7 @@ class OrderListItem(BaseModel):
     id: int
     filename: str
     file_url: Optional[str] = None
-    file_type: str
+    file_type: Optional[str] = "xlsx"
     status: str
     processing_error: Optional[str] = None
     order_metadata: Optional[dict[str, Any]] = None
@@ -221,12 +232,12 @@ class OrderListItem(BaseModel):
     total_amount: Optional[float] = None
     match_statistics: Optional[dict[str, Any]] = None
     has_inquiry: bool = False
-    is_reviewed: bool = False
+    is_reviewed: Optional[bool] = False
     fulfillment_status: str = "pending"
     template_id: Optional[int] = None
     template_match_method: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}

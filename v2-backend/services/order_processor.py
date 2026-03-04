@@ -795,6 +795,13 @@ def process_order(order_id: int, file_bytes: bytes) -> None:
                 except Exception as e:
                     logger.warning("Order %d: financial analysis failed: %s", order_id, str(e))
 
+                # Auto-run inquiry pre-analysis
+                try:
+                    from services.inquiry_agent import run_inquiry_pre_analysis
+                    order.inquiry_data = run_inquiry_pre_analysis(order, db)
+                except Exception as e:
+                    logger.warning("Order %d: inquiry pre-analysis failed: %s", order_id, str(e))
+
             # Auto-run delivery environment (if port + delivery_date available)
             if order.port_id and order.delivery_date:
                 try:

@@ -11,6 +11,7 @@ Dual-write strategy (same as pipeline Storage):
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -53,15 +54,38 @@ _TOOL_SUMMARY_MAP: dict[str, str] = {
     "search_product_database": "搜索产品数据库",
     "get_order_overview": "查看订单概览",
     "generate_order_inquiry": "生成询价Excel",
-    "parse_price_list": "解析价格表",
-    "resolve_references": "查找ID引用",
-    "check_existing_products": "比对现有产品",
-    "execute_product_upload": "执行产品导入",
+    "parse_file": "解析上传文件",
+    "resolve_and_validate": "验证暂存数据",
+    "create_references": "创建引用数据",
+    "preview_changes": "预览变更",
+    "execute_upload": "执行产品导入",
+    "audit_data": "数据质量审计",
     "get_order_fulfillment": "查看履约状态",
     "update_order_fulfillment": "更新履约状态",
     "record_delivery_receipt": "记录交货验收",
     "attach_order_file": "附加订单文件",
+    "request_confirmation": "请求用户确认",
 }
+
+
+_STRUCTURED_MARKER = "\n__STRUCTURED__\n"
+
+
+def _extract_structured_data(text: str) -> tuple[str, dict | None]:
+    """Extract structured JSON from tool result text.
+
+    Returns (clean_text, parsed_dict_or_None).
+    Always strips the __STRUCTURED__ marker from clean_text even on parse failure.
+    """
+    idx = text.find(_STRUCTURED_MARKER)
+    if idx < 0:
+        return text, None
+    clean = text[:idx]
+    json_str = text[idx + len(_STRUCTURED_MARKER):]
+    try:
+        return clean, json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return clean, None
 
 
 class ChatStorage:
@@ -204,13 +228,17 @@ class ChatStorage:
                 if tool_name == "think":
                     continue  # Skip think tool result ("[Thought recorded]")
                 result_text = data.get("result", "")
-                # P1-2: Don't truncate query_db results — frontend needs full JSON for DataTable
-                if tool_name != "query_db" and len(result_text) > 2000:
-                    result_text = result_text[:2000] + "..."
 
-                if result_text.startswith("Error:"):
+                # Extract structured data (upload cards, confirmation, etc.)
+                clean_text, upload_data = _extract_structured_data(result_text)
+
+                # P1-2: Don't truncate query_db results — frontend needs full JSON for DataTable
+                if tool_name != "query_db" and len(clean_text) > 2000:
+                    clean_text = clean_text[:2000] + "..."
+
+                if clean_text.startswith("Error:"):
                     from services.agent.error_utils import parse_tool_error, log_tool_error
-                    error_meta = parse_tool_error(result_text, tool_name)
+                    error_meta = parse_tool_error(clean_text, tool_name)
                     error_meta["duration_ms"] = data.get("duration_ms", 0)
                     log_tool_error(session_id, tool_name, error_meta)
                     self._write_display_message(
@@ -219,10 +247,29 @@ class ChatStorage:
                         metadata=error_meta,
                     )
                 else:
+                    meta = {"tool_name": tool_name, "duration_ms": data.get("duration_ms", 0)}
+                    if upload_data:
+                        # Ensure card_type for backward compat
+                        if "card_type" not in upload_data:
+                            _LEGACY = {
+                                "resolve_and_validate": "upload_validation",
+                                "preview_changes": "upload_preview",
+                                "execute_upload": "upload_result",
+                            }
+                            upload_data["card_type"] = _LEGACY.get(upload_data.get("tool", ""), "unknown")
+                        meta["structured_card"] = upload_data
+                    elif tool_name == "query_db":
+                        # Auto-wrap query_db JSON as structured card
+                        try:
+                            parsed = json.loads(clean_text)
+                            if isinstance(parsed.get("columns"), list) and isinstance(parsed.get("rows"), list):
+                                meta["structured_card"] = {"card_type": "query_table", **parsed}
+                        except (json.JSONDecodeError, ValueError):
+                            pass
                     self._write_display_message(
                         session_id, "tool", "observation",
-                        result_text,
-                        metadata={"tool_name": tool_name, "duration_ms": data.get("duration_ms", 0)},
+                        clean_text,
+                        metadata=meta,
                     )
             elif ptype == "thinking":
                 # Gemini native thinking output

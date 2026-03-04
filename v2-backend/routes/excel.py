@@ -61,6 +61,15 @@ async def parse_file(
     content, filename = await _read_and_validate(file)
     file_url = _save_file(content, filename)
 
+    # Extract raw text for AI inference (non-critical)
+    raw_text = ""
+    try:
+        from services.template_matcher import get_scannable_text
+        file_type_hint = "pdf" if filename.lower().endswith(".pdf") else "excel"
+        raw_text = get_scannable_text(content, file_type_hint)[:5000]
+    except Exception:
+        pass
+
     if filename.lower().endswith(".pdf"):
         # PDF path: AI-driven analysis
         try:
@@ -81,6 +90,19 @@ async def parse_file(
         labels_str = "|".join(sorted(col["label"].lower().strip() for col in columns if col.get("label")))
         fingerprint = hashlib.sha256(labels_str.encode()).hexdigest()[:16] if labels_str else ""
 
+        # Fallback: if pdfplumber not available, construct raw_text from analysis
+        if not raw_text:
+            parts = []
+            for mf in analysis.get("metadata_fields", []):
+                parts.append(f"{mf.get('label','')}: {mf.get('value','')}")
+            for col in columns:
+                parts.append(col.get("label", ""))
+            for row in sample_rows[:10]:
+                parts.append(" ".join(str(c) for c in row if c))
+            if analysis.get("layout_prompt"):
+                parts.append(analysis["layout_prompt"])
+            raw_text = "\n".join(parts)[:5000]
+
         return {
             "file_type": "pdf",
             "sheets": [
@@ -100,6 +122,7 @@ async def parse_file(
             },
             "layout_prompt": analysis.get("layout_prompt", ""),
             "file_url": file_url,
+            "raw_text": raw_text,
         }
     else:
         # Excel path: original logic
@@ -109,6 +132,7 @@ async def parse_file(
             raise HTTPException(status_code=400, detail=f"Excel 解析失败: {str(e)}")
         result["file_url"] = file_url
         result["file_type"] = "excel"
+        result["raw_text"] = raw_text
         return result
 
 

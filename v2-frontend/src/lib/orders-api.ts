@@ -104,10 +104,54 @@ export interface GeneratedFile {
   }> | null;
 }
 
+export interface VerifyResult {
+  cell: string;
+  annotation: string;
+  value: string;
+  status: "pass" | "fail" | "unchecked";
+  reason?: string;
+  suggestion?: string;
+}
+
+export interface SupplierInquiryData {
+  status: "pending" | "generating" | "completed" | "error";
+  supplier_name?: string;
+  product_count?: number;
+  subtotal?: number;
+  currency?: string;
+  missing_fields?: string[] | null;
+  file?: {
+    filename: string;
+    file_url: string;
+    preview_url?: string;
+    product_count: number;
+    has_template?: boolean;
+    template_name?: string | null;
+    template_id?: number | null;
+    selection_method?: string;
+    supplier_id?: number;
+  };
+  template?: {
+    id?: number | null;
+    name?: string | null;
+    method?: string;
+    selection_method?: string;
+    count?: number;
+  };
+  verify_results?: VerifyResult[];
+  elapsed_seconds?: number;
+  error?: string;
+}
+
 export interface InquiryData {
-  generated_files: GeneratedFile[];
+  status?: string;
   supplier_count: number;
-  unassigned_count: number;
+  total_products?: number;
+  suppliers?: Record<string, SupplierInquiryData>;
+  total_elapsed_seconds?: number;
+  // Legacy fields
+  generated_files?: GeneratedFile[];
+  unassigned_count?: number;
   agent_summary?: string;
   agent_elapsed_seconds?: number;
   agent_steps?: number;
@@ -448,23 +492,31 @@ export async function generateInquiry(orderId: number): Promise<Order> {
 // ─── Streaming Inquiry API ──────────────────────────────────
 
 export interface InquiryStep {
-  type: "tool_call" | "tool_result" | "thinking";
+  type: "tool_call" | "tool_result" | "thinking" | "preview" | "supplier_start" | "supplier_done";
   tool_name?: string;
   tool_label?: string;
-  content: string;
-  step_index: number;
-  elapsed_seconds: number;
+  content?: string;
+  step_index?: number;
+  elapsed_seconds?: number;
   duration_ms?: number;
+  // Supplier/preview-specific
+  supplier_id?: number;
+  supplier_name?: string;
+  product_count?: number;
+  status?: string;
+  html?: string;
 }
 
 export async function startGenerateInquiry(
-  orderId: number
+  orderId: number,
+  templateOverrides?: Record<number, number | null>
 ): Promise<{ status: string; stream_key: string }> {
   const res = await fetchWithAuth(
     `${API_BASE}/api/orders/${orderId}/generate-inquiry`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template_overrides: templateOverrides }),
     }
   );
   return handleResponse<{ status: string; stream_key: string }>(res);
@@ -576,4 +628,104 @@ export function getOrderFileDownloadUrl(
 ): string {
   const token = getToken();
   return `${API_BASE}/api/orders/${orderId}/files/${filename}?token=${token}`;
+}
+
+// ─── Single Supplier Inquiry API ──────────────────────────
+
+export async function startGenerateInquirySingleSupplier(
+  orderId: number,
+  supplierId: number,
+  templateId?: number
+): Promise<{ status: string; stream_key: string; supplier_id: number }> {
+  const res = await fetchWithAuth(
+    `${API_BASE}/api/orders/${orderId}/generate-inquiry/${supplierId}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template_id: templateId }),
+    }
+  );
+  return handleResponse<{ status: string; stream_key: string; supplier_id: number }>(res);
+}
+
+/** Stream inquiry progress with a custom stream_key (for single-supplier redo). */
+export function streamInquiryProgressWithKey(
+  orderId: number,
+  streamKey: string,
+  onStep: (step: InquiryStep) => void,
+  onDone: (data: unknown) => void,
+  onError: (err: Error) => void
+): () => void {
+  const controller = new AbortController();
+  const token = getToken();
+
+  (async () => {
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/orders/${orderId}/inquiry-stream?stream_key=${encodeURIComponent(streamKey)}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
+        }
+      );
+
+      if (!res.ok || !res.body) {
+        onError(new Error(`HTTP ${res.status}`));
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr) continue;
+
+          try {
+            const event = JSON.parse(jsonStr);
+            if (event.type === "done") {
+              onDone(event.data || {});
+              return;
+            } else if (event.type === "error") {
+              onError(new Error(event.message || "生成失败"));
+              return;
+            } else {
+              onStep(event as InquiryStep);
+            }
+          } catch {
+            // skip malformed JSON
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        onError(err instanceof Error ? err : new Error("Stream failed"));
+      }
+    }
+  })();
+
+  return () => controller.abort();
+}
+
+export async function getInquiryPreview(
+  orderId: number,
+  supplierId: number
+): Promise<string> {
+  const res = await fetchWithAuth(
+    `${API_BASE}/api/orders/${orderId}/inquiry-preview/${supplierId}`
+  );
+  if (!res.ok) {
+    throw new Error("预览加载失败");
+  }
+  return res.text();
 }

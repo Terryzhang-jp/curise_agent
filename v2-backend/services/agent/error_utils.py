@@ -43,9 +43,9 @@ _RECOVERY_HINTS: dict[str, str] = {
     "ResourceExhausted": "请等待几分钟后重试",
     "DeadlineExceeded": "请稍后重试",
     # Tool-specific hints
-    "parse_price_list": "请确认上传的 Excel 文件格式正确，包含产品信息",
+    "parse_file": "请确认上传的 Excel 文件格式正确，包含产品信息",
     "query_db": "请检查 SQL 语法是否正确",
-    "execute_product_upload": "请确认产品数据完整后重试",
+    "execute_upload": "请确认产品数据完整后重试",
 }
 
 # Regex to extract "ExcType: message" from "Error: ExcType: message"

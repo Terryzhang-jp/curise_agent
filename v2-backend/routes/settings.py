@@ -1,7 +1,7 @@
 import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -197,6 +197,69 @@ def seed_defaults(
 # ═══════════════════════════════════════════════════════════════════
 
 
+@router.post("/order-templates/infer")
+def infer_order_template(
+    body: dict,
+    current_user: User = Depends(require_admin),
+):
+    """Use Gemini to infer template name, source_company, and match_keywords from file content."""
+    import logging as _log
+    logger = _log.getLogger(__name__)
+
+    raw_text = (body.get("raw_text") or "").strip()
+    headers = body.get("headers") or []
+    file_type = body.get("file_type") or "excel"
+
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="raw_text is required")
+
+    prompt = f"""你是采购订单格式分析专家。根据以下订单文件内容，推断：
+
+1. name: 一个简洁的模板名称（中文或英文均可，描述这种订单格式，如"RCCL 标准采购单"、"MSC Purchase Order"）
+2. source_company: 发出此订单的公司名称（如 Royal Caribbean、MSC Cruises）。如果无法确定，返回空字符串。
+3. match_keywords: 3-5个在同类文档中必然出现的、具有区分度的关键词（大写，如 ["ROYAL CARIBBEAN", "RCI", "PURCHASE ORDER"]）
+
+文件类型: {file_type}
+列头: {', '.join(headers) if headers else '无'}
+文件内容:
+{raw_text[:4000]}"""
+
+    try:
+        from google import genai
+        from google.genai import types
+        from services.agent.config import load_api_key
+
+        client = genai.Client(api_key=load_api_key())
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "source_company": {"type": "string"},
+                        "match_keywords": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name", "source_company", "match_keywords"],
+                },
+                thinking_config=types.ThinkingConfig(thinking_budget=1024),
+                temperature=0.1,
+            ),
+        )
+        import json
+        result = json.loads(response.text)
+        return {
+            "name": result.get("name", ""),
+            "source_company": result.get("source_company", ""),
+            "match_keywords": result.get("match_keywords", []),
+        }
+    except Exception as e:
+        logger.warning("Order template inference failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"AI 推理失败: {str(e)}")
+
+
 @router.get("/order-templates", response_model=list[OrderFormatTemplateResponse])
 def list_order_templates(
     db: Session = Depends(get_db),
@@ -348,9 +411,14 @@ def delete_supplier_template(
 @router.post("/supplier-templates/analyze")
 async def analyze_supplier_template(
     file: UploadFile = File(...),
+    order_template_id: int | None = Form(None),
+    db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """AI-analyze an uploaded Excel template to discover field positions and product table layout."""
+    """AI-analyze an uploaded Excel template to discover field positions and product table layout.
+
+    If order_template_id is provided, uses enhanced analysis with order context for targeted matching.
+    """
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="请上传 .xlsx 文件")
 
@@ -367,17 +435,91 @@ async def analyze_supplier_template(
         f.write(file_bytes)
     file_url = f"/uploads/{safe_name}"
 
+    order_template_name = None
+
     try:
-        from services.template_analyzer import analyze_excel_template
-        result = analyze_excel_template(file_bytes)
+        import asyncio
+        from services.template_analysis_agent import run_template_analysis_agent
+
+        order_context = None
+        if order_template_id:
+            order_tpl = db.query(OrderFormatTemplate).filter(
+                OrderFormatTemplate.id == order_template_id
+            ).first()
+            if not order_tpl:
+                raise HTTPException(status_code=404, detail="订单格式模板不存在")
+
+            order_template_name = order_tpl.name
+            order_context = _build_order_context(order_tpl, db)
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            run_template_analysis_agent,
+            file_bytes,
+            order_context,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI 分析失败: {str(e)}")
 
-    return {
+    # Generate HTML preview (non-critical — failure does not block analysis)
+    template_html = None
+    try:
+        from services.template_analyzer import generate_template_html
+        template_html = generate_template_html(file_bytes)
+    except Exception as html_err:
+        import logging as _log
+        _log.getLogger(__name__).warning("HTML preview generation failed: %s", html_err)
+
+    response = {
         "field_positions": result.get("field_positions", {}),
         "product_table_config": result.get("product_table_config", {}),
+        "cell_map": result.get("cell_map", {}),
         "notes": result.get("notes", ""),
         "file_url": file_url,
+        "template_html": template_html,
+    }
+    if order_template_id:
+        response["field_mapping_preview"] = result.get("field_mapping_preview", [])
+        response["order_template_name"] = order_template_name
+    return response
+
+
+def _build_order_context(order_tpl: OrderFormatTemplate, db: Session) -> dict:
+    """Build order_context dict from an OrderFormatTemplate for enhanced AI analysis."""
+    header_fields: list[dict] = []
+
+    # 1. extracted_fields → header fields
+    if order_tpl.extracted_fields:
+        for ef in order_tpl.extracted_fields:
+            if isinstance(ef, dict) and ef.get("key"):
+                header_fields.append({"key": ef["key"], "label": ef.get("label", ef["key"])})
+
+    # 2. Fallback: field_schema_id → FieldDefinition
+    if not header_fields and order_tpl.field_schema_id:
+        definitions = (
+            db.query(FieldDefinition)
+            .filter(FieldDefinition.schema_id == order_tpl.field_schema_id)
+            .order_by(FieldDefinition.sort_order)
+            .all()
+        )
+        for d in definitions:
+            header_fields.append({"key": d.field_key, "label": d.field_label})
+
+    # 3. column_mapping → product fields (deduplicate header keys)
+    product_fields: list[dict] = []
+    header_keys = {f["key"] for f in header_fields}
+    if order_tpl.column_mapping:
+        for _col, field_key in order_tpl.column_mapping.items():
+            if field_key and field_key not in header_keys:
+                product_fields.append({"key": field_key, "label": field_key})
+
+    return {
+        "header_fields": header_fields,
+        "product_fields": product_fields,
+        "source_company": order_tpl.source_company,
     }
 
 

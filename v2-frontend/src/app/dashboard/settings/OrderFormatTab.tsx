@@ -15,6 +15,7 @@ import {
   deleteOrderTemplate,
   parseExcel,
   listFieldSchemas,
+  inferOrderTemplate,
 } from "@/lib/settings-api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -120,6 +121,8 @@ export default function OrderFormatTab() {
   // Template matching fields
   const [sourceCompany, setSourceCompany] = useState("");
   const [matchKeywords, setMatchKeywords] = useState("");
+  const [notes, setNotes] = useState("");
+  const [inferring, setInferring] = useState(false);
 
   // List view: expand & edit state
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -127,6 +130,7 @@ export default function OrderFormatTab() {
   const [editName, setEditName] = useState("");
   const [editCompany, setEditCompany] = useState("");
   const [editKeywords, setEditKeywords] = useState("");
+  const [editNotes, setEditNotes] = useState("");
   const [editSaving, setEditSaving] = useState(false);
 
   // field_key → 中文标签 map
@@ -169,6 +173,7 @@ export default function OrderFormatTab() {
     setEditName(tpl.name);
     setEditCompany(tpl.source_company || "");
     setEditKeywords(tpl.match_keywords?.join(", ") || "");
+    setEditNotes(tpl.notes || "");
   };
 
   const handleEditSave = async () => {
@@ -183,6 +188,7 @@ export default function OrderFormatTab() {
         name: editName.trim(),
         source_company: editCompany.trim() || undefined,
         match_keywords: keywords.length > 0 ? keywords : [],
+        notes: editNotes.trim() || undefined,
       });
       await refresh();
       setEditingTpl(null);
@@ -217,6 +223,7 @@ export default function OrderFormatTab() {
     setLayoutPrompt("");
     setSourceCompany("");
     setMatchKeywords("");
+    setNotes("");
   };
 
   const handleFileUpload = async (file: File) => {
@@ -240,6 +247,23 @@ export default function OrderFormatTab() {
         });
         setColumnMapping(mapping);
         setStep(2);
+
+        // Async AI inference for template name/company/keywords (non-blocking)
+        const headerLabels = result.sheets[0].headers.map((h) => h.label);
+        const rawText = result.raw_text || "";
+        if (rawText) {
+          setInferring(true);
+          inferOrderTemplate({ raw_text: rawText, headers: headerLabels, file_type: detectedType })
+            .then((inferred) => {
+              if (inferred.name && !templateName) setTemplateName(inferred.name);
+              if (inferred.source_company && !sourceCompany) setSourceCompany(inferred.source_company);
+              if (inferred.match_keywords?.length && !matchKeywords) {
+                setMatchKeywords(inferred.match_keywords.join(", "));
+              }
+            })
+            .catch(() => {})
+            .finally(() => setInferring(false));
+        }
       }
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "解析失败");
@@ -273,6 +297,7 @@ export default function OrderFormatTab() {
         sample_file_url: fileUrl,
         source_company: sourceCompany.trim() || undefined,
         match_keywords: keywords.length > 0 ? keywords : undefined,
+        notes: notes.trim() || undefined,
         ...(fileType === "pdf" && {
           layout_prompt: layoutPrompt || undefined,
           extracted_fields: pdfMetadata?.fields || undefined,
@@ -394,7 +419,15 @@ export default function OrderFormatTab() {
                           </div>
                         )}
 
-                        {/* b) 列映射表格 */}
+                        {/* b) 备注 */}
+                        {tpl.notes && (
+                          <div>
+                            <div className="text-xs text-muted-foreground mb-1">备注</div>
+                            <p className="text-xs whitespace-pre-wrap">{tpl.notes}</p>
+                          </div>
+                        )}
+
+                        {/* c) 列映射表格 */}
                         {mappingEntries.length > 0 && (
                           <div>
                             <div className="text-xs text-muted-foreground mb-1.5">列映射</div>
@@ -508,6 +541,16 @@ export default function OrderFormatTab() {
                   value={editKeywords}
                   onChange={(e) => setEditKeywords(e.target.value)}
                   placeholder="ROYAL CARIBBEAN, RCI, RCCL"
+                  className="mt-1"
+                />
+              </div>
+              <div>
+                <Label className="text-xs">备注</Label>
+                <Textarea
+                  value={editNotes}
+                  onChange={(e) => setEditNotes(e.target.value)}
+                  placeholder="模板使用说明、注意事项等"
+                  rows={3}
                   className="mt-1"
                 />
               </div>
@@ -711,7 +754,15 @@ export default function OrderFormatTab() {
       {/* Step 3: Name & Save */}
       {step === 3 && (
         <div className="space-y-4">
-          <h4 className="text-sm font-medium">保存模板</h4>
+          <div className="flex items-center gap-2">
+            <h4 className="text-sm font-medium">保存模板</h4>
+            {inferring && (
+              <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                AI 推理中...
+              </span>
+            )}
+          </div>
           <div className="max-w-md space-y-3">
             <div>
               <Label className="text-xs">模板名称 *</Label>
@@ -742,6 +793,16 @@ export default function OrderFormatTab() {
               <p className="text-muted-foreground text-[11px] mt-1">
                 上传订单时自动匹配文档中的关键词
               </p>
+            </div>
+            <div>
+              <Label className="text-xs">备注</Label>
+              <Textarea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="模板使用说明、注意事项等"
+                rows={3}
+                className="mt-1"
+              />
             </div>
           </div>
           {fileType === "pdf" && (

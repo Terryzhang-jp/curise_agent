@@ -125,14 +125,17 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
             "search_product_database": "按关键词搜索产品数据库",
             "get_order_overview": "查看订单概览（基本信息、匹配、询价状态）",
             "generate_order_inquiry": "为指定订单生成询价 Excel 文件",
-            "parse_price_list": "解析上传的 Excel 文件，提取产品列表",
-            "resolve_references": "根据名称查找供应商/国家/港口 ID",
-            "check_existing_products": "比对数据库，找出新增/更新/异常",
-            "execute_product_upload": "确认后执行产品数据导入",
+            "parse_file": "解析上传的 Excel/CSV 文件，创建暂存数据",
+            "resolve_and_validate": "验证暂存数据（代码匹配+LLM模糊匹配+置信度分级）",
+            "create_references": "自动创建缺失的供应商/国家等引用数据",
+            "preview_changes": "生成变更预览报告（新增/更新/异常/无变化）",
+            "execute_upload": "确认后原子执行产品导入，写入变更日志",
+            "audit_data": "数据质量审计（检查列缺失、格式错误、重复数据、单位/价格合理性等）",
             "get_order_fulfillment": "查看订单履约状态（交货、发票、付款）",
             "update_order_fulfillment": "更新订单履约状态和财务信息",
             "record_delivery_receipt": "记录港口交货验收（逐产品接收/拒收）",
             "attach_order_file": "将上传的图片/文件附加到订单",
+            "request_confirmation": "请求用户确认（重要操作前必须调用）",
         }
         for name in sorted(enabled_tools):
             desc = tool_descs.get(name, name)
@@ -159,6 +162,9 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
 - countries / ports: 国家和港口
 - suppliers: 供应商
 - categories: 产品分类
+- v2_upload_batches: 产品数据上传批次（file_name, status, supplier_name, summary 等）
+- v2_staging_products: 暂存产品行（batch_id, product_name, price, match_result 等）
+- v2_product_changelog: 产品变更日志（product_id, batch_id, change_type, field_changes）
 
 ## 规则
 - 需要数据时，先用 get_db_schema 了解表结构，再用 query_db 查询
@@ -170,6 +176,8 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
 - 查询结果务必用 markdown 表格格式展示，不要用列表或纯文字罗列
 - 编写 SQL 时仔细分析用户意图：「按X统计」「不同X的Y」意味着需要 GROUP BY 或窗口函数（如 ROW_NUMBER() OVER (PARTITION BY ...)），而非简单 ORDER BY + LIMIT
 - 表格中数值字段保留合理精度，价格保留2位小数
+- 执行重要操作（删除数据、批量更新、不可逆变更）前，先调用 request_confirmation 获取用户授权
+- 调用 request_confirmation 后必须停止当前回合，等待用户确认或取消
 
 ## 履约管理
 你可以管理订单的完整履约周期：
@@ -182,12 +190,17 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
 
 ## 产品上传流程
 如果用户上传了 Excel 文件（报价单/价格表），你应该：
-1. 先用 parse_price_list 解析文件
-2. 用 resolve_references 确认供应商和国家
-3. 用 check_existing_products 比对数据库
-4. 将结果汇总展示给用户，等用户确认
-5. 用户确认后才调用 execute_product_upload 执行
-注意：每一步都要向用户展示结果，不要跳步。
+1. 用 parse_file 解析文件（自动映射列、创建暂存数据）
+2. 用 resolve_and_validate 验证数据（传入供应商名/国家名）
+   - 高置信度匹配 (≥90%) 自动接受
+   - 中置信度 (70-89%) 告知用户建议
+   - 低置信度 (<70%) 标记为需确认
+3. 用 audit_data 进行数据质量审计（检查格式/缺失/重复/语义问题）
+4. 如有缺失引用数据（新供应商/国家），先询问用户，再用 create_references 创建
+5. 用 preview_changes 生成变更预览，展示给用户
+6. 用户确认后调用 execute_upload（支持排除指定行号）
+注意：resolve_and_validate 之后必须调用 audit_data，不可跳过。每一步都要向用户展示结果，不要跳步。异常价格(涨跌>30%)需要用户明确确认。
+audit_data 工具结果会自动生成结构化卡片展示给用户，你只需简短总结（1-2句话说明有无问题和下一步建议），不要重复列举审计详情。
 {skill_summary}"""
 
 
@@ -508,12 +521,16 @@ async def stream_messages(
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
             return
 
-        max_polls = 240  # 240 * 0.5s = 120s timeout
-        for _ in range(max_polls):
+        max_idle = 240  # 240 consecutive empty reads * 0.5s = 120s inactivity timeout
+        idle_count = 0
+        while idle_count < max_idle:
             try:
                 event = await loop.run_in_executor(None, lambda: q.get(True, 0.5))
             except Empty:
+                idle_count += 1
                 continue
+
+            idle_count = 0  # Reset on successful read
 
             event_type = event.get("type", "")
 
@@ -532,7 +549,7 @@ async def stream_messages(
             # Forward event as-is (message, token, token_done)
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-        # Timeout — clean up
+        # Inactivity timeout — clean up
         remove_queue(session_id)
         yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
 

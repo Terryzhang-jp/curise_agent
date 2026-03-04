@@ -35,6 +35,102 @@ export interface TokenDoneEvent {
   created_at: string;
 }
 
+// ─── Upload structured data types ──────────────────────────────
+
+export interface UploadValidationData {
+  card_type?: "upload_validation";
+  tool: "resolve_and_validate";
+  batch_id: number;
+  stats: { new: number; update: number; no_change: number; anomaly: number };
+  total: number;
+  supplier: { name: string | null; id: number | null };
+  country: { name: string | null; id: number | null };
+  confidence: { high: number; mid: number; low: number; new: number };
+  quarantined: Array<{
+    row: number;
+    name: string;
+    code: string | null;
+    db_name: string;
+    confidence: number;
+    action: string;
+    price_change_pct: number | null;
+  }>;
+  missing_supplier: boolean;
+  missing_country: boolean;
+}
+
+export interface UploadPreviewData {
+  card_type?: "upload_preview";
+  tool: "preview_changes";
+  batch_id: number;
+  supplier: { name: string | null; id: number | null };
+  country: { name: string | null; id: number | null };
+  stats: { new: number; update: number; anomaly: number; no_change: number };
+  anomalies: Array<{
+    row: number;
+    name: string;
+    old_price: number | null;
+    new_price: number | null;
+    change_pct: number | null;
+  }>;
+  new_items: Array<{ row: number; name: string; code: string | null; price: number | null }>;
+  updates: Array<{
+    row: number;
+    name: string;
+    old_price: number | null;
+    new_price: number | null;
+    change_pct: number | null;
+  }>;
+}
+
+export interface UploadResultData {
+  card_type?: "upload_result";
+  tool: "execute_upload";
+  batch_id: number;
+  status: "completed" | "partial";
+  stats: { inserted: number; updated: number; skipped: number; excluded: number; failed: number };
+  failures: string[];
+}
+
+export interface ConfirmationCardData {
+  card_type: "confirmation";
+  title: string;
+  description: string;
+  actions: Array<{ label: string; message: string; variant: "default" | "outline" | "destructive" }>;
+}
+
+export interface QueryTableCardData {
+  card_type: "query_table";
+  columns: string[];
+  rows: Record<string, unknown>[];
+  total: number;
+  truncated?: boolean;
+}
+
+export interface DataAuditFinding {
+  severity: "error" | "warning" | "info";
+  category: string;
+  rows: number[];
+  message: string;
+  suggestion: string;
+}
+
+export interface DataAuditCardData {
+  card_type: "data_audit";
+  batch_id: number;
+  total_rows: number;
+  findings: DataAuditFinding[];
+  summary: string;
+  stats: { error: number; warning: number; info: number };
+}
+
+export type StructuredCard =
+  | UploadValidationData | UploadPreviewData | UploadResultData
+  | ConfirmationCardData | QueryTableCardData
+  | DataAuditCardData;
+
+export type UploadData = UploadValidationData | UploadPreviewData | UploadResultData;
+
 // ─── Helpers ───────────────────────────────────────────────────
 
 async function handleResponse<T>(res: Response): Promise<T> {

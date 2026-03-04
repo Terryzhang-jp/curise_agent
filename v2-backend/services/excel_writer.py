@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
@@ -202,3 +203,100 @@ def _fill_generic(ws, metadata: dict, products: list[dict], supplier_id: int) ->
         except (ValueError, TypeError):
             pass
     ws.cell(row=total_row, column=7, value=total_amount).font = label_font
+
+
+# ─── InquiryWorkbook: Mutable wrapper for agentic cell writes ───
+
+class InquiryWorkbook:
+    """Mutable workbook wrapper for incremental cell writes + live HTML preview."""
+
+    def __init__(self):
+        self._wb: Workbook | None = None
+        self._ws = None
+        self._source: str = "empty"  # "template_file" | "template_new" | "generic" | "empty"
+        self._lock = threading.Lock()
+
+    def load_template(self, file_path: str) -> None:
+        """Load .xlsx template file (preserves formatting/formulas)."""
+        self._wb = load_workbook(file_path)
+        self._ws = self._wb.active
+        self._source = "template_file"
+
+    def create_from_config(self) -> None:
+        """Create new workbook for template-driven fill without a file."""
+        self._wb = Workbook()
+        self._ws = self._wb.active
+        self._ws.title = "Inquiry"
+        self._source = "template_new"
+
+    def create_generic(self, metadata: dict, products: list, supplier_id: int) -> None:
+        """Create generic layout workbook (fully filled, no agent needed)."""
+        self._wb = Workbook()
+        self._ws = self._wb.active
+        self._ws.title = "Inquiry"
+        _fill_generic(self._ws, metadata, products, supplier_id)
+        self._source = "generic"
+
+    def write_cells(self, cells: list[dict]) -> list[dict]:
+        """Write values to cells. Returns status per cell.
+        cells: [{cell: "B3", value: "xxx"}, ...]
+        """
+        with self._lock:
+            results = []
+            for item in cells:
+                ref = item.get("cell", "")
+                val = item.get("value", "")
+                try:
+                    cell = self._ws[ref]
+                    if isinstance(cell, MergedCell):
+                        results.append({"cell": ref, "status": "skipped_merged"})
+                        continue
+                    cell.value = val
+                    results.append({"cell": ref, "status": "ok", "value": str(val)[:50]})
+                except Exception as e:
+                    results.append({"cell": ref, "status": "error", "error": str(e)})
+            return results
+
+    def write_product_rows(self, start_row: int, columns: dict[str, str],
+                           products: list[dict], formula_columns: list[str] | None = None) -> int:
+        """Write product data rows. Returns count of rows written.
+        columns: {"A": "line_number", "C": "product_code", ...}
+        """
+        skip = set(c.upper() for c in (formula_columns or []))
+        with self._lock:
+            for i, product in enumerate(products):
+                row = start_row + i
+                matched = product.get("matched_product") or {}
+                for col_letter, field_key in columns.items():
+                    if col_letter.upper() in skip:
+                        continue
+                    if field_key == "line_number":
+                        value = i + 1
+                    else:
+                        value = product.get(field_key) or matched.get(field_key, "")
+                    if value != "" and value is not None:
+                        cell = self._ws[f"{col_letter}{row}"]
+                        if not isinstance(cell, MergedCell):
+                            cell.value = value
+            return len(products)
+
+    def render_html(self) -> str:
+        """Convert current workbook state to HTML via xlsx2html."""
+        if self._wb is None:
+            return "<p>No workbook loaded</p>"
+        from services.template_analyzer import generate_template_html
+        buf = io.BytesIO()
+        self._wb.save(buf)
+        return generate_template_html(buf.getvalue())
+
+    def save_bytes(self) -> bytes:
+        """Save workbook to bytes."""
+        if self._wb is None:
+            raise RuntimeError("No workbook initialized")
+        buf = io.BytesIO()
+        self._wb.save(buf)
+        return buf.getvalue()
+
+    @property
+    def is_generic(self) -> bool:
+        return self._source == "generic"

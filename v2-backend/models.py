@@ -95,6 +95,7 @@ class OrderFormatTemplate(Base):
     extracted_fields = Column(JSON, nullable=True)  # Metadata fields discovered by AI
     source_company = Column(String(200), nullable=True)   # e.g. "Royal Caribbean"
     match_keywords = Column(JSON, nullable=True)           # e.g. ["ROYAL CARIBBEAN", "RCI"]
+    notes = Column(Text, nullable=True)                     # 管理员备注
     is_active = Column(Boolean, default=True)
     created_by = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -236,8 +237,6 @@ class Product(Base):
     effective_from = Column(DateTime, nullable=True)
     effective_to = Column(DateTime, nullable=True)
     status = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 # Backward compatibility alias
@@ -250,13 +249,16 @@ class SupplierTemplate(Base):
     __tablename__ = "v2_supplier_templates"
 
     id = Column(Integer, primary_key=True, index=True)
-    supplier_id = Column(Integer, nullable=True)  # 逻辑关联, 不加 FK 约束
+    supplier_id = Column(Integer, nullable=True)  # 逻辑关联, 不加 FK 约束 (legacy, 用 supplier_ids)
+    supplier_ids = Column(JSON, nullable=True)  # [1, 2, 3] 多个供应商 ID
     country_id = Column(Integer, nullable=True)  # 逻辑关联到 countries 表
     template_name = Column(String(200), nullable=False)
     template_file_url = Column(String(500), nullable=True)
     field_positions = Column(JSON, nullable=True)  # {"po_number": {"position": "A4", "data_type": "string", "description": "PO番号"}, ...} or legacy {"po_number": "A4"}
     has_product_table = Column(Boolean, default=True)
     product_table_config = Column(JSON, nullable=True)  # {"start_row": 12, "columns": {"A": "product_code", ...}}
+    order_format_template_id = Column(Integer, nullable=True)  # 绑定的订单模板 ID
+    field_mapping_metadata = Column(JSON, nullable=True)  # AI 匹配元数据 (provenance)
     created_by = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -375,6 +377,92 @@ class ToolConfig(Base):
     is_builtin = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UploadBatch(Base):
+    """上传批次 — 每次文件上传创建一个 batch，暂存所有数据直到确认执行"""
+
+    __tablename__ = "v2_upload_batches"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('staging','validating','previewing','executing','completed','failed','rolled_back')",
+            name="ck_v2_upload_batches_status",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(36), nullable=False, index=True)
+    user_id = Column(Integer, nullable=False)
+    file_name = Column(String(500), nullable=False)
+    file_hash = Column(String(64), nullable=True)
+    status = Column(String(20), default="staging")
+    supplier_id = Column(Integer, nullable=True)
+    supplier_name = Column(String(200), nullable=True)
+    country_id = Column(Integer, nullable=True)
+    country_name = Column(String(200), nullable=True)
+    column_mapping = Column(JSON, nullable=True)
+    summary = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    rolled_back_at = Column(DateTime, nullable=True)
+    rolled_back_by = Column(Integer, nullable=True)
+
+    staging_rows = relationship("StagingProduct", back_populates="batch", cascade="all, delete-orphan")
+    changelog_entries = relationship("ProductChangeLog", back_populates="batch")
+
+
+class StagingProduct(Base):
+    """暂存产品行 — 解析后的每一行产品数据，验证后才写入正式表"""
+
+    __tablename__ = "v2_staging_products"
+    __table_args__ = (
+        CheckConstraint(
+            "validation_status IN ('pending','valid','invalid','quarantined')",
+            name="ck_v2_staging_products_vstatus",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("v2_upload_batches.id", ondelete="CASCADE"), nullable=False, index=True)
+    row_number = Column(Integer, nullable=False)
+    raw_data = Column(JSON, nullable=False)
+    product_name = Column(String(200), nullable=True)
+    product_code = Column(String(100), nullable=True)
+    price = Column(Numeric(10, 2), nullable=True)
+    unit = Column(String(50), nullable=True)
+    pack_size = Column(String(100), nullable=True)
+    brand = Column(String(100), nullable=True)
+    currency = Column(String(20), nullable=True)
+    country_of_origin = Column(String(100), nullable=True)
+    validation_status = Column(String(20), default="pending")
+    validation_errors = Column(JSON, nullable=True)
+    match_result = Column(JSON, nullable=True)
+    resolved_supplier_id = Column(Integer, nullable=True)
+    resolved_country_id = Column(Integer, nullable=True)
+
+    batch = relationship("UploadBatch", back_populates="staging_rows")
+
+
+class ProductChangeLog(Base):
+    """产品变更日志 — 记录每次产品创建/更新/回滚的详情"""
+
+    __tablename__ = "v2_product_changelog"
+    __table_args__ = (
+        CheckConstraint(
+            "change_type IN ('created','updated','rolled_back')",
+            name="ck_v2_product_changelog_type",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, nullable=False, index=True)
+    batch_id = Column(Integer, ForeignKey("v2_upload_batches.id"), nullable=False, index=True)
+    change_type = Column(String(20), nullable=False)
+    field_changes = Column(JSON, nullable=True)
+    changed_at = Column(DateTime, default=datetime.utcnow)
+    changed_by = Column(Integer, nullable=True)
+
+    batch = relationship("UploadBatch", back_populates="changelog_entries")
 
 
 class SkillConfig(Base):

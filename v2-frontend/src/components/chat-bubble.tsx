@@ -1,12 +1,64 @@
 "use client";
 
-import { useState } from "react";
+import { useState, memo } from "react";
 import { cn } from "@/lib/utils";
 import { MarkdownContent } from "./markdown-content";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { ChevronDown, BrainCircuit, Wrench, Terminal, AlertTriangle, OctagonX, RotateCw, Database, Loader2 } from "lucide-react";
+import { ChevronDown, BrainCircuit, Wrench, Terminal, AlertTriangle, OctagonX, RotateCw, Loader2 } from "lucide-react";
 import type { ChatMessage } from "@/lib/chat-api";
+import { UploadValidationCard } from "./upload/UploadValidationCard";
+import { UploadPreviewCard } from "./upload/UploadPreviewCard";
+import { UploadResultCard } from "./upload/UploadResultCard";
+import { ConfirmationCard } from "./upload/ConfirmationCard";
+import { QueryTableCard } from "./upload/QueryTableCard";
+import { DataAuditCard } from "./upload/DataAuditCard";
+
+// ─── Card Registry ──────────────────────────────────────────
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const CARD_REGISTRY: Record<string, React.ComponentType<{ data: any; onQuickAction?: (text: string) => void }>> = {
+  upload_validation: UploadValidationCard,
+  upload_preview: UploadPreviewCard,
+  upload_result: UploadResultCard,
+  confirmation: ConfirmationCard,
+  query_table: QueryTableCard,
+  data_audit: DataAuditCard,
+};
+
+const LEGACY_TOOL_TO_CARD: Record<string, string> = {
+  resolve_and_validate: "upload_validation",
+  preview_changes: "upload_preview",
+  execute_upload: "upload_result",
+};
+
+function resolveCardType(data: Record<string, unknown>): string | undefined {
+  if (data.card_type) return data.card_type as string;
+  return LEGACY_TOOL_TO_CARD[data.tool as string] ?? undefined;
+}
+
+// ─── Legacy query result parsing (for old messages without structured_card) ──
+
+interface QueryResult {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  total: number;
+  truncated?: boolean;
+}
+
+function tryParseQueryResult(content: string): QueryResult | null {
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed && Array.isArray(parsed.columns) && Array.isArray(parsed.rows)) {
+      return parsed as QueryResult;
+    }
+  } catch {
+    // not JSON — fall through
+  }
+  return null;
+}
+
+// ─── ChatBubble ─────────────────────────────────────────────
 
 interface ChatBubbleProps {
   role: "user" | "assistant" | "tool";
@@ -16,6 +68,7 @@ interface ChatBubbleProps {
   streaming?: boolean;
   metadata?: Record<string, unknown>;
   onRetry?: (toolName: string) => void;
+  onQuickAction?: (text: string) => void;
 }
 
 function formatTime(dateStr: string): string {
@@ -29,7 +82,7 @@ function formatTime(dateStr: string): string {
   }
 }
 
-export function ChatBubble({ role, content, msgType, createdAt, streaming, metadata, onRetry }: ChatBubbleProps) {
+export const ChatBubble = memo(function ChatBubble({ role, content, msgType, createdAt, streaming, metadata, onRetry, onQuickAction }: ChatBubbleProps) {
   const type = msgType || "text";
 
   // User message
@@ -73,24 +126,27 @@ export function ChatBubble({ role, content, msgType, createdAt, streaming, metad
 
   // Observation (tool result)
   if (type === "observation" || role === "tool") {
-    return <ObservationBubble content={content} />;
+    return <ObservationBubble content={content} metadata={metadata} onQuickAction={onQuickAction} />;
   }
 
   // Assistant text (final answer)
   return (
     <div className="flex justify-start">
       <div className="max-w-[80%] rounded-2xl rounded-bl-md px-4 py-2.5 bg-card border border-border/50 text-sm">
-        <MarkdownContent content={content} />
-        {streaming && (
-          <span className="inline-block w-[2px] h-[1em] bg-primary/70 ml-0.5 animate-pulse align-text-bottom" />
-        )}
-        {!streaming && (
-          <div className="text-[9px] text-muted-foreground mt-1.5">{formatTime(createdAt)}</div>
+        {streaming ? (
+          <div className="whitespace-pre-wrap break-words">{content}
+            <span className="inline-block w-[2px] h-[1em] bg-primary/70 ml-0.5 animate-pulse align-text-bottom" />
+          </div>
+        ) : (
+          <>
+            <MarkdownContent content={content} />
+            <div className="text-[9px] text-muted-foreground mt-1.5">{formatTime(createdAt)}</div>
+          </>
         )}
       </div>
     </div>
   );
-}
+});
 
 function ThinkingBubble({ content }: { content: string }) {
   const [open, setOpen] = useState(false);
@@ -115,114 +171,29 @@ function ThinkingBubble({ content }: { content: string }) {
   );
 }
 
-interface QueryResult {
-  columns: string[];
-  rows: Record<string, unknown>[];
-  total: number;
-  truncated?: boolean;
-}
-
-function tryParseQueryResult(content: string): QueryResult | null {
-  try {
-    const parsed = JSON.parse(content);
-    if (parsed && Array.isArray(parsed.columns) && Array.isArray(parsed.rows)) {
-      return parsed as QueryResult;
-    }
-  } catch {
-    // not JSON — fall through
-  }
-  return null;
-}
-
-function formatCellValue(value: unknown): string {
-  if (value === null || value === undefined) return "-";
-  if (typeof value === "number") return value.toLocaleString("zh-CN");
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
-}
-
-function QueryResultTable({ data }: { data: QueryResult }) {
-  const { columns, rows, total, truncated } = data;
-
-  if (rows.length === 0) {
-    return (
-      <div className="mt-1 px-3 py-4 rounded-lg bg-muted/30 border border-border/30 text-xs text-muted-foreground text-center">
-        查询无结果
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-1 rounded-lg border border-border/30 overflow-hidden">
-      <div className="max-h-[400px] overflow-auto">
-        <table className="w-full text-[11px]">
-          <thead className="sticky top-0 z-10 bg-muted/80 backdrop-blur-sm">
-            <tr>
-              {columns.map((col) => (
-                <th
-                  key={col}
-                  className="px-2.5 py-1.5 text-left font-medium text-muted-foreground whitespace-nowrap border-b border-border/30"
-                >
-                  {col}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, i) => (
-              <tr
-                key={i}
-                className={cn(
-                  "border-b border-border/20 last:border-b-0",
-                  i % 2 === 0 ? "bg-background" : "bg-muted/20"
-                )}
-              >
-                {columns.map((col) => (
-                  <td key={col} className="px-2.5 py-1.5 whitespace-nowrap text-foreground/80">
-                    {formatCellValue(row[col])}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <div className="px-2.5 py-1.5 text-[10px] text-muted-foreground bg-muted/40 border-t border-border/30 flex items-center justify-between">
-        <span>
-          共 {total} 条{truncated ? `（仅显示前 ${rows.length} 条）` : ""}
-        </span>
-        <span>{rows.length} 行 × {columns.length} 列</span>
-      </div>
-    </div>
-  );
-}
-
-function ObservationBubble({ content }: { content: string }) {
+function ObservationBubble({ content, metadata, onQuickAction }: { content: string; metadata?: Record<string, unknown>; onQuickAction?: (text: string) => void }) {
   const [open, setOpen] = useState(false);
-  const queryResult = tryParseQueryResult(content);
-  const isLong = content.length > 200;
 
+  // 1. Structured card (new protocol + legacy fallback)
+  const cardData = (metadata?.structured_card || metadata?.upload_data) as Record<string, unknown> | undefined;
+  if (cardData) {
+    const ct = resolveCardType(cardData);
+    const Card = ct ? CARD_REGISTRY[ct] : undefined;
+    if (Card) return <div className="flex justify-start"><Card data={cardData} onQuickAction={onQuickAction} /></div>;
+  }
+
+  // 2. Legacy query result (old messages without structured_card)
+  const queryResult = tryParseQueryResult(content);
   if (queryResult) {
     return (
       <div className="flex justify-start">
-        <Collapsible open={open} onOpenChange={setOpen} className="max-w-[90%] min-w-[320px]">
-          <CollapsibleTrigger asChild>
-            <button className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-500/5 border border-blue-500/15 text-[10px] text-blue-500 hover:bg-blue-500/10 transition-colors">
-              <Database className="h-3 w-3" />
-              <span className="font-medium">查询结果 · {queryResult.total} 条</span>
-              <ChevronDown className={cn("h-3 w-3 transition-transform", open && "rotate-180")} />
-            </button>
-          </CollapsibleTrigger>
-          <QueryResultTable data={queryResult} />
-          <CollapsibleContent>
-            <div className="mt-1 px-3 py-2 rounded-lg bg-muted/30 border border-border/30 text-[10px] font-mono text-muted-foreground whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
-              {content}
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
+        <QueryTableCard data={{ card_type: "query_table" as const, ...queryResult }} />
       </div>
     );
   }
+
+  // 3. Plain text fallback
+  const isLong = content.length > 200;
 
   return (
     <div className="flex justify-start">
@@ -345,7 +316,7 @@ function getReasoningBlockSummary(messages: ChatMessage[]): string {
   return "推理过程";
 }
 
-function ReasoningStepInline({ msg, onRetry }: { msg: ChatMessage; onRetry?: (toolName: string) => void }) {
+function ReasoningStepInline({ msg, onRetry, onQuickAction }: { msg: ChatMessage; onRetry?: (toolName: string) => void; onQuickAction?: (text: string) => void }) {
   const type = msg.msg_type || "text";
 
   if (type === "thinking") {
@@ -378,18 +349,25 @@ function ReasoningStepInline({ msg, onRetry }: { msg: ChatMessage; onRetry?: (to
   }
 
   if (type === "observation") {
+    // 1. Structured card (new protocol + legacy fallback)
+    const cardData = (msg.metadata?.structured_card || msg.metadata?.upload_data) as Record<string, unknown> | undefined;
+    if (cardData) {
+      const ct = resolveCardType(cardData);
+      const Card = ct ? CARD_REGISTRY[ct] : undefined;
+      if (Card) return <div className="py-1.5"><Card data={cardData} onQuickAction={onQuickAction} /></div>;
+    }
+
+    // 2. Legacy query result (old messages without structured_card)
     const queryResult = tryParseQueryResult(msg.content);
     if (queryResult) {
       return (
         <div className="py-1.5">
-          <div className="flex items-center gap-1.5 text-[10px] text-blue-500 mb-1">
-            <Database className="h-3 w-3" />
-            <span className="font-medium">查询结果 · {queryResult.total} 条</span>
-          </div>
-          <QueryResultTable data={queryResult} />
+          <QueryTableCard data={{ card_type: "query_table" as const, ...queryResult }} />
         </div>
       );
     }
+
+    // 3. Plain text fallback
     const truncated = msg.content.length > 300 ? msg.content.slice(0, 300) + "..." : msg.content;
     return (
       <div className="flex items-start gap-2 py-1.5">
@@ -408,9 +386,10 @@ interface ReasoningBlockProps {
   messages: ChatMessage[];
   isActive: boolean;
   onRetry?: (toolName: string) => void;
+  onQuickAction?: (text: string) => void;
 }
 
-export function ReasoningBlock({ messages, isActive, onRetry }: ReasoningBlockProps) {
+export const ReasoningBlock = memo(function ReasoningBlock({ messages, isActive, onRetry, onQuickAction }: ReasoningBlockProps) {
   const [open, setOpen] = useState(false);
   const summary = getReasoningBlockSummary(messages);
   const stepCount = messages.length;
@@ -449,11 +428,11 @@ export function ReasoningBlock({ messages, isActive, onRetry }: ReasoningBlockPr
         <CollapsibleContent>
           <div className="mt-1.5 ml-1.5 pl-3 border-l-2 border-violet-500/20 space-y-0.5">
             {messages.map((msg) => (
-              <ReasoningStepInline key={msg.id} msg={msg} onRetry={onRetry} />
+              <ReasoningStepInline key={msg.id} msg={msg} onRetry={onRetry} onQuickAction={onQuickAction} />
             ))}
           </div>
         </CollapsibleContent>
       </Collapsible>
     </div>
   );
-}
+});

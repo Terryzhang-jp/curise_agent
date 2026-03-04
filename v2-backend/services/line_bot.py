@@ -360,16 +360,25 @@ def _process_message(event, received_at: float, user_text: str, file_bytes: byte
         except Exception as e:
             logger.error("Agent error for session %s: %s", session.id, e, exc_info=True)
             answer = f"抱歉，处理您的消息时出错了: {str(e)}"
-        finally:
-            # Reset session status
+
+        # Reset session status (in its own try/except to never block delivery)
+        try:
             session = db.query(AgentSession).filter(AgentSession.id == session.id).first()
             if session:
                 session.status = "active"
                 session.updated_at = datetime.utcnow()
                 db.commit()
+        except Exception as e:
+            logger.warning("Failed to reset session status: %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
         # Deliver reply
+        logger.info("Delivering LINE reply to %s (%d chars)", target_id, len(answer))
         deliver_message(reply_token, target_id, answer, received_at)
+        logger.info("LINE reply delivered to %s", target_id)
 
     except Exception as e:
         logger.error("_process_message error for %s: %s", line_user_id, e, exc_info=True)

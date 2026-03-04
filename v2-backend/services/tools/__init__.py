@@ -106,15 +106,17 @@ def create_chat_registry(ctx, enabled_tools: set[str] | None = None):
             if name not in enabled_tools:
                 registry.remove(name)
 
-    # Product upload tools — auto-registered when file is attached OR when
-    # a previous upload session state exists (bypasses enabled_tools filter)
-    _has_upload_context = bool(ctx.file_bytes)
-    if not _has_upload_context and ctx.pipeline_session_id:
-        from services.tools.product_upload import load_upload_state
-        _has_upload_context = load_upload_state(ctx.pipeline_session_id) is not None
-    if _has_upload_context:
-        from services.tools.product_upload import create_product_upload_tools
-        create_product_upload_tools(registry, ctx)
+    # Confirmation tool
+    if _should_register("request_confirmation"):
+        from services.tools.confirmation import create_confirmation_tools
+        create_confirmation_tools(registry, ctx)
+
+    # Data upload tools — auto-registered when file is attached OR when
+    # a previous upload batch exists in DB (bypasses enabled_tools filter)
+    from services.tools.data_upload import has_upload_context as _has_data_upload
+    if _has_data_upload(ctx) or bool(ctx.file_bytes):
+        from services.tools.data_upload import create_data_upload_tools
+        create_data_upload_tools(registry, ctx)
 
     return registry
 
@@ -289,9 +291,9 @@ def _register_order_inquiry(registry, ctx):
         if not order.match_results:
             return "Error: 没有匹配结果，无法生成询价单"
 
-        from services.inquiry_agent import run_inquiry_agent
+        from services.inquiry_agent import run_inquiry_orchestrator
         try:
-            result = run_inquiry_agent(order, ctx.db)
+            result = run_inquiry_orchestrator(order, ctx.db)
             order.inquiry_data = result
             ctx.db.commit()
         except Exception as e:

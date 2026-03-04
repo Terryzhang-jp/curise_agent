@@ -64,7 +64,7 @@ def _get_model():
         raise ValueError("GOOGLE_API_KEY 未配置")
     genai.configure(api_key=settings.GOOGLE_API_KEY)
     return genai.GenerativeModel(
-        "gemini-2.5-flash",
+        "gemini-3-flash-preview",
         generation_config={
             "temperature": 0.1,
             "top_p": 0.95,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   getOrder,
@@ -11,6 +11,9 @@ import {
   fetchDeliveryEnvironment,
   startGenerateInquiry,
   streamInquiryProgress,
+  startGenerateInquirySingleSupplier,
+  streamInquiryProgressWithKey,
+  getInquiryPreview,
   updateOrder,
   rematchOrder,
   downloadOrderFile,
@@ -18,6 +21,7 @@ import {
   type OrderStatus,
   type OrderProduct,
   type InquiryStep,
+  type InquiryData,
   type FulfillmentStatus,
   type DeliveryEnvironment,
 } from "@/lib/orders-api";
@@ -79,6 +83,8 @@ import OrderDataPreview from "@/app/dashboard/workspace/artifacts/OrderDataPrevi
 import MatchResultsPreview from "@/app/dashboard/workspace/artifacts/MatchResultsPreview";
 import AnomalyPreview from "@/app/dashboard/workspace/artifacts/AnomalyPreview";
 import FinancialPreview from "@/app/dashboard/workspace/artifacts/FinancialPreview";
+import { listSupplierTemplates, type SupplierTemplate } from "@/lib/settings-api";
+import SupplierInquiryCard from "@/components/inquiry/SupplierInquiryCard";
 
 const PROCESSING_STATUSES: OrderStatus[] = ["uploading", "extracting", "matching"];
 
@@ -255,13 +261,13 @@ export default function OrderDetailPage() {
   }
 
   // Inquiry streaming handler
-  async function handleGenerateInquiry() {
+  async function handleGenerateInquiry(templateOverrides?: Record<number, number | null>) {
     if (!order) return;
     setInquiryGenerating(true);
     setInquirySteps([]);
 
     try {
-      await startGenerateInquiry(orderId);
+      await startGenerateInquiry(orderId, templateOverrides);
 
       const abort = streamInquiryProgress(
         orderId,
@@ -284,6 +290,40 @@ export default function OrderDetailPage() {
     } catch (err) {
       setInquiryGenerating(false);
       toast.error(err instanceof Error ? err.message : "启动询价单生成失败");
+    }
+  }
+
+  // Single supplier redo
+  async function handleRedoSupplier(supplierId: number, templateId?: number) {
+    if (!order) return;
+    setInquiryGenerating(true);
+    setInquirySteps([]);
+
+    try {
+      const { stream_key } = await startGenerateInquirySingleSupplier(orderId, supplierId, templateId);
+
+      // SSE with supplier-specific stream_key
+      const abort = streamInquiryProgressWithKey(
+        orderId,
+        stream_key,
+        (step) => {
+          setInquirySteps((prev) => [...prev, step]);
+        },
+        async () => {
+          await fetchOrder();
+          setInquiryGenerating(false);
+          setInquirySteps([]);
+          toast.success(`供应商 #${supplierId} 询价单重新生成完成`);
+        },
+        (err) => {
+          setInquiryGenerating(false);
+          toast.error(err.message || "重新生成失败");
+        }
+      );
+      abortInquiryRef.current = abort;
+    } catch (err) {
+      setInquiryGenerating(false);
+      toast.error(err instanceof Error ? err.message : "启动重新生成失败");
     }
   }
 
@@ -534,7 +574,7 @@ export default function OrderDetailPage() {
 
       {/* Inquiry generation progress */}
       {inquiryGenerating && (
-        <InquiryProgress steps={inquirySteps} />
+        <InquiryProgress steps={inquirySteps} order={order} />
       )}
 
       {/* Tabs */}
@@ -615,7 +655,7 @@ export default function OrderDetailPage() {
               )}
             </TabsContent>
             <TabsContent value="inquiry" className="h-full m-0">
-              {order.inquiry_data && <InquiryTab order={order} />}
+              {order.inquiry_data && <InquiryTab order={order} onRedoSupplier={handleRedoSupplier} onGenerateAll={handleGenerateInquiry} inquiryGenerating={inquiryGenerating} />}
             </TabsContent>
             <TabsContent value="fulfillment" className="h-full m-0">
               <FulfillmentTab order={order} />
@@ -1114,70 +1154,181 @@ function EditableProductsTab({
 
 // ─── Inquiry Progress ────────────────────────────────────────
 
-function InquiryProgress({ steps }: { steps: InquiryStep[] }) {
-  // Build display steps: group tool_call + tool_result pairs
-  const displaySteps: {
-    tool_label: string;
-    tool_name: string;
-    elapsed: number;
-    completed: boolean;
-    duration_ms?: number;
-  }[] = [];
+// Human-readable action descriptions (no jargon)
+const STEP_DESCRIPTIONS: Record<string, string> = {
+  read_template: "读取模板",
+  select_template: "选择模板",
+  read_order_data: "读取订单数据",
+  write_cells: "填写表头",
+  write_product_rows: "填写产品明细",
+  verify: "校验数据",
+  save: "保存文件",
+  think: "分析中",
+};
 
-  const seen = new Set<string>();
+interface SupplierProgress {
+  supplier_id: number;
+  supplier_name: string;
+  product_count: number;
+  done: boolean;
+  error: boolean;
+  currentAction: string | null;  // what's happening right now
+  completedSteps: number;
+  elapsedSeconds: number;
+}
 
-  for (const step of steps) {
-    if (step.type === "tool_call" && step.tool_name) {
-      const key = `${step.tool_name}-${step.step_index}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        displaySteps.push({
-          tool_label: step.tool_label || step.tool_name,
-          tool_name: step.tool_name,
-          elapsed: step.elapsed_seconds,
-          completed: false,
-        });
+function InquiryProgress({ steps, order }: { steps: InquiryStep[]; order?: Order | null }) {
+  const groups = useMemo(() => {
+    const map = new Map<number, SupplierProgress>();
+    let currentSid: number | null = null;
+
+    const preNames: Record<number, string> = {};
+    if (order?.inquiry_data?.suppliers) {
+      for (const [k, v] of Object.entries(order.inquiry_data.suppliers)) {
+        if (v.supplier_name) preNames[Number(k)] = v.supplier_name;
       }
-    } else if (step.type === "tool_result" && step.tool_name) {
-      // Mark the last matching uncompleted step as completed
-      for (let i = displaySteps.length - 1; i >= 0; i--) {
-        if (displaySteps[i].tool_name === step.tool_name && !displaySteps[i].completed) {
-          displaySteps[i].completed = true;
-          displaySteps[i].duration_ms = step.duration_ms;
-          break;
+    }
+
+    for (const step of steps) {
+      if (step.type === "supplier_start" && step.supplier_id != null) {
+        currentSid = step.supplier_id;
+        map.set(currentSid, {
+          supplier_id: currentSid,
+          supplier_name: step.supplier_name || preNames[currentSid] || `供应商 #${currentSid}`,
+          product_count: step.product_count ?? 0,
+          done: false,
+          error: false,
+          currentAction: null,
+          completedSteps: 0,
+          elapsedSeconds: 0,
+        });
+      } else if (step.type === "supplier_done" && step.supplier_id != null) {
+        const g = map.get(step.supplier_id);
+        if (g) {
+          g.done = true;
+          g.error = step.status === "error";
+          g.currentAction = null;
+          if (step.elapsed_seconds != null) g.elapsedSeconds = step.elapsed_seconds;
+        }
+      } else if (step.type === "thinking") {
+        const sid = step.supplier_id ?? currentSid;
+        if (sid != null) {
+          const g = map.get(sid);
+          if (g && !g.done) g.currentAction = "分析中...";
+        }
+      } else if (step.type === "tool_call" && step.tool_name) {
+        const sid = step.supplier_id ?? currentSid;
+        if (sid != null) {
+          const g = map.get(sid);
+          if (g && !g.done) {
+            g.currentAction = (STEP_DESCRIPTIONS[step.tool_name] || step.tool_label || step.tool_name) + "...";
+          }
+        }
+      } else if (step.type === "tool_result" && step.tool_name) {
+        const sid = step.supplier_id ?? currentSid;
+        if (sid != null) {
+          const g = map.get(sid);
+          if (g) {
+            g.completedSteps++;
+            if (step.elapsed_seconds != null) g.elapsedSeconds = step.elapsed_seconds;
+          }
         }
       }
     }
+    return Array.from(map.values());
+  }, [steps, order]);
+
+  const isLegacy = groups.length === 0 && steps.length > 0;
+
+  let totalElapsed = 0;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i].type !== "preview" && steps[i].elapsed_seconds != null) {
+      totalElapsed = steps[i].elapsed_seconds!;
+      break;
+    }
   }
 
-  const completedCount = displaySteps.filter((s) => s.completed).length;
-  const lastStep = steps[steps.length - 1];
-  const totalElapsed = lastStep?.elapsed_seconds || 0;
+  const doneCount = groups.filter((g) => g.done).length;
+  const progress = groups.length > 0 ? (doneCount / groups.length) * 100 : 0;
+
+  if (isLegacy) {
+    return <LegacyInquiryProgress steps={steps} />;
+  }
 
   return (
-    <div className="px-6 py-3 bg-blue-50/50 dark:bg-blue-950/20 border-b border-blue-200/30 dark:border-blue-800/30">
-      <div className="flex items-center gap-2 text-xs text-blue-600 dark:text-blue-400 font-medium mb-2">
-        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-        <span>
-          生成询价单中... ({completedCount} 步, {totalElapsed.toFixed(1)}s)
+    <div className="px-6 py-5 border-b border-border/40">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2.5">
+          <div className="relative h-5 w-5 flex items-center justify-center">
+            <FileSpreadsheet className="h-4 w-4 text-primary" />
+            {doneCount < groups.length && (
+              <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+            )}
+          </div>
+          <span className="text-sm font-medium">
+            生成询价单
+          </span>
+        </div>
+        <span className="text-xs text-muted-foreground tabular-nums">
+          {doneCount}/{groups.length} · {totalElapsed.toFixed(1)}s
         </span>
       </div>
+
+      {/* Progress bar */}
+      <div className="h-1 bg-muted rounded-full mb-5 overflow-hidden">
+        <div
+          className="h-full bg-primary rounded-full transition-all duration-700 ease-out"
+          style={{ width: `${Math.max(progress, groups.length > 0 ? 3 : 0)}%` }}
+        />
+      </div>
+
+      {/* Supplier list */}
       <div className="space-y-1">
-        {displaySteps.map((step, i) => (
-          <div key={i} className="flex items-center gap-2 text-xs">
-            {step.completed ? (
-              <CheckCircle2 className="h-3 w-3 text-emerald-500 shrink-0" />
-            ) : (
-              <Loader2 className="h-3 w-3 text-blue-500 animate-spin shrink-0" />
+        {groups.map((g) => (
+          <div
+            key={g.supplier_id}
+            className="flex items-center gap-3 py-2 px-1"
+          >
+            {/* Status indicator */}
+            <div className="shrink-0 w-5 flex justify-center">
+              {g.done && !g.error ? (
+                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+              ) : g.done && g.error ? (
+                <AlertTriangle className="h-4 w-4 text-destructive" />
+              ) : g.currentAction ? (
+                <Loader2 className="h-4 w-4 text-primary animate-spin" />
+              ) : (
+                <div className="h-1.5 w-1.5 rounded-full bg-muted-foreground/30" />
+              )}
+            </div>
+
+            {/* Supplier info */}
+            <div className="min-w-0 flex-1">
+              <div className="flex items-baseline gap-2">
+                <span className={`text-sm truncate ${
+                  g.done ? "text-muted-foreground" : "text-foreground font-medium"
+                }`}>
+                  {g.supplier_name}
+                </span>
+                <span className="text-[11px] text-muted-foreground/60 shrink-0">
+                  {g.product_count} 产品
+                </span>
+              </div>
+              {/* Current action — subtle, single line */}
+              {!g.done && g.currentAction && (
+                <p className="text-[11px] text-muted-foreground/70 mt-0.5 truncate">
+                  {g.currentAction}
+                </p>
+              )}
+            </div>
+
+            {/* Duration (only when done) */}
+            {g.done && (
+              <span className="text-[11px] text-muted-foreground/50 tabular-nums shrink-0">
+                {g.elapsedSeconds.toFixed(1)}s
+              </span>
             )}
-            <span className={step.completed ? "text-muted-foreground" : "text-foreground"}>
-              {step.tool_label}
-            </span>
-            <span className="text-muted-foreground/50 text-[10px] ml-auto tabular-nums">
-              {step.completed && step.duration_ms != null
-                ? `${(step.duration_ms / 1000).toFixed(1)}s`
-                : `${step.elapsed.toFixed(1)}s`}
-            </span>
           </div>
         ))}
       </div>
@@ -1185,21 +1336,77 @@ function InquiryProgress({ steps }: { steps: InquiryStep[] }) {
   );
 }
 
+function LegacyInquiryProgress({ steps }: { steps: InquiryStep[] }) {
+  let currentAction = "";
+  let completedCount = 0;
+  for (const step of steps) {
+    if (step.type === "tool_call" && step.tool_name) {
+      currentAction = (STEP_DESCRIPTIONS[step.tool_name] || step.tool_label || step.tool_name) + "...";
+    } else if (step.type === "tool_result") {
+      completedCount++;
+    }
+  }
+  let totalElapsed = 0;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i].type !== "preview" && steps[i].elapsed_seconds != null) { totalElapsed = steps[i].elapsed_seconds!; break; }
+  }
+
+  return (
+    <div className="px-6 py-5 border-b border-border/40">
+      <div className="flex items-center gap-2.5 mb-3">
+        <div className="relative h-5 w-5 flex items-center justify-center">
+          <FileSpreadsheet className="h-4 w-4 text-primary" />
+          <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+        </div>
+        <span className="text-sm font-medium">生成询价单</span>
+        <span className="text-xs text-muted-foreground tabular-nums ml-auto">
+          {completedCount} 步 · {totalElapsed.toFixed(1)}s
+        </span>
+      </div>
+      {currentAction && (
+        <p className="text-xs text-muted-foreground/70 pl-[30px]">{currentAction}</p>
+      )}
+    </div>
+  );
+}
+
 // ─── Inquiry Tab ────────────────────────────────────────────
 
-const SELECTION_METHOD_LABELS: Record<string, string> = {
-  supplier: "供应商匹配",
-  country: "国家匹配",
-  single: "唯一模板",
-  none: "通用格式",
-};
-
-function InquiryTab({ order }: { order: Order }) {
+function InquiryTab({
+  order,
+  onRedoSupplier,
+  onGenerateAll,
+  inquiryGenerating,
+}: {
+  order: Order;
+  onRedoSupplier?: (supplierId: number, templateId?: number) => void;
+  onGenerateAll?: (templateOverrides?: Record<number, number | null>) => void;
+  inquiryGenerating?: boolean;
+}) {
   const inquiry = order.inquiry_data;
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
+  const [previewSupplierId, setPreviewSupplierId] = useState<number | null>(null);
+  const [previewHtml, setPreviewHtml] = useState<string>("");
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [allTemplates, setAllTemplates] = useState<SupplierTemplate[]>([]);
+  const [templateOverrides, setTemplateOverrides] = useState<Record<number, number | null>>({});
+  const [expandedSupplierId, setExpandedSupplierId] = useState<number | null>(null);
+
+  useEffect(() => {
+    listSupplierTemplates().then(setAllTemplates).catch(() => {});
+  }, []);
+
   if (!inquiry) return null;
 
-  const files = inquiry.generated_files || [];
+  const suppliers = inquiry.suppliers || {};
+  const supplierIds = Object.keys(suppliers).map(Number).sort((a, b) => a - b);
+
+  // Compute totals
+  const totalProducts = supplierIds.reduce(
+    (sum, sid) => sum + (suppliers[String(sid)]?.product_count ?? 0),
+    0
+  );
+  const totalElapsed = inquiry.total_elapsed_seconds;
 
   async function handleDownload(filename: string) {
     setDownloadingFile(filename);
@@ -1212,113 +1419,133 @@ function InquiryTab({ order }: { order: Order }) {
     }
   }
 
+  async function handlePreview(supplierId: number) {
+    setPreviewSupplierId(supplierId);
+    setPreviewLoading(true);
+    try {
+      const html = await getInquiryPreview(order.id, supplierId);
+      setPreviewHtml(html);
+    } catch {
+      setPreviewHtml("<p>预览加载失败，请下载文件查看。</p>");
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
+  function getSelectedTemplateId(sid: number): number | null {
+    if (sid in templateOverrides) return templateOverrides[sid];
+    const sd = suppliers[String(sid)];
+    return sd?.template?.id ?? null;
+  }
+
+  // Build overrides map (only entries that differ from pre-analyzed defaults)
+  function buildOverridesForGenerate(): Record<number, number | null> | undefined {
+    const overrides: Record<number, number | null> = {};
+    let hasOverride = false;
+    for (const sid of supplierIds) {
+      if (sid in templateOverrides) {
+        overrides[sid] = templateOverrides[sid];
+        hasOverride = true;
+      }
+    }
+    return hasOverride ? overrides : undefined;
+  }
+
   return (
     <div className="h-full overflow-y-auto px-6 py-5 space-y-4">
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm">询价单文件</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            共 {inquiry.supplier_count} 个供应商，{files.length} 份询价单
-            {inquiry.unassigned_count > 0 && (
-              <span className="text-amber-500 ml-1">({inquiry.unassigned_count} 个产品未分配)</span>
+      {/* Summary bar */}
+      <div className="flex items-center justify-between">
+        <div className="text-xs text-muted-foreground flex items-center gap-2">
+          <FileSpreadsheet className="h-4 w-4 text-emerald-500" />
+          <span className="font-medium text-foreground">询价单</span>
+          <span>{supplierIds.length} 个供应商</span>
+          <span>&middot;</span>
+          <span>{totalProducts} 产品</span>
+          {totalElapsed != null && (
+            <>
+              <span>&middot;</span>
+              <span>耗时 {totalElapsed}s</span>
+            </>
+          )}
+          {(inquiry.unassigned_count ?? 0) > 0 && (
+            <span className="text-amber-500">({inquiry.unassigned_count} 未分配)</span>
+          )}
+        </div>
+        {onGenerateAll && (
+          <Button
+            size="sm"
+            className="text-xs h-7"
+            disabled={inquiryGenerating}
+            onClick={() => onGenerateAll(buildOverridesForGenerate())}
+          >
+            {inquiryGenerating ? (
+              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+            ) : (
+              <FileSpreadsheet className="mr-1 h-3 w-3" />
             )}
-            {inquiry.agent_elapsed_seconds != null && (
-              <span className="ml-2">
-                Agent 耗时 {inquiry.agent_elapsed_seconds}s
-                {inquiry.agent_steps != null && <>, {inquiry.agent_steps} 步</>}
-              </span>
-            )}
-          </p>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {files.map((file, i) => (
-            <div key={i} className="rounded-lg border">
-              <div className="flex items-center justify-between px-3 py-2.5">
-                <div className="flex items-center gap-3">
-                  <FileSpreadsheet className="h-4 w-4 text-emerald-500 shrink-0" />
-                  <div>
-                    <div className="text-xs font-medium">{file.filename || `供应商 #${file.supplier_id}`}</div>
-                    <div className="text-[10px] text-muted-foreground flex items-center gap-1 flex-wrap">
-                      <span>供应商 #{file.supplier_id}</span>
-                      <span>&middot;</span>
-                      <span>{file.product_count} 个产品</span>
-                      {file.template_name && (
-                        <>
-                          <span>&middot;</span>
-                          <span>模板: {file.template_name}</span>
-                        </>
-                      )}
-                      {file.selection_method && (
-                        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] bg-muted">
-                          {SELECTION_METHOD_LABELS[file.selection_method] || file.selection_method}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-                {file.filename ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-xs h-7"
-                    disabled={downloadingFile === file.filename}
-                    onClick={() => handleDownload(file.filename!)}
-                  >
-                    {downloadingFile === file.filename ? (
-                      <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                    ) : (
-                      <Download className="mr-1 h-3 w-3" />
-                    )}
-                    下载
-                  </Button>
-                ) : file.error ? (
-                  <span className="text-xs text-destructive">{file.error}</span>
-                ) : null}
+            {inquiryGenerating ? "生成中..." : "全部生成"}
+          </Button>
+        )}
+      </div>
+
+      {/* Supplier cards grid */}
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+        {supplierIds.map((sid) => (
+          <SupplierInquiryCard
+            key={sid}
+            supplierId={sid}
+            data={suppliers[String(sid)]}
+            allTemplates={allTemplates}
+            selectedTemplateId={getSelectedTemplateId(sid)}
+            onTemplateChange={(tid) =>
+              setTemplateOverrides((prev) => ({ ...prev, [sid]: tid }))
+            }
+            expanded={expandedSupplierId === sid}
+            onToggle={() =>
+              setExpandedSupplierId((prev) => (prev === sid ? null : sid))
+            }
+            onPreview={() => handlePreview(sid)}
+            onDownload={(f) => handleDownload(f)}
+            onRedo={() =>
+              onRedoSupplier?.(
+                sid,
+                templateOverrides[sid] !== undefined
+                  ? templateOverrides[sid] ?? undefined
+                  : undefined
+              )
+            }
+            downloadingFile={downloadingFile}
+          />
+        ))}
+      </div>
+
+      {/* Preview dialog */}
+      <Dialog
+        open={previewSupplierId !== null}
+        onOpenChange={(open) => {
+          if (!open) setPreviewSupplierId(null);
+        }}
+      >
+        <DialogContent className="max-w-4xl max-h-[85vh] overflow-hidden flex flex-col">
+          <DialogHeader>
+            <DialogTitle className="text-sm">
+              询价单预览 — 供应商 #{previewSupplierId}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex-1 overflow-auto">
+            {previewLoading ? (
+              <div className="flex items-center justify-center py-10">
+                <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
               </div>
-
-              {/* AI field mapping details */}
-              {file.field_mapping && Object.keys(file.field_mapping).length > 0 && (
-                <div className="px-3 pb-2.5 border-t">
-                  <div className="text-[10px] text-muted-foreground mt-2 mb-1">AI 字段映射</div>
-                  <div className="flex flex-wrap gap-1">
-                    {Object.entries(file.field_mapping).map(([tplField, metaKey]) => (
-                      <span key={tplField} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300">
-                        {tplField === metaKey ? tplField : `${tplField} ← ${metaKey}`}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Review warnings */}
-              {file.review_issues && file.review_issues.length > 0 && (
-                <div className="px-3 pb-2.5 border-t">
-                  <div className="text-[10px] text-amber-600 mt-2 mb-1">AI 审查警告</div>
-                  <div className="space-y-1">
-                    {file.review_issues.map((issue, j) => (
-                      <div key={j} className="text-[10px] text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950 rounded px-2 py-1">
-                        <span className="font-mono">{issue.cell}</span> {issue.field}: {issue.issue}
-                        {issue.suggestion && <span className="text-muted-foreground ml-1">({issue.suggestion})</span>}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      {inquiry.agent_summary && (
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Agent 总结</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-xs text-muted-foreground whitespace-pre-wrap">{inquiry.agent_summary}</p>
-          </CardContent>
-        </Card>
-      )}
+            ) : (
+              <div
+                className="excel-preview p-2"
+                dangerouslySetInnerHTML={{ __html: previewHtml }}
+              />
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

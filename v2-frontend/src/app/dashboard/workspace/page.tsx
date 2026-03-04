@@ -26,6 +26,8 @@ export default function WorkspacePage() {
   const [file, setFile] = useState<File | null>(null);
 
   const streamAbortRef = useRef<(() => void) | null>(null);
+  // Stable ref for doSend — allows useCallback handlers to avoid stale closures
+  const doSendRef = useRef<(text: string, file?: File | null) => void>(() => {});
 
   // Typewriter animation state
   const typewriterRef = useRef<{
@@ -36,30 +38,65 @@ export default function WorkspacePage() {
     finalContent: string;
     finalCreatedAt: string;
   } | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const lastTickRef = useRef<number>(0);
 
   function stopTypewriter() {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
+    const tw = typewriterRef.current;
+    if (tw) {
+      // Use authoritative full_content from token_done, fall back to accumulated
+      // token target if token_done was never received (e.g. SSE timeout).
+      const content = tw.finalContent || tw.target;
+      if (content) {
+        const { msgId, finalCreatedAt } = tw;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === msgId
+              ? { ...m, content, streaming: false, created_at: finalCreatedAt || m.created_at }
+              : m
+          )
+        );
+      }
+    }
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
     }
     typewriterRef.current = null;
   }
 
   function startTypewriter(msgId: number) {
-    if (timerRef.current) return;
+    if (rafRef.current) return;
 
-    timerRef.current = setInterval(() => {
+    lastTickRef.current = performance.now();
+
+    function tick(now: number) {
       const tw = typewriterRef.current;
       if (!tw || tw.msgId !== msgId) {
-        clearInterval(timerRef.current!);
-        timerRef.current = null;
+        rafRef.current = null;
         return;
       }
 
-      const nextReveal = Math.min(tw.revealed + 3, tw.target.length);
+      // Throttle to ~50fps (20ms between updates)
+      if (now - lastTickRef.current < 20) {
+        rafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+      lastTickRef.current = now;
+
+      // Dynamic chunk size: scale with content length for faster reveal on long text
+      const pending = tw.target.length - tw.revealed;
+      const chunk = Math.max(20, Math.floor(pending / 15));
+      const prevRevealed = tw.revealed;
+      const nextReveal = Math.min(tw.revealed + chunk, tw.target.length);
       tw.revealed = nextReveal;
       const isComplete = tw.done && nextReveal >= tw.target.length;
+
+      // Nothing new to reveal and not complete — wait for more tokens without re-rendering
+      if (nextReveal === prevRevealed && !isComplete) {
+        rafRef.current = requestAnimationFrame(tick);
+        return;
+      }
 
       setMessages((prev) =>
         prev.map((m) =>
@@ -75,11 +112,14 @@ export default function WorkspacePage() {
       );
 
       if (isComplete) {
-        clearInterval(timerRef.current!);
-        timerRef.current = null;
+        rafRef.current = null;
         typewriterRef.current = null;
+      } else {
+        rafRef.current = requestAnimationFrame(tick);
       }
-    }, 20);
+    }
+
+    rafRef.current = requestAnimationFrame(tick);
   }
 
   const stopStream = useCallback(() => {
@@ -212,6 +252,7 @@ export default function WorkspacePage() {
           });
         },
         (title) => {
+          stopTypewriter(); // Finalize any in-progress typewriter with full content
           setSending(false);
           streamAbortRef.current = null;
           if (title) {
@@ -279,6 +320,9 @@ export default function WorkspacePage() {
     }
   }
 
+  // Keep ref in sync so stable callbacks always call the latest doSend
+  doSendRef.current = doSend;
+
   // Public send handler — extracts current input/file state
   function handleSend() {
     if ((!input.trim() && !file) || !activeSessionId || sending) return;
@@ -286,11 +330,15 @@ export default function WorkspacePage() {
     doSend(text, file);
   }
 
-  // Retry handler — sends a retry request as a new user message
-  function handleRetry(toolName: string) {
-    if (!activeSessionId || sending) return;
-    doSend(`请重新执行上一步操作 (${toolName})`);
-  }
+  // Retry handler — stable ref to avoid breaking React.memo on ChatBubble
+  const handleRetry = useCallback((toolName: string) => {
+    doSendRef.current(`请重新执行上一步操作 (${toolName})`);
+  }, []);
+
+  // Quick action handler — stable ref to avoid breaking React.memo on ChatBubble
+  const handleQuickAction = useCallback((text: string) => {
+    doSendRef.current(text);
+  }, []);
 
   return (
     <div className="h-full flex">
@@ -313,6 +361,7 @@ export default function WorkspacePage() {
         file={file}
         onFileChange={setFile}
         onRetry={handleRetry}
+        onQuickAction={handleQuickAction}
       />
     </div>
   );

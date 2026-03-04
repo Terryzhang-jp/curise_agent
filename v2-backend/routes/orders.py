@@ -16,8 +16,11 @@ import uuid
 from datetime import datetime
 from queue import Empty
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session as DBSession
 
@@ -300,6 +303,13 @@ def _run_rematch(order_id: int):
                 except Exception as e:
                     logger.warning("Rematch: Order %d financial analysis failed: %s", order_id, str(e))
 
+                # Auto-run inquiry pre-analysis
+                try:
+                    from services.inquiry_agent import run_inquiry_pre_analysis
+                    order.inquiry_data = run_inquiry_pre_analysis(order, db)
+                except Exception as e:
+                    logger.warning("Rematch: Order %d inquiry pre-analysis failed: %s", order_id, str(e))
+
         order.processed_at = datetime.utcnow()
         db.commit()
         logger.info("Rematch: Order %d complete", order_id)
@@ -500,9 +510,16 @@ def delivery_environment(
 
 # ─── Generate Inquiry (Streaming) ─────────────────────────────
 
+class GenerateInquiryRequest(BaseModel):
+    template_overrides: Optional[dict[int, Optional[int]]] = None
+
+class GenerateInquirySingleRequest(BaseModel):
+    template_id: Optional[int] = None
+
 @router.post("/{order_id}/generate-inquiry")
 def generate_inquiry(
     order_id: int,
+    body: GenerateInquiryRequest = GenerateInquiryRequest(),
     current_user: User = Depends(require_writer),
     db: DBSession = Depends(get_db),
 ):
@@ -528,16 +545,16 @@ def generate_inquiry(
 
     threading.Thread(
         target=_run_inquiry_background,
-        args=(order_id, stream_key),
+        args=(order_id, stream_key, body.template_overrides),
         daemon=True,
     ).start()
 
     return {"status": "generating", "stream_key": stream_key}
 
 
-def _run_inquiry_background(order_id: int, stream_key: str):
-    """Background thread: run streaming inquiry agent and save results."""
-    from services.inquiry_agent import run_inquiry_agent_streaming
+def _run_inquiry_background(order_id: int, stream_key: str, template_overrides=None):
+    """Background thread: run inquiry orchestrator and save results."""
+    from services.inquiry_agent import run_inquiry_orchestrator
 
     db = SessionLocal()
     try:
@@ -547,7 +564,7 @@ def _run_inquiry_background(order_id: int, stream_key: str):
             push_event(stream_key, {"type": "error", "message": "订单不存在"})
             return
 
-        inquiry_data = run_inquiry_agent_streaming(order, db, stream_key)
+        inquiry_data = run_inquiry_orchestrator(order, db, stream_key, template_overrides)
 
         order.inquiry_data = inquiry_data
         # Auto-advance fulfillment status to inquiry_sent
@@ -578,10 +595,12 @@ def _run_inquiry_background(order_id: int, stream_key: str):
 @router.get("/{order_id}/inquiry-stream")
 async def inquiry_stream(
     order_id: int,
+    stream_key: str | None = Query(None, description="Override stream key for single-supplier redo"),
     current_user: User = Depends(get_current_user),
 ):
     """SSE stream for real-time inquiry generation progress."""
-    stream_key = f"inquiry-{order_id}"
+    if not stream_key:
+        stream_key = f"inquiry-{order_id}"
 
     async def event_generator():
         loop = asyncio.get_event_loop()
@@ -617,6 +636,133 @@ async def inquiry_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ─── Single Supplier Inquiry (Re-do) ────────────────────────
+
+@router.post("/{order_id}/generate-inquiry/{supplier_id}")
+def generate_inquiry_single(
+    order_id: int,
+    supplier_id: int,
+    body: GenerateInquirySingleRequest = GenerateInquirySingleRequest(),
+    current_user: User = Depends(require_writer),
+    db: DBSession = Depends(get_db),
+):
+    """Re-generate inquiry for a single supplier."""
+    order = db.query(Order).filter(
+        Order.id == order_id,
+        Order.user_id == current_user.id,
+    ).first()
+    if not order:
+        raise HTTPException(404, "订单不存在")
+    if order.status != "ready":
+        raise HTTPException(400, "订单尚未处理完成")
+    if not order.match_results:
+        raise HTTPException(400, "没有匹配结果")
+
+    # Verify supplier has products in this order
+    has_supplier = any(
+        (item.get("matched_product") or {}).get("supplier_id") == supplier_id
+        for item in order.match_results
+    )
+    if not has_supplier:
+        raise HTTPException(404, f"供应商 {supplier_id} 不在此订单中")
+
+    stream_key = f"inquiry-{order_id}-{supplier_id}"
+
+    if get_queue(stream_key) is not None:
+        raise HTTPException(409, "该供应商询价单正在生成中")
+
+    get_or_create_queue(stream_key)
+
+    threading.Thread(
+        target=_run_inquiry_single_background,
+        args=(order_id, supplier_id, stream_key, body.template_id),
+        daemon=True,
+    ).start()
+
+    return {"status": "generating", "stream_key": stream_key, "supplier_id": supplier_id}
+
+
+def _run_inquiry_single_background(order_id: int, supplier_id: int, stream_key: str, template_id=None):
+    """Background thread: run single supplier inquiry and merge result into order."""
+    from services.inquiry_agent import run_inquiry_single_supplier
+
+    db = SessionLocal()
+    try:
+        order = db.query(Order).get(order_id)
+        if not order:
+            push_event(stream_key, {"type": "error", "message": "订单不存在"})
+            return
+
+        result = run_inquiry_single_supplier(order, db, supplier_id, stream_key, template_id)
+
+        # Merge result into existing inquiry_data
+        inquiry_data = order.inquiry_data or {"suppliers": {}, "generated_files": []}
+        suppliers = inquiry_data.setdefault("suppliers", {})
+        suppliers[str(supplier_id)] = result
+
+        # Update generated_files flat list (replace existing entry for this supplier)
+        gen_files = inquiry_data.get("generated_files", [])
+        gen_files = [f for f in gen_files if f.get("supplier_id") != supplier_id]
+        if result.get("file"):
+            gen_files.append(result["file"])
+        inquiry_data["generated_files"] = gen_files
+        inquiry_data["supplier_count"] = len(set(f.get("supplier_id") for f in gen_files if f.get("supplier_id")))
+
+        from sqlalchemy.orm.attributes import flag_modified
+        order.inquiry_data = inquiry_data
+        flag_modified(order, "inquiry_data")
+        db.commit()
+
+        push_event(stream_key, {"type": "done", "data": result})
+    except Exception as e:
+        logger.error("Inquiry single supplier %d for order %d failed: %s",
+                     supplier_id, order_id, str(e), exc_info=True)
+        db.rollback()
+        push_event(stream_key, {"type": "error", "message": str(e)})
+    finally:
+        db.close()
+
+
+@router.get("/{order_id}/inquiry-preview/{supplier_id}")
+def inquiry_preview(
+    order_id: int,
+    supplier_id: int,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """Get saved preview HTML for a supplier's inquiry."""
+    order = db.query(Order).filter(
+        Order.id == order_id,
+        Order.user_id == current_user.id,
+    ).first()
+    if not order:
+        raise HTTPException(404, "订单不存在")
+
+    inquiry_data = order.inquiry_data or {}
+    suppliers = inquiry_data.get("suppliers", {})
+    supplier_data = suppliers.get(str(supplier_id))
+
+    if not supplier_data:
+        raise HTTPException(404, "未找到该供应商的询价数据")
+
+    file_info = supplier_data.get("file")
+    if not file_info or not file_info.get("preview_url"):
+        raise HTTPException(404, "没有预览文件")
+
+    preview_filename = os.path.basename(file_info["preview_url"])
+    preview_path = os.path.realpath(os.path.join(UPLOAD_DIR, preview_filename))
+    if not preview_path.startswith(os.path.realpath(UPLOAD_DIR)):
+        raise HTTPException(400, "非法文件路径")
+    if not os.path.exists(preview_path):
+        raise HTTPException(404, "预览文件已丢失")
+
+    with open(preview_path, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html)
 
 
 # ─── Files ─────────────────────────────────────────────────────

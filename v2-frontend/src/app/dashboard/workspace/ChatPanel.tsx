@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useCallback } from "react";
 import type { ChatSession, ChatMessage } from "@/lib/chat-api";
 import { ChatBubble, ReasoningBlock } from "@/components/chat-bubble";
 import { Button } from "@/components/ui/button";
@@ -20,6 +20,7 @@ interface ChatPanelProps {
   file: File | null;
   onFileChange: (f: File | null) => void;
   onRetry?: (toolName: string) => void;
+  onQuickAction?: (text: string) => void;
 }
 
 const ALLOWED_EXTENSIONS = [".xlsx", ".xls", ".pdf", ".csv"];
@@ -61,7 +62,14 @@ function groupMessages(messages: ChatMessage[]): MessageGroup[] {
 
   for (const msg of messages) {
     const msgType = msg.msg_type || "text";
-    if (REASONING_TYPES.has(msgType)) {
+    // Structured cards with interactive buttons should appear in main chat flow,
+    // not hidden inside collapsed reasoning blocks
+    const isStructuredCard = msgType === "observation" &&
+      (msg.metadata?.structured_card || msg.metadata?.upload_data);
+    if (isStructuredCard) {
+      flushReasoning();
+      groups.push({ type: "single", message: msg });
+    } else if (REASONING_TYPES.has(msgType)) {
       currentReasoning.push(msg);
     } else {
       flushReasoning();
@@ -84,13 +92,35 @@ export default function ChatPanel({
   file,
   onFileChange,
   onRetry,
+  onQuickAction,
 }: ChatPanelProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const userScrolledUpRef = useRef(false);
+
+  // Detect user scroll: if user scrolls away from bottom, stop auto-scroll
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    // "near bottom" = within 150px of the bottom edge
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    userScrolledUpRef.current = !nearBottom;
+  }, []);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    // Only auto-scroll if user hasn't scrolled up
+    if (!userScrolledUpRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages]);
+
+  // Reset scroll lock when sending a new message (user expects to see the response)
+  useEffect(() => {
+    if (sending) {
+      userScrolledUpRef.current = false;
+    }
+  }, [sending]);
 
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -102,7 +132,7 @@ export default function ChatPanel({
   return (
     <div className="flex-1 flex flex-col min-w-0 min-h-0 h-full">
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto">
         <div className="max-w-2xl mx-auto px-4 py-6 space-y-4">
           {/* Empty states */}
           {!session && (
@@ -148,6 +178,7 @@ export default function ChatPanel({
                         streaming={(msg as ChatMessage & { streaming?: boolean }).streaming}
                         metadata={msg.metadata}
                         onRetry={onRetry}
+                        onQuickAction={onQuickAction}
                       />
                     );
                   }
@@ -159,6 +190,7 @@ export default function ChatPanel({
                       messages={group.messages}
                       isActive={isActive}
                       onRetry={onRetry}
+                      onQuickAction={onQuickAction}
                     />
                   );
                 })}
