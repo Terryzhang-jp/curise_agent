@@ -1,8 +1,12 @@
 """
 Template Matcher — match uploaded orders to known OrderFormatTemplates.
 
-Functions:
-- find_matching_template: keyword-based matching (0 LLM)
+Cascading Multi-Signal Matcher (0 LLM):
+  Phase 1: Fingerprint exact match (Excel only, precision=100%)
+  Phase 2: source_company match (precision≈95%)
+  Phase 3: IDF-weighted keyword scoring (precision≈80%)
+
+Other functions:
 - get_scannable_text: extract searchable text from file (0 LLM for Excel, pdfplumber for PDF)
 - build_guided_prompt: construct template-guided extraction prompt
 - extract_excel_deterministic: 0 LLM extraction when column_mapping is complete
@@ -12,6 +16,7 @@ from __future__ import annotations
 
 import io
 import logging
+from collections import Counter
 from typing import Optional
 
 from models import OrderFormatTemplate
@@ -19,34 +24,168 @@ from models import OrderFormatTemplate
 logger = logging.getLogger(__name__)
 
 
-# ─── Template Matching (0 LLM) ──────────────────────────────────
+# ─── Template Matching — Cascading Multi-Signal (0 LLM) ─────────
 
-def find_matching_template(scannable_text: str, db) -> tuple[Optional[OrderFormatTemplate], Optional[str]]:
-    """Find the best matching template by keyword search. Returns (template, method) or (None, None)."""
-    templates = db.query(OrderFormatTemplate).filter(
+def find_matching_template(
+    scannable_text: str,
+    db,
+    file_bytes: bytes | None = None,
+    file_type: str | None = None,
+) -> tuple[Optional[OrderFormatTemplate], Optional[str]]:
+    """Cascading multi-signal template matching. Returns (template, method) or (None, None).
+
+    Phase 1: fingerprint  — Excel header hash exact match (100% precision)
+    Phase 2: source_company — company name substring match in document text
+    Phase 3: keyword_idf  — IDF-weighted keyword scoring
+    """
+    all_templates = db.query(OrderFormatTemplate).filter(
         OrderFormatTemplate.is_active == True,
-        OrderFormatTemplate.match_keywords.isnot(None),
     ).all()
 
-    if not templates:
+    if not all_templates:
         return None, None
 
+    # ── Phase 1: Fingerprint exact match (Excel only) ──
+    if file_bytes and file_type and file_type != "pdf":
+        result = _phase1_fingerprint(file_bytes, all_templates)
+        if result:
+            return result
+
+    # ── Phase 2: source_company match ──
+    if scannable_text:
+        result = _phase2_source_company(scannable_text, all_templates)
+        if result:
+            return result
+
+    # ── Phase 3: IDF-weighted keyword scoring ──
+    if scannable_text:
+        result = _phase3_keyword_idf(scannable_text, all_templates)
+        if result:
+            return result
+
+    return None, None
+
+
+def _phase1_fingerprint(
+    file_bytes: bytes, templates: list[OrderFormatTemplate],
+) -> tuple[OrderFormatTemplate, str] | None:
+    """Phase 1: Exact fingerprint match for Excel files."""
+    from services.excel_parser import compute_fingerprint
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        headers = []
+        header_row = 1
+        for cell in ws[header_row]:
+            if cell.value is not None:
+                headers.append(str(cell.value))
+        if not headers:
+            return None
+
+        fp = compute_fingerprint(headers)
+
+        for tpl in templates:
+            if tpl.format_fingerprint and tpl.format_fingerprint == fp:
+                logger.info(
+                    "Phase 1 HIT: fingerprint '%s' → template '%s' (id=%d)",
+                    fp, tpl.name, tpl.id,
+                )
+                return tpl, "fingerprint"
+
+        logger.debug("Phase 1 MISS: fingerprint '%s' matched no template", fp)
+    except Exception as e:
+        logger.warning("Phase 1 fingerprint computation failed: %s", e)
+
+    return None
+
+
+def _phase2_source_company(
+    scannable_text: str, templates: list[OrderFormatTemplate],
+) -> tuple[OrderFormatTemplate, str] | None:
+    """Phase 2: Match source_company name in document text."""
     text_upper = scannable_text.upper()
-    best, best_hits = None, 0
+
+    candidates = []
+    for tpl in templates:
+        company = tpl.source_company
+        if not company or len(company.strip()) < 2:
+            continue
+        if company.upper() in text_upper:
+            candidates.append(tpl)
+
+    if len(candidates) == 1:
+        tpl = candidates[0]
+        logger.info(
+            "Phase 2 HIT: source_company '%s' → template '%s' (id=%d)",
+            tpl.source_company, tpl.name, tpl.id,
+        )
+        return tpl, "source_company"
+
+    if len(candidates) > 1:
+        names = [c.name for c in candidates]
+        logger.info("Phase 2 AMBIGUOUS: %d templates matched by source_company: %s → fall through to Phase 3", len(candidates), names)
+
+    return None
+
+
+def _phase3_keyword_idf(
+    scannable_text: str, templates: list[OrderFormatTemplate],
+) -> tuple[OrderFormatTemplate, str] | None:
+    """Phase 3: IDF-weighted keyword scoring."""
+    text_upper = scannable_text.upper()
+
+    # Collect all keywords across templates and compute IDF weights
+    # IDF(keyword) = 1 / (number of templates that contain this keyword)
+    keyword_template_count: Counter[str] = Counter()
+    templates_with_keywords = []
 
     for tpl in templates:
         keywords = tpl.match_keywords or []
         if not keywords:
             continue
-        hits = sum(1 for kw in keywords if kw.upper() in text_upper)
-        if hits > best_hits:
-            best, best_hits = tpl, hits
+        templates_with_keywords.append(tpl)
+        seen = set()
+        for kw in keywords:
+            kw_upper = kw.upper()
+            if kw_upper not in seen:
+                keyword_template_count[kw_upper] += 1
+                seen.add(kw_upper)
 
-    if best:
-        logger.info("Template matched: '%s' (id=%d) with %d keyword hits", best.name, best.id, best_hits)
-        return best, "keyword"
+    if not templates_with_keywords:
+        return None
 
-    return None, None
+    # Score each template
+    best_tpl = None
+    best_score = 0.0
+    best_hits = 0
+
+    for tpl in templates_with_keywords:
+        keywords = tpl.match_keywords or []
+        score = 0.0
+        hits = 0
+        for kw in keywords:
+            kw_upper = kw.upper()
+            if kw_upper in text_upper:
+                idf = 1.0 / keyword_template_count[kw_upper]
+                score += idf
+                hits += 1
+
+        if score > best_score:
+            best_score = score
+            best_hits = hits
+            best_tpl = tpl
+
+    # Require at least 1 keyword hit
+    if best_tpl and best_hits >= 1:
+        logger.info(
+            "Phase 3 HIT: template '%s' (id=%d) — score=%.2f, %d keyword hits",
+            best_tpl.name, best_tpl.id, best_score, best_hits,
+        )
+        return best_tpl, "keyword_idf"
+
+    return None
 
 
 # ─── Scannable Text Extraction ──────────────────────────────────
@@ -78,23 +217,67 @@ def _excel_to_scannable(file_bytes: bytes) -> str:
 
 
 def _pdf_to_scannable(file_bytes: bytes) -> str:
-    """Extract text from PDF using pdfplumber (no LLM). Falls back gracefully."""
+    """Extract text from PDF. Tries pdfplumber first, falls back to Vision for image-based PDFs."""
+    text = ""
+
+    # Try pdfplumber (instant, 0 LLM)
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             parts = []
-            # Only scan first 3 pages for keywords (sufficient for header matching)
             for page in pdf.pages[:3]:
-                text = page.extract_text()
-                if text:
-                    parts.append(text)
-            return "\n".join(parts)
+                t = page.extract_text()
+                if t:
+                    parts.append(t)
+            text = "\n".join(parts)
     except ImportError:
-        logger.warning("pdfplumber not installed, skipping PDF template matching")
-        return ""
+        logger.warning("pdfplumber not installed")
     except Exception as e:
-        logger.warning("Failed to extract PDF text: %s", e)
+        logger.warning("pdfplumber failed: %s", e)
+
+    if text.strip():
+        return text
+
+    # Fallback: image-based PDF → Vision read first page only (~2-3s, 1 LLM call)
+    logger.info("PDF has no extractable text, using Vision fallback on page 1")
+    try:
+        return _pdf_vision_scannable(file_bytes)
+    except Exception as e:
+        logger.warning("Vision fallback failed: %s", e)
         return ""
+
+
+def _pdf_vision_scannable(file_bytes: bytes) -> str:
+    """Read first page of image-based PDF with Gemini Vision for keyword extraction."""
+    from pdf2image import convert_from_bytes
+    from google import genai
+    from google.genai import types
+    from config import settings
+
+    images = convert_from_bytes(file_bytes, dpi=150, first_page=1, last_page=1)
+    if not images:
+        return ""
+
+    # Convert to JPEG bytes
+    img_buf = io.BytesIO()
+    images[0].convert("RGB").save(img_buf, format="JPEG", quality=80)
+    img_bytes = img_buf.getvalue()
+
+    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=[
+            types.Part.from_text(text="Read all visible text on this page. Return the raw text only, no formatting or analysis."),
+            types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=2000,
+        ),
+    )
+    text = response.text or ""
+    logger.info("Vision fallback extracted %d chars from page 1", len(text))
+    return text
 
 
 # ─── Guided Prompt Construction ─────────────────────────────────

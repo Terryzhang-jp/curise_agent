@@ -131,6 +131,7 @@ class OrderFormatTemplateCreate(BaseModel):
     source_company: Optional[str] = None
     match_keywords: Optional[list[str]] = None
     notes: Optional[str] = None
+    document_schema: Optional[dict[str, Any]] = None
     is_active: bool = True
 
 
@@ -146,6 +147,7 @@ class OrderFormatTemplateUpdate(BaseModel):
     source_company: Optional[str] = None
     match_keywords: Optional[list[str]] = None
     notes: Optional[str] = None
+    document_schema: Optional[dict[str, Any]] = None
     is_active: Optional[bool] = None
 
 
@@ -164,6 +166,7 @@ class OrderFormatTemplateResponse(BaseModel):
     source_company: Optional[str] = None
     match_keywords: Optional[list[str]] = None
     notes: Optional[str] = None
+    document_schema: Optional[dict[str, Any]] = None
     is_active: bool = True
     created_by: Optional[int] = None
     created_at: datetime

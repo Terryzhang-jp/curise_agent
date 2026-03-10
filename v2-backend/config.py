@@ -42,7 +42,7 @@ class Settings:
 
     # File uploads
     UPLOAD_DIR: str = os.path.join(os.path.dirname(__file__), "uploads")
-    MAX_UPLOAD_SIZE: int = 20 * 1024 * 1024  # 20 MB
+    MAX_UPLOAD_SIZE: int = 25 * 1024 * 1024  # 25 MB
 
 
 settings = Settings()

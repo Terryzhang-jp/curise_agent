@@ -7,6 +7,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
 
 export type OrderStatus =
   | "uploading"
+  | "pending_template"
   | "extracting"
   | "matching"
   | "ready"
@@ -360,7 +361,8 @@ export async function uploadOrder(file: File): Promise<Order> {
   const res = await fetchWithAuth(`${API_BASE}/api/orders/upload`, {
     method: "POST",
     body: form,
-  });
+    timeout: 120000, // 2 min — large PDF uploads can be slow
+  } as RequestInit & { timeout?: number });
   return handleResponse<Order>(res);
 }
 
@@ -444,6 +446,18 @@ export async function reprocessOrder(orderId: number): Promise<Order> {
   const res = await fetchWithAuth(`${API_BASE}/api/orders/${orderId}/reprocess`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+  });
+  return handleResponse<Order>(res);
+}
+
+export async function setOrderTemplate(
+  orderId: number,
+  templateId: number,
+): Promise<Order> {
+  const res = await fetchWithAuth(`${API_BASE}/api/orders/${orderId}/set-template`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ template_id: templateId }),
   });
   return handleResponse<Order>(res);
 }

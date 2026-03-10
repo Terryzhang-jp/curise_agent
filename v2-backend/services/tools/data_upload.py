@@ -132,6 +132,39 @@ def _recover_batch_id(ctx) -> int | None:
     return None
 
 
+def _make_new_match_result(sp, batch, ctx) -> dict:
+    """Build a match_result dict for a staging row that has no match in the target port.
+
+    If batch.port_id is set, check whether the product code exists in other ports
+    (same country). If so, mark as 'new_at_port' and record source_product_id for
+    field inheritance in execute_upload.
+    """
+    result = {
+        "action": "new",
+        "confidence": 0,
+        "matched_product_id": None,
+        "match_method": "none",
+    }
+    if batch.port_id and sp.product_code:
+        from models import Product
+        try:
+            existing = (
+                ctx.db.query(Product)
+                .filter(
+                    Product.code == sp.product_code.upper(),
+                    Product.country_id == batch.country_id,
+                    Product.status == True,
+                )
+                .first()
+            )
+            if existing:
+                result["match_method"] = "new_at_port"
+                result["source_product_id"] = existing.id
+        except Exception:
+            pass  # Graceful fallback — still a "new" product
+    return result
+
+
 def has_upload_context(ctx) -> bool:
     """Check if there's an active upload batch for this session (for __init__.py)."""
     if _get_active_batch_id(ctx):
@@ -337,7 +370,7 @@ def create_data_upload_tools(registry, ctx):
     # ── Tool 2: resolve_and_validate ──────────────────────────
 
     @registry.tool(
-        description="验证暂存数据：代码精确匹配 + LLM 模糊匹配 + 置信度分级。传入供应商名/国家名以缩小匹配范围。",
+        description="验证暂存数据：代码精确匹配 + LLM 模糊匹配 + 置信度分级。传入供应商名/国家名/港口名/有效日期以缩小匹配范围。",
         parameters={
             "supplier_name": {
                 "type": "STRING",
@@ -349,16 +382,42 @@ def create_data_upload_tools(registry, ctx):
                 "description": "国家名称（可选，用于筛选 DB 产品范围）",
                 "required": False,
             },
+            "port_name": {
+                "type": "STRING",
+                "description": "目标港口名称（如 横浜、Bangkok），决定更新哪个港口的价格记录",
+                "required": False,
+            },
+            "effective_from": {
+                "type": "STRING",
+                "description": "价格生效开始日期 YYYY-MM-DD",
+                "required": False,
+            },
+            "effective_to": {
+                "type": "STRING",
+                "description": "价格生效结束日期 YYYY-MM-DD",
+                "required": False,
+            },
         },
         group="data_upload",
     )
-    def resolve_and_validate(supplier_name: str = "", country_name: str = "") -> str:
+    def resolve_and_validate(supplier_name: str = "", country_name: str = "", port_name: str = "", effective_from: str = "", effective_to: str = "") -> str:
         from sqlalchemy import text
         from models import UploadBatch, StagingProduct, Product
 
         batch, err = _load_batch(ctx)
         if err:
             return err
+
+        # ── Required field validation ──
+        # Check both batch state (from previous calls) and current params
+        has_country = batch.country_id or country_name.strip()
+        has_port = batch.port_id or port_name.strip()
+        if has_country and not has_port:
+            return "Error: 请提供目标港口名称（port_name 参数）。例如：横浜、Bangkok 等。这决定了更新哪个港口的价格记录。"
+        if not batch.effective_from and not effective_from.strip():
+            return "Error: 请提供价格生效开始日期（effective_from 参数）。格式：YYYY-MM-DD。"
+        if not batch.effective_to and not effective_to.strip():
+            return "Error: 请提供价格生效结束日期（effective_to 参数）。格式：YYYY-MM-DD。"
 
         staging_rows = (
             ctx.db.query(StagingProduct)
@@ -400,12 +459,42 @@ def create_data_upload_tools(registry, ctx):
                 ct_savepoint.rollback()
                 logger.warning("Country lookup failed: %s", e)
 
+        # ── Port lookup ──
+        if port_name.strip() and not batch.port_id:
+            try:
+                pt_savepoint = ctx.db.begin_nested()
+                rows = ctx.db.execute(
+                    text("SELECT id, name FROM ports WHERE name ILIKE :p LIMIT 5"),
+                    {"p": f"%{port_name.strip()}%"},
+                ).fetchall()
+                if rows:
+                    batch.port_id = rows[0][0]
+                    batch.port_name = rows[0][1]
+                pt_savepoint.commit()
+            except Exception as e:
+                pt_savepoint.rollback()
+                logger.warning("Port lookup failed: %s", e)
+
+        # ── Effective dates ──
+        if effective_from.strip() and not batch.effective_from:
+            try:
+                batch.effective_from = datetime.strptime(effective_from.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        if effective_to.strip() and not batch.effective_to:
+            try:
+                batch.effective_to = datetime.strptime(effective_to.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
         # ── Load DB products for matching ──
         query = ctx.db.query(Product).filter(Product.status == True)
         if batch.supplier_id:
             query = query.filter(Product.supplier_id == batch.supplier_id)
         if batch.country_id:
             query = query.filter(Product.country_id == batch.country_id)
+        if batch.port_id:
+            query = query.filter(Product.port_id == batch.port_id)
         db_products = query.all()
 
         # Index by code and name
@@ -532,35 +621,20 @@ def create_data_upload_tools(registry, ctx):
 
                     # Still unmatched
                     if not sp.match_result:
-                        sp.match_result = {
-                            "action": "new",
-                            "confidence": 0,
-                            "matched_product_id": None,
-                            "match_method": "none",
-                        }
+                        sp.match_result = _make_new_match_result(sp, batch, ctx)
                         sp.validation_status = "valid"
                         stats["new"] += 1
             except Exception as e:
                 logger.warning("LLM fuzzy match failed: %s, marking remaining as new", e)
                 for sp in unmatched_rows:
                     if not sp.match_result:
-                        sp.match_result = {
-                            "action": "new",
-                            "confidence": 0,
-                            "matched_product_id": None,
-                            "match_method": "none",
-                        }
+                        sp.match_result = _make_new_match_result(sp, batch, ctx)
                         sp.validation_status = "valid"
                         stats["new"] += 1
         else:
             # No DB products to match against — all new
             for sp in unmatched_rows:
-                sp.match_result = {
-                    "action": "new",
-                    "confidence": 0,
-                    "matched_product_id": None,
-                    "match_method": "none",
-                }
+                sp.match_result = _make_new_match_result(sp, batch, ctx)
                 sp.validation_status = "valid"
                 stats["new"] += 1
 
@@ -592,6 +666,22 @@ def create_data_upload_tools(registry, ctx):
             lines.append(f"- 国家: {batch.country_name} (id={batch.country_id})")
         elif country_name:
             lines.append(f"- 未找到国家 '{country_name}'（可能需要创建）")
+
+        if batch.port_name:
+            lines.append(f"- 港口: {batch.port_name} (id={batch.port_id})")
+        elif port_name:
+            lines.append(f"- 未找到港口 '{port_name}'")
+
+        if batch.effective_from or batch.effective_to:
+            lines.append(f"- 有效期: {batch.effective_from or '?'} ~ {batch.effective_to or '?'}")
+
+        # Cross-port new count
+        new_at_port = sum(
+            1 for sp in staging_rows
+            if sp.match_result and sp.match_result.get("match_method") == "new_at_port"
+        )
+        if new_at_port:
+            lines.append(f"- 港口新增(其他港口已有): {new_at_port}")
 
         # Confidence distribution
         high = sum(1 for sp in staging_rows if sp.match_result and sp.match_result.get("confidence", 0) >= 0.9)
@@ -629,6 +719,9 @@ def create_data_upload_tools(registry, ctx):
             "total": total,
             "supplier": {"name": batch.supplier_name, "id": batch.supplier_id},
             "country": {"name": batch.country_name, "id": batch.country_id},
+            "port": {"name": batch.port_name, "id": batch.port_id},
+            "effective_from": str(batch.effective_from) if batch.effective_from else None,
+            "effective_to": str(batch.effective_to) if batch.effective_to else None,
             "confidence": {"high": high, "mid": mid, "low": low, "new": none_},
             "quarantined": [
                 {
@@ -797,6 +890,8 @@ def create_data_upload_tools(registry, ctx):
             f"## 变更预览（批次 #{batch.id}）",
             f"- 供应商: {batch.supplier_name or '未设置'}" + (f" (id={batch.supplier_id})" if batch.supplier_id else ""),
             f"- 国家: {batch.country_name or '未设置'}" + (f" (id={batch.country_id})" if batch.country_id else ""),
+            f"- 港口: {batch.port_name or '未设置'}" + (f" (id={batch.port_id})" if batch.port_id else ""),
+            f"- 有效期: {batch.effective_from or '?'} ~ {batch.effective_to or '?'}",
             "",
             f"### 统计",
             f"- 新增: {len(groups['new'])} 个",
@@ -844,6 +939,9 @@ def create_data_upload_tools(registry, ctx):
             "batch_id": batch.id,
             "supplier": {"name": batch.supplier_name, "id": batch.supplier_id},
             "country": {"name": batch.country_name, "id": batch.country_id},
+            "port": {"name": batch.port_name, "id": batch.port_id},
+            "effective_from": str(batch.effective_from) if batch.effective_from else None,
+            "effective_to": str(batch.effective_to) if batch.effective_to else None,
             "stats": {
                 "new": len(groups["new"]),
                 "update": len(groups["update"]),
@@ -946,8 +1044,15 @@ def create_data_upload_tools(registry, ctx):
                     # INSERT new product — use savepoint so one failure doesn't kill the session
                     try:
                         with ctx.db.begin_nested():
+                            # Cross-port: inherit fields from existing product in other port
+                            source_id = mr.get("source_product_id")
+                            source_product = None
+                            if source_id:
+                                source_product = ctx.db.query(Product).filter(Product.id == source_id).first()
+
                             new_product = Product(
                                 product_name_en=sp.product_name,
+                                product_name_jp=source_product.product_name_jp if source_product else None,
                                 code=sp.product_code or None,
                                 price=sp.price,
                                 unit=sp.unit or None,
@@ -955,10 +1060,13 @@ def create_data_upload_tools(registry, ctx):
                                 brand=sp.brand or None,
                                 currency=sp.currency or None,
                                 country_of_origin=sp.country_of_origin or None,
-                                supplier_id=sp.resolved_supplier_id or batch.supplier_id,
+                                supplier_id=sp.resolved_supplier_id or batch.supplier_id or (source_product.supplier_id if source_product else None),
                                 country_id=sp.resolved_country_id or batch.country_id,
+                                category_id=source_product.category_id if source_product else None,
+                                port_id=batch.port_id,
                                 status=True,
-                                effective_from=datetime.utcnow(),
+                                effective_from=batch.effective_from or datetime.utcnow().date(),
+                                effective_to=batch.effective_to,
                             )
                             ctx.db.add(new_product)
                             ctx.db.flush()
@@ -1047,11 +1155,34 @@ def create_data_upload_tools(registry, ctx):
                                 })
                                 db_product.brand = sp.brand
 
+                            # Effective dates update
+                            if batch.effective_from:
+                                old_from = db_product.effective_from
+                                # Compare as date (effective_from in products is DateTime, batch is Date)
+                                old_from_date = old_from.date() if hasattr(old_from, 'date') and old_from else old_from
+                                if old_from_date != batch.effective_from:
+                                    field_changes.append({
+                                        "field": "effective_from",
+                                        "old_value": str(old_from) if old_from else None,
+                                        "new_value": str(batch.effective_from),
+                                    })
+                                    db_product.effective_from = batch.effective_from
+
+                            if batch.effective_to:
+                                old_to = db_product.effective_to
+                                old_to_date = old_to.date() if hasattr(old_to, 'date') and old_to else old_to
+                                if old_to_date != batch.effective_to:
+                                    field_changes.append({
+                                        "field": "effective_to",
+                                        "old_value": str(old_to) if old_to else None,
+                                        "new_value": str(batch.effective_to),
+                                    })
+                                    db_product.effective_to = batch.effective_to
+
                             if not field_changes:
                                 # No actual changes — treat as no_change
                                 raise _NoChangeSignal()
 
-                            db_product.effective_from = datetime.utcnow()
                             ctx.db.flush()
 
                             changelog = ProductChangeLog(

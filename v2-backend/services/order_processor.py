@@ -125,6 +125,8 @@ def _parse_delivery_date(date_str: str | None) -> datetime | None:
     if not date_str:
         return None
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y",
+                "%m-%d-%Y", "%d-%m-%Y",
+                "%d-%b-%Y", "%b-%d-%Y", "%d %b %Y", "%b %d, %Y",
                 "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(date_str.strip(), fmt)
@@ -718,8 +720,10 @@ def _excel_to_text(file_bytes: bytes) -> str:
 
 # ─── Main Process ────────────────────────────────────────────────
 
-def process_order(order_id: int, file_bytes: bytes) -> None:
+def process_order(order_id: int, file_bytes: bytes, template_id_override: int | None = None) -> None:
     """Background task: template_match → extract → agent_matching."""
+    from models import OrderFormatTemplate
+
     db = SessionLocal()
     try:
         order = db.query(Order).get(order_id)
@@ -729,20 +733,39 @@ def process_order(order_id: int, file_bytes: bytes) -> None:
 
         # Step 0: Template matching (0 LLM — keyword-based)
         template = None
-        try:
-            from services.template_matcher import find_matching_template, get_scannable_text
+        if template_id_override:
+            # Manual template selection — skip auto-matching
+            template = db.query(OrderFormatTemplate).get(template_id_override)
+            if template:
+                order.template_id = template.id
+                order.template_match_method = "manual"
+                db.commit()
+                logger.info("Order %d: using manually selected template '%s' (id=%d)",
+                            order_id, template.name, template.id)
+        else:
+            try:
+                from services.template_matcher import find_matching_template, get_scannable_text
 
-            scannable = get_scannable_text(file_bytes, order.file_type)
-            if scannable:
-                template, match_method = find_matching_template(scannable, db)
-                if template:
-                    order.template_id = template.id
-                    order.template_match_method = match_method
-                    db.commit()
-                    logger.info("Order %d: matched template '%s' (id=%d) via %s",
-                                order_id, template.name, template.id, match_method)
-        except Exception as e:
-            logger.warning("Order %d: template matching failed (non-fatal): %s", order_id, e)
+                scannable = get_scannable_text(file_bytes, order.file_type)
+                if scannable:
+                    template, match_method = find_matching_template(
+                        scannable, db, file_bytes=file_bytes, file_type=order.file_type,
+                    )
+                    if template:
+                        order.template_id = template.id
+                        order.template_match_method = match_method
+                        db.commit()
+                        logger.info("Order %d: matched template '%s' (id=%d) via %s",
+                                    order_id, template.name, template.id, match_method)
+            except Exception as e:
+                logger.warning("Order %d: template matching failed (non-fatal): %s", order_id, e)
+
+        # PDF without template → pause for user to select template
+        if not template and order.file_type == "pdf":
+            order.status = "pending_template"
+            db.commit()
+            logger.info("Order %d: no template matched for PDF, awaiting user selection", order_id)
+            return
 
         # Step 1: Extraction (template-guided or generic)
         order.status = "extracting"
@@ -750,7 +773,10 @@ def process_order(order_id: int, file_bytes: bytes) -> None:
         logger.info("Order %d: starting extraction (file_type=%s, template=%s)",
                      order_id, order.file_type, template.name if template else "none")
 
-        if template:
+        if template and template.document_schema:
+            from services.schema_extraction import extract_order_with_schema
+            extracted = extract_order_with_schema(file_bytes, template.document_schema)
+        elif template:
             extracted = _template_guided_extract(file_bytes, order.file_type, template, db)
         else:
             extracted = vision_extract(file_bytes, order.file_type)

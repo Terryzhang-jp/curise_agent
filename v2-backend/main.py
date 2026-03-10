@@ -2,6 +2,7 @@ import logging
 import os
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +65,35 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    _recover_stuck_orders()
+
+
+def _recover_stuck_orders():
+    """Reset orders stuck in extracting/matching (from OOM kills or instance restarts)."""
+    from database import SessionLocal
+    from models import Order
+    from datetime import datetime, timedelta
+
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(minutes=5)
+        stuck = db.query(Order).filter(
+            Order.status.in_(["extracting", "matching", "uploading"]),
+            Order.updated_at < cutoff,
+        ).all()
+        for order in stuck:
+            logger.info("Recovering stuck order %d (status=%s, updated=%s)",
+                        order.id, order.status, order.updated_at)
+            order.status = "error"
+            order.processing_error = "处理超时，请重新处理"
+        if stuck:
+            db.commit()
+            logger.info("Recovered %d stuck orders", len(stuck))
+    except Exception as e:
+        logger.warning("Stuck order recovery failed: %s", e)
+        db.rollback()
+    finally:
+        db.close()
 
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")

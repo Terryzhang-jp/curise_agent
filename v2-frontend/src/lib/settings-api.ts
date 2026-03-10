@@ -42,6 +42,7 @@ export interface OrderFormatTemplate {
   source_company: string | null;
   match_keywords: string[] | null;
   notes: string | null;
+  document_schema?: DocumentSchema | null;
   is_active: boolean;
   created_by: number | null;
   created_at: string;
@@ -127,6 +128,46 @@ export interface MetadataField {
 export interface PdfMetadata {
   document_type: string;
   fields: MetadataField[];
+}
+
+// Schema-first PDF extraction types
+export interface SchemaAttribute {
+  key: string;
+  label: string;
+  type: "text" | "date" | "number" | "currency";
+  sample_value?: string;
+  required?: boolean;
+}
+
+export interface SchemaColumn {
+  key: string;
+  label: string;
+  type: "text" | "date" | "number" | "currency";
+  sample_value?: string;
+}
+
+export interface AttributeGroup {
+  name: string;
+  name_en: string;
+  type: "single" | "repeating" | "text_block";
+  description: string;
+  attributes?: SchemaAttribute[];
+  columns?: SchemaColumn[];
+  estimated_row_count?: number;
+}
+
+export interface DocumentSchema {
+  document_type: string;
+  attribute_groups: AttributeGroup[];
+  page_layout: {
+    total_pages: number;
+    cover_pages?: number[];
+    metadata_pages: number[];
+    data_pages: number[];
+    terms_pages: number[];
+  };
+  field_mapping: Record<string, string>;
+  notes?: string;
 }
 
 export interface ExcelParseResult {
@@ -264,6 +305,7 @@ export function createOrderTemplate(data: {
   source_company?: string;
   match_keywords?: string[];
   notes?: string;
+  document_schema?: DocumentSchema;
   is_active?: boolean;
 }) {
   return api<OrderFormatTemplate>("/api/settings/order-templates", {
@@ -305,6 +347,26 @@ export function inferOrderTemplate(data: {
     method: "POST",
     body: JSON.stringify(data),
   });
+}
+
+export async function analyzeOrderTemplatePdf(file: File): Promise<{
+  document_schema: DocumentSchema;
+  document_type: string;
+  sample_file_url: string;
+  timing: { total: number; pages: number; batch_success_rate: string; pages_observed: number };
+}> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetchWithAuth(`${API_BASE}/api/settings/order-templates/analyze-pdf`, {
+    method: "POST",
+    body: formData,
+    timeout: 120000, // PDF analysis takes ~35-40s, allow up to 2 minutes
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "分析失败" }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
 }
 
 // ─── Supplier Templates ────────────────────────────────────────

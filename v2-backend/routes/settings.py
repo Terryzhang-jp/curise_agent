@@ -260,6 +260,49 @@ def infer_order_template(
         raise HTTPException(status_code=500, detail=f"AI 推理失败: {str(e)}")
 
 
+@router.post("/order-templates/analyze-pdf")
+async def analyze_order_template_pdf(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_admin),
+):
+    """Analyze uploaded PDF template -> return document_schema."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "请上传 PDF 文件")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "文件为空")
+    if len(file_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(400, "文件大小不能超过 25 MB")
+
+    # Save file for future reference
+    upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    safe_name = f"template_{uuid.uuid4().hex[:8]}_{file.filename}"
+    filepath = os.path.join(upload_dir, safe_name)
+    with open(filepath, "wb") as f:
+        f.write(file_bytes)
+
+    try:
+        import asyncio
+        from services.schema_extraction import analyze_template, _infer_field_mapping
+
+        loop = asyncio.get_event_loop()
+        schema = await loop.run_in_executor(None, analyze_template, file_bytes)
+
+        # Auto-infer field_mapping
+        schema["field_mapping"] = _infer_field_mapping(schema)
+
+        return {
+            "document_schema": schema,
+            "document_type": schema.get("document_type", "Unknown"),
+            "sample_file_url": f"/uploads/{safe_name}",
+            "timing": schema.pop("_timing", {}),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"PDF 分析失败: {str(e)}")
+
+
 @router.get("/order-templates", response_model=list[OrderFormatTemplateResponse])
 def list_order_templates(
     db: Session = Depends(get_db),

@@ -191,14 +191,21 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
 ## 产品上传流程
 如果用户上传了 Excel 文件（报价单/价格表），你应该：
 1. 用 parse_file 解析文件（自动映射列、创建暂存数据）
-2. 用 resolve_and_validate 验证数据（传入供应商名/国家名）
+2. **在调用 resolve_and_validate 之前，必须先确认以下必填信息**：
+   - **国家**（country_name）：如 JAPAN、THAILAND
+   - **港口**（port_name）：如 横浜、Bangkok — 这决定了更新哪个港口的价格记录
+   - **生效日期**（effective_from / effective_to）：如 2026-03-01 至 2026-04-30
+   如果用户没有主动提供这些信息，你必须明确询问。这三项缺一不可。
+3. 用 resolve_and_validate 验证数据（传入 supplier_name、country_name、port_name、effective_from、effective_to）
+   - 系统会按 (国家+港口) 精确匹配产品记录，不会跨港口误更新
+   - 如果产品代码在目标港口不存在但在其他港口存在，会标记为"港口新增"
    - 高置信度匹配 (≥90%) 自动接受
    - 中置信度 (70-89%) 告知用户建议
    - 低置信度 (<70%) 标记为需确认
-3. 用 audit_data 进行数据质量审计（检查格式/缺失/重复/语义问题）
-4. 如有缺失引用数据（新供应商/国家），先询问用户，再用 create_references 创建
-5. 用 preview_changes 生成变更预览，展示给用户
-6. 用户确认后调用 execute_upload（支持排除指定行号）
+4. 用 audit_data 进行数据质量审计（检查格式/缺失/重复/语义问题）
+5. 如有缺失引用数据（新供应商/国家），先询问用户，再用 create_references 创建
+6. 用 preview_changes 生成变更预览，展示给用户
+7. 用户确认后调用 execute_upload（支持排除指定行号）
 注意：resolve_and_validate 之后必须调用 audit_data，不可跳过。每一步都要向用户展示结果，不要跳步。异常价格(涨跌>30%)需要用户明确确认。
 audit_data 工具结果会自动生成结构化卡片展示给用户，你只需简短总结（1-2句话说明有无问题和下一步建议），不要重复列举审计详情。
 {skill_summary}"""

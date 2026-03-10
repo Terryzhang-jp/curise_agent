@@ -9,6 +9,7 @@ interface FileDropZoneProps {
   accept?: string;
   label?: string;
   disabled?: boolean;
+  maxSizeMB?: number;
 }
 
 export function FileDropZone({
@@ -16,6 +17,7 @@ export function FileDropZone({
   accept = ".xlsx,.pdf",
   label = "拖放文件到此处，或点击选择",
   disabled = false,
+  maxSizeMB,
 }: FileDropZoneProps) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
@@ -24,6 +26,17 @@ export function FileDropZone({
   const allowedExtensions = useMemo(
     () => accept.split(",").map((s) => s.trim().toLowerCase()),
     [accept]
+  );
+
+  const checkSize = useCallback(
+    (file: File): boolean => {
+      if (maxSizeMB && file.size > maxSizeMB * 1024 * 1024) {
+        alert(`文件不能超过 ${maxSizeMB}MB`);
+        return false;
+      }
+      return true;
+    },
+    [maxSizeMB]
   );
 
   const handleDrop = useCallback(
@@ -36,22 +49,24 @@ export function FileDropZone({
         file &&
         allowedExtensions.some((ext) => file.name.toLowerCase().endsWith(ext))
       ) {
+        if (!checkSize(file)) return;
         setFileName(file.name);
         onFile(file);
       }
     },
-    [onFile, allowedExtensions, disabled]
+    [onFile, allowedExtensions, disabled, checkSize]
   );
 
   const handleChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (file) {
+        if (!checkSize(file)) return;
         setFileName(file.name);
         onFile(file);
       }
     },
-    [onFile]
+    [onFile, checkSize]
   );
 
   return (
@@ -90,6 +105,7 @@ export function FileDropZone({
           <div className="text-sm text-muted-foreground">{label}</div>
           <div className="text-xs text-muted-foreground/70 mt-1">
             支持 {accept.replace(/\./g, "").replace(/,/g, ", ").toUpperCase()} 格式
+            {maxSizeMB ? `，最大 ${maxSizeMB}MB` : ""}
           </div>
         </div>
       )}

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, JSON, Numeric, CheckConstraint, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Date, Text, ForeignKey, JSON, Numeric, CheckConstraint, UniqueConstraint
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
 
@@ -96,6 +96,7 @@ class OrderFormatTemplate(Base):
     source_company = Column(String(200), nullable=True)   # e.g. "Royal Caribbean"
     match_keywords = Column(JSON, nullable=True)           # e.g. ["ROYAL CARIBBEAN", "RCI"]
     notes = Column(Text, nullable=True)                     # 管理员备注
+    document_schema = Column(JSON, nullable=True)             # Schema-first: attribute_groups + page_layout + field_mapping
     is_active = Column(Boolean, default=True)
     created_by = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -273,7 +274,7 @@ class Order(Base):
         CheckConstraint("payment_amount >= 0", name="ck_v2_orders_payment_amount_nonneg"),
         CheckConstraint("invoice_amount >= 0", name="ck_v2_orders_invoice_amount_nonneg"),
         CheckConstraint(
-            "status IN ('uploading','extracting','matching','ready','error')",
+            "status IN ('uploading','pending_template','extracting','matching','ready','error')",
             name="ck_v2_orders_status_enum",
         ),
         CheckConstraint(
@@ -400,6 +401,10 @@ class UploadBatch(Base):
     supplier_name = Column(String(200), nullable=True)
     country_id = Column(Integer, nullable=True)
     country_name = Column(String(200), nullable=True)
+    port_id = Column(Integer, nullable=True)
+    port_name = Column(String(200), nullable=True)
+    effective_from = Column(Date, nullable=True)
+    effective_to = Column(Date, nullable=True)
     column_mapping = Column(JSON, nullable=True)
     summary = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

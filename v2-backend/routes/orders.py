@@ -60,7 +60,7 @@ async def upload_order(
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(400, "文件大小不能超过 20 MB")
+        raise HTTPException(400, "文件大小不能超过 25 MB")
 
     # Save file
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -359,6 +359,63 @@ def review_order(
     return {"detail": "已标记审核", "reviewed_at": order.reviewed_at.isoformat()}
 
 
+# ─── Set Template (for pending_template orders) ──────────────
+
+class SetTemplateRequest(BaseModel):
+    template_id: int
+
+
+@router.post("/{order_id}/set-template", response_model=OrderDetail)
+async def set_order_template(
+    order_id: int,
+    body: SetTemplateRequest,
+    current_user: User = Depends(require_writer),
+    db: DBSession = Depends(get_db),
+):
+    """Set template for an order awaiting template selection, then resume processing."""
+    order = db.query(Order).filter(
+        Order.id == order_id,
+        Order.user_id == current_user.id,
+    ).first()
+    if not order:
+        raise HTTPException(404, "订单不存在")
+    if order.status != "pending_template":
+        raise HTTPException(400, "订单不在等待选择模板状态")
+
+    # Validate template exists
+    from models import OrderFormatTemplate
+    template = db.query(OrderFormatTemplate).get(body.template_id)
+    if not template:
+        raise HTTPException(404, "模板不存在")
+
+    # Read file bytes
+    if not order.file_url:
+        raise HTTPException(400, "找不到原始文件")
+    file_path = os.path.join(UPLOAD_DIR, os.path.basename(order.file_url))
+    if not os.path.exists(file_path):
+        raise HTTPException(400, "原始文件已丢失")
+
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    # Reset to uploading and launch processing with template override
+    order.status = "uploading"
+    db.commit()
+    db.refresh(order)
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        None, _run_process_order_with_template, order.id, file_bytes, body.template_id
+    )
+    return order
+
+
+def _run_process_order_with_template(order_id: int, file_bytes: bytes, template_id: int):
+    """Wrapper for background thread execution with template override."""
+    from services.order_processor import process_order
+    process_order(order_id, file_bytes, template_id_override=template_id)
+
+
 # ─── Reprocess ─────────────────────────────────────────────────
 
 @router.post("/{order_id}/reprocess", response_model=OrderDetail)
@@ -374,8 +431,8 @@ async def reprocess_order(
     ).first()
     if not order:
         raise HTTPException(404, "订单不存在")
-    if order.status not in ("error", "ready"):
-        raise HTTPException(400, "仅可重新处理出错或已完成的订单")
+    if order.status not in ("error", "ready", "pending_template", "extracting", "matching"):
+        raise HTTPException(400, "仅可重新处理出错、已完成或待选模板的订单")
 
     # Read file bytes from saved file
     if not order.file_url:
