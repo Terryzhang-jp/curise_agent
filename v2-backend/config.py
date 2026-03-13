@@ -44,5 +44,10 @@ class Settings:
     UPLOAD_DIR: str = os.path.join(os.path.dirname(__file__), "uploads")
     MAX_UPLOAD_SIZE: int = 25 * 1024 * 1024  # 25 MB
 
+    # Supabase Storage
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+    STORAGE_BUCKET: str = os.getenv("STORAGE_BUCKET", "v2-files")
+
 
 settings = Settings()

@@ -416,6 +416,20 @@ export function deleteSupplierTemplate(id: number) {
   return api<{ detail: string }>(`/api/settings/supplier-templates/${id}`, { method: "DELETE" });
 }
 
+export async function uploadSupplierTemplateFile(id: number, file: File): Promise<SupplierTemplate> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetchWithAuth(`${API_BASE}/api/settings/supplier-templates/${id}/upload-file`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "上传失败" }));
+    throw new Error(err.detail || "上传失败");
+  }
+  return res.json();
+}
+
 // ─── Countries ────────────────────────────────────────────────
 
 export interface Country {

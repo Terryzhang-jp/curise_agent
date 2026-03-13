@@ -22,3 +22,4 @@ slowapi>=0.1.9,<1.0.0
 pdfplumber>=0.10.0
 ddgs>=9.0.0
 xlsx2html==0.6.4
+supabase>=2.0.0,<3.0.0

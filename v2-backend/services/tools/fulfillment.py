@@ -376,10 +376,9 @@ def create_fulfillment_tools(registry, ctx):
         elif header[:2] in (b"PK", b"\x50\x4b"):
             ext = ".xlsx"
 
+        from services.file_storage import storage
         safe_name = f"att_{uuid.uuid4().hex[:8]}{ext}"
-        path = os.path.join(UPLOAD_DIR, safe_name)
-        with open(path, "wb") as f:
-            f.write(ctx.file_bytes)
+        storage.upload("attachments", safe_name, ctx.file_bytes)
 
         attachment = {
             "filename": safe_name,

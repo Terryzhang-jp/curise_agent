@@ -16,6 +16,7 @@ import {
   listSupplierTemplates,
   createSupplierTemplate,
   deleteSupplierTemplate,
+  uploadSupplierTemplateFile,
   parseExcelCells,
   analyzeExcelTemplate,
   normalizeFieldPositions,
@@ -59,7 +60,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { EmptyState } from "@/components/empty-state";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { ArrowLeft, Plus, Trash2, FileText, Loader2, Sparkles, Link2, ZoomIn, ZoomOut, CircleCheck, CircleAlert, MousePointerClick } from "lucide-react";
+import { ArrowLeft, Plus, Trash2, FileText, Loader2, Sparkles, Link2, ZoomIn, ZoomOut, CircleCheck, CircleAlert, MousePointerClick, Upload, CheckCircle2 } from "lucide-react";
 
 type View = "list" | "create";
 
@@ -332,6 +333,34 @@ export default function SupplierTemplateTab() {
       toast.success("已删除");
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "删除失败");
+    }
+  };
+
+  const [uploadingId, setUploadingId] = useState<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const pendingUploadIdRef = useRef<number | null>(null);
+
+  const handleUploadFile = (tplId: number) => {
+    pendingUploadIdRef.current = tplId;
+    fileInputRef.current?.click();
+  };
+
+  const onFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const tplId = pendingUploadIdRef.current;
+    if (!file || !tplId) return;
+    e.target.value = "";
+
+    setUploadingId(tplId);
+    try {
+      await uploadSupplierTemplateFile(tplId, file);
+      await refresh();
+      toast.success("模板文件已上传到云存储");
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "上传失败");
+    } finally {
+      setUploadingId(null);
+      pendingUploadIdRef.current = null;
     }
   };
 
@@ -701,6 +730,14 @@ export default function SupplierTemplateTab() {
   if (view === "list") {
     return (
       <div className="space-y-4">
+        {/* Hidden file input for template upload */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".xlsx,.xls"
+          className="hidden"
+          onChange={onFileSelected}
+        />
         <div className="flex items-center justify-between">
           <h3 className="font-medium">供应商模板</h3>
           <Button size="sm" onClick={startCreate}>
@@ -736,7 +773,6 @@ export default function SupplierTemplateTab() {
                         })()}
                         {tpl.field_positions && ` | ${Object.keys(tpl.field_positions).length} 个字段位置`}
                         {tpl.has_product_table && " | 含产品表格"}
-                        {tpl.template_file_url && " | 有模板文件"}
                       </div>
                       {tpl.order_format_template_id && (
                         <div className="flex items-center gap-1 mt-1.5">
@@ -756,25 +792,55 @@ export default function SupplierTemplateTab() {
                         </div>
                       )}
                     </div>
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-destructive h-8 w-8 shrink-0">
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent>
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>确定删除？</AlertDialogTitle>
-                          <AlertDialogDescription>
-                            将删除供应商模板「{tpl.template_name}」。此操作不可撤销。
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel>取消</AlertDialogCancel>
-                          <AlertDialogAction onClick={() => handleDelete(tpl.id)}>删除</AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {/* Storage status badge */}
+                      {tpl.template_file_url && !tpl.template_file_url.startsWith("/uploads/") ? (
+                        <Badge variant="outline" className="text-[10px] border-green-300 text-green-600 gap-1">
+                          <CheckCircle2 className="h-3 w-3" />已上传
+                        </Badge>
+                      ) : tpl.template_file_url ? (
+                        <Badge variant="outline" className="text-[10px] border-amber-300 text-amber-600 gap-1">
+                          本地文件
+                        </Badge>
+                      ) : null}
+
+                      {/* Upload button */}
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="text-muted-foreground hover:text-blue-600 h-8 w-8"
+                        title="上传模板文件到云存储"
+                        onClick={() => handleUploadFile(tpl.id)}
+                        disabled={uploadingId === tpl.id}
+                      >
+                        {uploadingId === tpl.id ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Upload className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+
+                      {/* Delete button */}
+                      <AlertDialog>
+                        <AlertDialogTrigger asChild>
+                          <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-destructive h-8 w-8">
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </AlertDialogTrigger>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>确定删除？</AlertDialogTitle>
+                            <AlertDialogDescription>
+                              将删除供应商模板「{tpl.template_name}」。此操作不可撤销。
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>取消</AlertDialogCancel>
+                            <AlertDialogAction onClick={() => handleDelete(tpl.id)}>删除</AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
+                    </div>
                   </div>
                 </CardContent>
               </Card>

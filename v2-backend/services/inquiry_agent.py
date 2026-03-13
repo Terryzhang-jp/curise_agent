@@ -18,6 +18,8 @@ import os
 import re
 import time
 import uuid
+
+from services.file_storage import storage as file_storage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
@@ -29,6 +31,26 @@ from openpyxl import load_workbook as _load_workbook_raw
 from services.agent.config import load_api_key
 
 logger = logging.getLogger(__name__)
+
+# Matches external workbook references like [Book1.xlsx] or [RecoveredExternalLink1]
+EXTERNAL_REF_RE = re.compile(r'\[.*?\]')
+
+
+def _sanitize_external_refs(ws) -> int:
+    """Strip formulas that reference external workbooks. Returns count removed."""
+    if ws is None:
+        return 0
+    count = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                if EXTERNAL_REF_RE.search(cell.value):
+                    logger.info("Sanitized external ref at %s: %s", cell.coordinate, cell.value[:80])
+                    cell.value = None
+                    count += 1
+    if count:
+        logger.info("Sanitized %d external reference formula(s) from template", count)
+    return count
 
 
 # ─── Pre-Analysis (no LLM, pure code) ────────────────────────
@@ -536,17 +558,29 @@ def _generate_single_supplier(
         return _save_workbook(wb, None, selection_method, order_meta, supplier_id,
                               products, upload_dir, {}, stream_key, overall_start)
 
-    # Load template file
+    # Load template file from Supabase Storage
     template_file_path = None
     if chosen_template.template_file_url:
-        template_file_path = os.path.join(
-            upload_dir, os.path.basename(chosen_template.template_file_url)
-        )
-        if not os.path.exists(template_file_path):
+        try:
+            suffix = ".xlsx"
+            if chosen_template.template_file_url.lower().endswith(".xls"):
+                suffix = ".xls"
+            template_file_path = file_storage.download_to_temp(
+                chosen_template.template_file_url, suffix=suffix
+            )
+        except FileNotFoundError:
+            logger.warning("Template file not found in storage: %s", chosen_template.template_file_url)
             template_file_path = None
 
     if template_file_path:
         wb.load_template(template_file_path)
+        # Layer 2.2: Sanitize — strip external workbook references to prevent #N/A
+        _sanitize_external_refs(wb._ws)
+        # Clean up temp file
+        try:
+            os.unlink(template_file_path)
+        except OSError:
+            pass
     else:
         wb.create_from_config()
 
@@ -567,6 +601,10 @@ def _generate_single_supplier(
         for row in wb._ws.iter_rows():
             for cell in row:
                 if isinstance(cell.value, str) and cell.value.startswith("="):
+                    # Layer 1: Skip external workbook references (already sanitized by Layer 2.2,
+                    # but double-check in case load_workbook re-introduces them)
+                    if EXTERNAL_REF_RE.search(cell.value):
+                        continue
                     formula_cells.add(cell.coordinate)
                     template_formulas[cell.coordinate] = cell.value
 
@@ -626,6 +664,20 @@ def _generate_single_supplier(
                 raise ValueError("LLM returned empty response")
 
             parsed = json.loads(resp_text.strip())
+            # LLM sometimes wraps the dict in a list — unwrap it
+            if isinstance(parsed, list):
+                if len(parsed) == 1 and isinstance(parsed[0], dict):
+                    parsed = parsed[0]
+                else:
+                    # Try merging list of dicts into one
+                    merged = {}
+                    for item in parsed:
+                        if isinstance(item, dict):
+                            merged.update(item)
+                    if merged:
+                        parsed = merged
+                    else:
+                        raise ValueError(f"LLM returned list with no usable dicts")
             if not isinstance(parsed, dict):
                 raise ValueError(f"LLM returned {type(parsed).__name__}, expected dict")
 
@@ -748,6 +800,8 @@ def _generate_single_supplier(
                                     pass
 
     # Rebuild formulas
+    # Layer 2.1: Only rebuild formulas in columns declared by formula_columns (whitelist)
+    allowed_formula_cols = set(c.upper() for c in formula_cols) if formula_cols else set()
     if template_formulas and wb._ws:
         last_data_row = start_row + count - 1
         per_row_formulas: dict[str, tuple[str, int]] = {}
@@ -757,6 +811,10 @@ def _generate_single_supplier(
             col_letter = re.match(r"([A-Z]+)", fc_ref).group(1)
             row_num = int(re.search(r"(\d+)", fc_ref).group(1))
             if start_row <= row_num <= start_row + 10:
+                # Only rebuild per-row formulas in whitelisted columns
+                if allowed_formula_cols and col_letter.upper() not in allowed_formula_cols:
+                    logger.debug("Skipping non-whitelisted per-row formula at %s: %s", fc_ref, fc_val[:60])
+                    continue
                 if col_letter not in per_row_formulas:
                     per_row_formulas[col_letter] = (fc_val, row_num)
             else:
@@ -797,19 +855,20 @@ def _save_workbook(
 
     po_number = str(order_meta.get("po_number") or "unknown").replace("/", "_").replace("\\", "_")
     filename = f"inquiry_{po_number}_supplier{supplier_id}_{uuid.uuid4().hex[:6]}.xlsx"
-    filepath = os.path.join(upload_dir, filename)
-    with open(filepath, "wb") as f:
-        f.write(excel_bytes)
+    file_url = file_storage.upload(
+        "inquiries", filename, excel_bytes,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     # Save preview HTML
     preview_filename = filename.replace(".xlsx", ".html")
     preview_url = None
     try:
         html = wb.render_html()
-        preview_path = os.path.join(upload_dir, preview_filename)
-        with open(preview_path, "w", encoding="utf-8") as f:
-            f.write(html)
-        preview_url = f"/uploads/{preview_filename}"
+        html_bytes = html.encode("utf-8")
+        preview_url = file_storage.upload(
+            "inquiries", preview_filename, html_bytes, content_type="text/html; charset=utf-8",
+        )
     except Exception as e:
         logger.warning("Preview HTML save failed for supplier %d: %s", supplier_id, e)
 
@@ -839,7 +898,7 @@ def _save_workbook(
     file_info = {
         "supplier_id": supplier_id,
         "filename": filename,
-        "file_url": f"/uploads/{filename}",
+        "file_url": file_url,
         "preview_url": preview_url,
         "product_count": len(products),
         "has_template": template is not None,

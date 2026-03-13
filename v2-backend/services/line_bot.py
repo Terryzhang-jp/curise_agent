@@ -426,13 +426,11 @@ def handle_image_message(event, received_at: float):
         deliver_message(event.reply_token, target_id, "图片下载失败，请重试。", received_at)
         return
 
-    # Save to uploads/ for agent access
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    # Save to Supabase Storage
+    from services.file_storage import storage
     filename = f"{uuid.uuid4().hex[:8]}_line_image.jpg"
-    filepath = os.path.join(UPLOAD_DIR, filename)
-    with open(filepath, "wb") as f:
-        f.write(file_bytes)
-    logger.info("Saved LINE image to %s (%d bytes)", filepath, len(file_bytes))
+    storage.upload("line", filename, file_bytes, content_type="image/jpeg")
+    logger.info("Saved LINE image to storage: %s (%d bytes)", filename, len(file_bytes))
 
     # Pass to agent with a prompt
     user_text = "用户上传了一张图片，请分析图片内容。"

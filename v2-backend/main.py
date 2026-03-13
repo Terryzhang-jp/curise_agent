@@ -66,6 +66,17 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 def on_startup():
     Base.metadata.create_all(bind=engine)
     _recover_stuck_orders()
+    _ensure_product_upload_template()
+    _ensure_storage_bucket()
+
+
+def _ensure_storage_bucket():
+    """Ensure Supabase Storage bucket exists."""
+    try:
+        from services.file_storage import storage
+        storage.ensure_bucket()
+    except Exception as e:
+        logger.warning("Storage bucket check failed: %s", e)
 
 
 def _recover_stuck_orders():
@@ -94,6 +105,19 @@ def _recover_stuck_orders():
         db.rollback()
     finally:
         db.close()
+
+
+def _ensure_product_upload_template():
+    """Generate product upload template on startup if missing."""
+    path = os.path.join(UPLOAD_DIR, "product_upload_template.xlsx")
+    if os.path.exists(path):
+        return
+    try:
+        from services.template_generator import generate_product_upload_template
+        generate_product_upload_template(path)
+        logger.info("Generated product upload template: %s", path)
+    except Exception as e:
+        logger.warning("Failed to generate product upload template: %s", e)
 
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")

@@ -18,6 +18,8 @@ from queue import Empty
 
 from typing import Optional
 
+from services.file_storage import storage
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -42,6 +44,17 @@ UPLOAD_DIR = settings.UPLOAD_DIR
 MAX_FILE_SIZE = settings.MAX_UPLOAD_SIZE
 
 
+def _get_order(db: DBSession, order_id: int, current_user: User | None = None) -> Order:
+    """Fetch order. If current_user is provided and is employee, restrict to own orders."""
+    query = db.query(Order).filter(Order.id == order_id)
+    if current_user and current_user.role not in ("superadmin", "admin"):
+        query = query.filter(Order.user_id == current_user.id)
+    order = query.first()
+    if not order:
+        raise HTTPException(404, "订单不存在")
+    return order
+
+
 # ─── Upload & Process ──────────────────────────────────────────
 
 @router.post("/upload", response_model=OrderDetail)
@@ -62,13 +75,9 @@ async def upload_order(
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(400, "文件大小不能超过 25 MB")
 
-    # Save file
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    # Save file to Supabase Storage
     safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
-    path = os.path.join(UPLOAD_DIR, safe_name)
-    with open(path, "wb") as f:
-        f.write(content)
-    file_url = f"/uploads/{safe_name}"
+    file_url = storage.upload("orders", safe_name, content)
 
     file_type = "pdf" if lower.endswith(".pdf") else "excel"
 
@@ -110,7 +119,7 @@ def list_orders(
     db: DBSession = Depends(get_db),
 ):
     """List orders with optional filters."""
-    query = db.query(Order).filter(Order.user_id == current_user.id)
+    query = db.query(Order)
 
     if status:
         query = query.filter(Order.status == status)
@@ -130,12 +139,7 @@ def get_order(
     db: DBSession = Depends(get_db),
 ):
     """Get order details."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id)
     return order
 
 
@@ -148,33 +152,21 @@ def delete_order(
     db: DBSession = Depends(get_db),
 ):
     """Delete an order and its associated files."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
 
-    # Clean up uploaded file
+    # Clean up uploaded file from storage
     if order.file_url:
-        fpath = os.path.join(UPLOAD_DIR, os.path.basename(order.file_url))
-        if os.path.exists(fpath):
-            try:
-                os.remove(fpath)
-            except OSError as e:
-                logger.warning("Failed to delete %s: %s", fpath, e)
+        storage.delete(order.file_url)
 
-    # Clean up generated inquiry Excel files
+    # Clean up generated inquiry files from storage
     if order.inquiry_data:
         for f in order.inquiry_data.get("generated_files", []):
-            fname = f.get("filename")
-            if fname:
-                fpath = os.path.join(UPLOAD_DIR, os.path.basename(fname))
-                if os.path.exists(fpath):
-                    try:
-                        os.remove(fpath)
-                    except OSError as e:
-                        logger.warning("Failed to delete %s: %s", fpath, e)
+            file_url = f.get("file_url") or f.get("filename")
+            if file_url:
+                storage.delete(file_url)
+            preview_url = f.get("preview_url")
+            if preview_url:
+                storage.delete(preview_url)
 
     db.delete(order)
     db.commit()
@@ -191,12 +183,7 @@ def update_order(
     db: DBSession = Depends(get_db),
 ):
     """Update order metadata and/or products. Only editable when status is ready or error."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status not in ("ready", "error"):
         raise HTTPException(400, "仅已完成或出错的订单可编辑")
 
@@ -236,12 +223,7 @@ async def rematch_order(
     db: DBSession = Depends(get_db),
 ):
     """Re-run matching on an order without re-extracting. Uses current products data."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status not in ("ready", "error"):
         raise HTTPException(400, "仅已完成或出错的订单可重新匹配")
     if not order.products:
@@ -343,12 +325,7 @@ def review_order(
     db: DBSession = Depends(get_db),
 ):
     """Mark an order as reviewed."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
 
     order.is_reviewed = True
     order.reviewed_at = datetime.utcnow()
@@ -373,12 +350,7 @@ async def set_order_template(
     db: DBSession = Depends(get_db),
 ):
     """Set template for an order awaiting template selection, then resume processing."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status != "pending_template":
         raise HTTPException(400, "订单不在等待选择模板状态")
 
@@ -388,15 +360,13 @@ async def set_order_template(
     if not template:
         raise HTTPException(404, "模板不存在")
 
-    # Read file bytes
+    # Read file bytes from storage
     if not order.file_url:
         raise HTTPException(400, "找不到原始文件")
-    file_path = os.path.join(UPLOAD_DIR, os.path.basename(order.file_url))
-    if not os.path.exists(file_path):
+    try:
+        file_bytes = storage.download(order.file_url)
+    except FileNotFoundError:
         raise HTTPException(400, "原始文件已丢失")
-
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
 
     # Reset to uploading and launch processing with template override
     order.status = "uploading"
@@ -425,24 +395,17 @@ async def reprocess_order(
     db: DBSession = Depends(get_db),
 ):
     """Reprocess a failed order."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status not in ("error", "ready", "pending_template", "extracting", "matching"):
         raise HTTPException(400, "仅可重新处理出错、已完成或待选模板的订单")
 
-    # Read file bytes from saved file
+    # Read file bytes from storage
     if not order.file_url:
         raise HTTPException(400, "找不到原始文件")
-    file_path = os.path.join(UPLOAD_DIR, os.path.basename(order.file_url))
-    if not os.path.exists(file_path):
+    try:
+        file_bytes = storage.download(order.file_url)
+    except FileNotFoundError:
         raise HTTPException(400, "原始文件已丢失")
-
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
 
     # Reset order state
     order.status = "uploading"
@@ -479,12 +442,7 @@ def anomaly_check(
     db: DBSession = Depends(get_db),
 ):
     """Run anomaly detection on an order."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status != "ready":
         raise HTTPException(400, "订单尚未处理完成")
 
@@ -501,23 +459,19 @@ def anomaly_check(
 @router.post("/{order_id}/financial-analysis", response_model=OrderDetail)
 def financial_analysis(
     order_id: int,
+    base_currency: str | None = Query(None, description="基准币种，默认使用订单币种"),
     current_user: User = Depends(require_writer),
     db: DBSession = Depends(get_db),
 ):
     """Run or re-run financial analysis on an order."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status != "ready":
         raise HTTPException(400, "订单尚未处理完成")
     if not order.match_results:
         raise HTTPException(400, "没有匹配结果，无法进行财务分析")
 
     from services.order_processor import run_financial_analysis
-    order.financial_data = run_financial_analysis(order)
+    order.financial_data = run_financial_analysis(order, base_currency=base_currency)
     db.commit()
     db.refresh(order)
     return order
@@ -532,12 +486,7 @@ def delivery_environment(
     db: DBSession = Depends(get_db),
 ):
     """Fetch or refresh delivery environment data for an order."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status != "ready":
         raise HTTPException(400, "订单尚未处理完成")
     if not order.port_id or not order.delivery_date:
@@ -581,12 +530,7 @@ def generate_inquiry(
     db: DBSession = Depends(get_db),
 ):
     """Start inquiry generation in background, return stream_key for SSE progress."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status != "ready":
         raise HTTPException(400, "订单尚未处理完成")
     if not order.match_results:
@@ -706,12 +650,7 @@ def generate_inquiry_single(
     db: DBSession = Depends(get_db),
 ):
     """Re-generate inquiry for a single supplier."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id, current_user)
     if order.status != "ready":
         raise HTTPException(400, "订单尚未处理完成")
     if not order.match_results:
@@ -790,13 +729,7 @@ def inquiry_preview(
     db: DBSession = Depends(get_db),
 ):
     """Get saved preview HTML for a supplier's inquiry."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
-
+    order = _get_order(db, order_id)
     inquiry_data = order.inquiry_data or {}
     suppliers = inquiry_data.get("suppliers", {})
     supplier_data = suppliers.get(str(supplier_id))
@@ -808,15 +741,12 @@ def inquiry_preview(
     if not file_info or not file_info.get("preview_url"):
         raise HTTPException(404, "没有预览文件")
 
-    preview_filename = os.path.basename(file_info["preview_url"])
-    preview_path = os.path.realpath(os.path.join(UPLOAD_DIR, preview_filename))
-    if not preview_path.startswith(os.path.realpath(UPLOAD_DIR)):
-        raise HTTPException(400, "非法文件路径")
-    if not os.path.exists(preview_path):
+    preview_url = file_info["preview_url"]
+    try:
+        html_bytes = storage.download(preview_url)
+        html = html_bytes.decode("utf-8")
+    except FileNotFoundError:
         raise HTTPException(404, "预览文件已丢失")
-
-    with open(preview_path, "r", encoding="utf-8") as f:
-        html = f.read()
 
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html)
@@ -831,13 +761,7 @@ def list_order_files(
     db: DBSession = Depends(get_db),
 ):
     """List generated files for an order."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
-
+    order = _get_order(db, order_id)
     inquiry = order.inquiry_data or {}
     return inquiry.get("generated_files", [])
 
@@ -870,12 +794,7 @@ def download_order_file(
     db: DBSession = Depends(get_db),
 ):
     """Download a generated file. Auth via ?token= query param."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
+    order = _get_order(db, order_id)
 
     # Verify file belongs to this order
     inquiry = order.inquiry_data or {}
@@ -884,17 +803,24 @@ def download_order_file(
     if not valid:
         raise HTTPException(404, "文件不存在")
 
-    safe_filename = os.path.basename(filename)
-    file_path = os.path.realpath(os.path.join(UPLOAD_DIR, safe_filename))
-    if not file_path.startswith(os.path.realpath(UPLOAD_DIR)):
-        raise HTTPException(400, "非法文件路径")
-    if not os.path.exists(file_path):
+    # Find the file_url from inquiry data
+    file_url = None
+    for f in files:
+        if f.get("filename") == filename:
+            file_url = f.get("file_url", filename)
+            break
+
+    try:
+        content = storage.download(file_url or filename)
+    except FileNotFoundError:
         raise HTTPException(404, "文件已丢失")
 
-    return FileResponse(
-        file_path,
+    from fastapi.responses import Response
+    safe_filename = os.path.basename(filename)
+    return Response(
+        content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=safe_filename,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )
 
 
@@ -906,28 +832,29 @@ def download_order_file_secure(
     db: DBSession = Depends(get_db),
 ):
     """Download a generated file. Auth via Authorization header (preferred)."""
-    order = db.query(Order).filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    ).first()
-    if not order:
-        raise HTTPException(404, "订单不存在")
-
+    order = _get_order(db, order_id)
     inquiry = order.inquiry_data or {}
     files = inquiry.get("generated_files", [])
     valid = any(f.get("filename") == filename for f in files)
     if not valid:
         raise HTTPException(404, "文件不存在")
 
-    safe_filename = os.path.basename(filename)
-    file_path = os.path.realpath(os.path.join(UPLOAD_DIR, safe_filename))
-    if not file_path.startswith(os.path.realpath(UPLOAD_DIR)):
-        raise HTTPException(400, "非法文件路径")
-    if not os.path.exists(file_path):
+    # Find the file_url from inquiry data
+    file_url = None
+    for f in files:
+        if f.get("filename") == filename:
+            file_url = f.get("file_url", filename)
+            break
+
+    try:
+        content = storage.download(file_url or filename)
+    except FileNotFoundError:
         raise HTTPException(404, "文件已丢失")
 
-    return FileResponse(
-        file_path,
+    from fastapi.responses import Response
+    safe_filename = os.path.basename(filename)
+    return Response(
+        content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=safe_filename,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )

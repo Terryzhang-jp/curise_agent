@@ -9,6 +9,7 @@ from database import get_db
 from models import User, FieldSchema, FieldDefinition, OrderFormatTemplate, SupplierTemplate
 from routes.auth import get_current_user
 from security import require_role
+from services.file_storage import storage
 
 require_admin = require_role("superadmin", "admin")
 from schemas import (
@@ -275,13 +276,9 @@ async def analyze_order_template_pdf(
     if len(file_bytes) > 25 * 1024 * 1024:
         raise HTTPException(400, "文件大小不能超过 25 MB")
 
-    # Save file for future reference
-    upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
-    os.makedirs(upload_dir, exist_ok=True)
+    # Save file to Supabase Storage
     safe_name = f"template_{uuid.uuid4().hex[:8]}_{file.filename}"
-    filepath = os.path.join(upload_dir, safe_name)
-    with open(filepath, "wb") as f:
-        f.write(file_bytes)
+    storage.upload("templates", safe_name, file_bytes, content_type="application/pdf")
 
     try:
         import asyncio
@@ -436,19 +433,51 @@ def delete_supplier_template(
     if not tpl:
         raise HTTPException(status_code=404, detail="供应商模板不存在")
 
-    # Clean up template file
+    # Clean up template file from storage
     if tpl.template_file_url:
-        upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
-        fpath = os.path.join(upload_dir, os.path.basename(tpl.template_file_url))
-        if os.path.exists(fpath):
-            try:
-                os.remove(fpath)
-            except OSError:
-                pass
+        storage.delete(tpl.template_file_url)
 
     db.delete(tpl)
     db.commit()
     return {"detail": "已删除"}
+
+
+@router.post("/supplier-templates/{tpl_id}/upload-file", response_model=SupplierTemplateResponse)
+async def upload_supplier_template_file(
+    tpl_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Upload (or replace) the Excel template file for a supplier template to Supabase Storage."""
+    tpl = db.query(SupplierTemplate).filter(SupplierTemplate.id == tpl_id).first()
+    if not tpl:
+        raise HTTPException(status_code=404, detail="供应商模板不存在")
+
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="请上传 .xlsx 文件")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="文件为空")
+    if len(file_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="文件大小不能超过 25 MB")
+
+    # Delete old file if exists
+    if tpl.template_file_url:
+        storage.delete(tpl.template_file_url)
+
+    # Upload to storage
+    safe_name = f"template_{uuid.uuid4().hex[:8]}_{file.filename}"
+    file_url = storage.upload(
+        "templates", safe_name, file_bytes,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    tpl.template_file_url = file_url
+    db.commit()
+    db.refresh(tpl)
+    return tpl
 
 
 @router.post("/supplier-templates/analyze")
@@ -469,14 +498,12 @@ async def analyze_supplier_template(
     if not file_bytes:
         raise HTTPException(status_code=400, detail="文件为空")
 
-    # Save the uploaded template file
-    upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
-    os.makedirs(upload_dir, exist_ok=True)
+    # Save the uploaded template file to Supabase Storage
     safe_name = f"template_{uuid.uuid4().hex[:8]}_{file.filename}"
-    filepath = os.path.join(upload_dir, safe_name)
-    with open(filepath, "wb") as f:
-        f.write(file_bytes)
-    file_url = f"/uploads/{safe_name}"
+    file_url = storage.upload(
+        "templates", safe_name, file_bytes,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     order_template_name = None
 

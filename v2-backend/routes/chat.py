@@ -26,7 +26,10 @@ from database import get_db, SessionLocal
 from models import AgentSession, AgentMessage, User
 from routes.auth import get_current_user
 from security import require_role
-from services.agent.stream_queue import get_or_create_queue, get_queue, remove_queue, push_event
+from services.agent.stream_queue import (
+    get_or_create_queue, get_queue, remove_queue, push_event,
+    get_or_create_cancel_event, set_cancelled, remove_cancel_event,
+)
 
 require_chat_user = require_role("superadmin", "admin", "employee")
 
@@ -77,8 +80,14 @@ def _load_skills_into_ctx(db: DBSession, ctx):
     from services.agent.tool_context import SkillDef
 
     # 1. Filesystem skills first (scan_skills clears then populates)
-    skills_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "skills")
-    ctx.scan_skills(extra_paths=[skills_dir] if os.path.isdir(skills_dir) else None)
+    # Check two possible locations: inside app dir (for Cloud Run) and parent dir (legacy)
+    app_dir = os.path.dirname(os.path.dirname(__file__))  # v2-backend/
+    skills_candidates = [
+        os.path.join(app_dir, "skills"),            # v2-backend/skills/ (Cloud Run)
+        os.path.join(app_dir, "..", "skills"),       # curise_agent/skills/ (legacy)
+    ]
+    extra = [d for d in skills_candidates if os.path.isdir(d)]
+    ctx.scan_skills(extra_paths=extra or None)
 
     # 2. DB skills — enabled ones override filesystem, disabled ones remove filesystem entries
     all_db_skills = db.query(SkillConfig).all()
@@ -97,8 +106,90 @@ def _load_skills_into_ctx(db: DBSession, ctx):
             ctx.skills.pop(s.name, None)
 
 
-def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
-    """Build the chat system prompt with dynamic tool list."""
+_SCENARIO_PROMPTS = {
+    "data_upload": """你是 CruiseAgent，正在帮助用户上传产品数据（报价单/价格表）。
+
+## 上传模板
+如果用户询问模板或格式要求，告知可以下载模板文件：
+- 下载地址：/uploads/product_upload_template.xlsx
+- 模板包含 16 列（product_name、country_id、category_id 等），第二个 sheet 有参考表可查 ID
+- 必填字段：product_name、country_id、category_id、effective_from
+
+## 流程
+1. parse_file 解析文件
+2. analyze_columns 分析未映射列（检测 supplier_id/country_id 等引用列）
+3. 确认国家、港口、供应商、生效日期
+4. prepare_upload 一键验证+审计+预览（传入所有参数）
+5. 用户确认后 execute_upload
+6. 如有错误可用 rollback_batch 回滚
+
+## 规则
+- parse_file 后必须立即调用 analyze_columns
+- 必须在 prepare_upload 之前确认国家、港口、生效日期
+- prepare_upload 返回卡片后等待用户确认，不要主动执行
+- 如有缺失供应商/国家，用 create_references 创建后再调用 prepare_upload
+- 简短回复，不要重复卡片已展示的信息""",
+
+    "query": """你是 CruiseAgent，正在帮助用户查询数据。
+
+## 能力
+你可以查询数据库获取产品、供应商、订单、国家、港口等信息。
+
+## 重要数据表
+- products: 产品主数据库（品名、价格、供应商、国家、港口等）
+- v2_orders: 上传的订单（含产品列表、匹配结果）
+- countries / ports: 国家和港口
+- suppliers: 供应商
+- categories: 产品分类
+
+## 规则
+- 先用 get_db_schema 了解表结构，再用 query_db 查询
+- 只允许 SELECT 查询
+- 查询结果用 markdown 表格格式展示
+- 数值字段保留合理精度，价格保留2位小数
+- 「按X统计」意味着 GROUP BY，不是 ORDER BY + LIMIT
+- 结果太多只展示关键信息并说明总数""",
+
+    "order_management": """你是 CruiseAgent，正在帮助用户管理订单。
+
+## 能力
+- 查看订单概览：get_order_overview
+- 查询订单详情：query_db
+- 为订单生成询价单：generate_order_inquiry
+
+## 重要数据表
+- v2_orders: 订单表（order_metadata, products, match_results 是 JSON 字段）
+- products: 产品匹配参考
+
+## 规则
+- v2_orders 中 JSON 字段使用 PostgreSQL JSON 操作符查询
+- 查询结果用 markdown 表格展示
+- 生成询价单前先确认订单ID""",
+
+    "fulfillment": """你是 CruiseAgent，正在帮助用户管理订单履约。
+
+## 履约周期
+pending → inquiry_sent → quoted → confirmed → delivering → delivered → invoiced → paid
+
+## 可用工具
+- get_order_fulfillment: 查看履约状态
+- update_order_fulfillment: 更新状态和财务信息
+- record_delivery_receipt: 记录交货验收（逐产品接收/拒收）
+- attach_order_file: 上传交货照片/发票扫描件
+
+## 规则
+- 理解自然语言意图（如"订单已交货"→update状态为delivered）
+- 执行重要操作前调用 request_confirmation""",
+}
+
+
+def _build_system_prompt(enabled_tools: set[str] | None, ctx,
+                         scenario: str | None = None) -> str:
+    """Build the chat system prompt with dynamic tool list.
+
+    If *scenario* is given and matches a key in _SCENARIO_PROMPTS, use the
+    lightweight scenario-specific prompt instead of the full generic prompt.
+    """
     # Determine which tools to list
     if enabled_tools is None:
         tool_section = """## 可用工具
@@ -126,11 +217,14 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
             "get_order_overview": "查看订单概览（基本信息、匹配、询价状态）",
             "generate_order_inquiry": "为指定订单生成询价 Excel 文件",
             "parse_file": "解析上传的 Excel/CSV 文件，创建暂存数据",
+            "analyze_columns": "分析未映射列（交叉比对 DB 参考表，检测 supplier_id/country_id 等）",
             "resolve_and_validate": "验证暂存数据（代码匹配+LLM模糊匹配+置信度分级）",
             "create_references": "自动创建缺失的供应商/国家等引用数据",
             "preview_changes": "生成变更预览报告（新增/更新/异常/无变化）",
             "execute_upload": "确认后原子执行产品导入，写入变更日志",
             "audit_data": "数据质量审计（检查列缺失、格式错误、重复数据、单位/价格合理性等）",
+            "prepare_upload": "一键准备上传（验证匹配+数据审计+变更预览，返回统一审查卡片）",
+            "rollback_batch": "回滚已完成的批次导入（删除新增、恢复更新产品原值）",
             "get_order_fulfillment": "查看订单履约状态（交货、发票、付款）",
             "update_order_fulfillment": "更新订单履约状态和财务信息",
             "record_delivery_receipt": "记录港口交货验收（逐产品接收/拒收）",
@@ -145,6 +239,19 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
     # Skills section
     skill_summary = ctx.get_skill_list_summary()
 
+    # Scenario-specific prompt — lightweight, focused on one task
+    if scenario and scenario in _SCENARIO_PROMPTS:
+        base = _SCENARIO_PROMPTS[scenario]
+        return f"""{base}
+
+{tool_section}
+
+## 记忆
+你拥有完整的对话记忆。
+
+{skill_summary}"""
+
+    # No scenario → full generic prompt
     return f"""你是 CruiseAgent，邮轮供应链管理助手。
 
 ## 能力
@@ -188,30 +295,26 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx) -> str:
 
 用户可能用自然语言描述状态更新（如"订单已交货"、"土豆只收了500kg"），你需要理解意图并调用相应工具。
 
+## 产品上传模板
+如果用户询问上传模板或格式要求，告知可以下载模板：/uploads/product_upload_template.xlsx
+模板包含 16 列，必填：product_name、country_id、category_id、effective_from。第二个 sheet 有 ID 参考表。
+
 ## 产品上传流程
 如果用户上传了 Excel 文件（报价单/价格表），你应该：
 1. 用 parse_file 解析文件（自动映射列、创建暂存数据）
-2. **在调用 resolve_and_validate 之前，必须先确认以下必填信息**：
-   - **国家**（country_name）：如 JAPAN、THAILAND
-   - **港口**（port_name）：如 横浜、Bangkok — 这决定了更新哪个港口的价格记录
-   - **生效日期**（effective_from / effective_to）：如 2026-03-01 至 2026-04-30
-   如果用户没有主动提供这些信息，你必须明确询问。这三项缺一不可。
-3. 用 resolve_and_validate 验证数据（传入 supplier_name、country_name、port_name、effective_from、effective_to）
-   - 系统会按 (国家+港口) 精确匹配产品记录，不会跨港口误更新
-   - 如果产品代码在目标港口不存在但在其他港口存在，会标记为"港口新增"
-   - 高置信度匹配 (≥90%) 自动接受
-   - 中置信度 (70-89%) 告知用户建议
-   - 低置信度 (<70%) 标记为需确认
-4. 用 audit_data 进行数据质量审计（检查格式/缺失/重复/语义问题）
-5. 如有缺失引用数据（新供应商/国家），先询问用户，再用 create_references 创建
-6. 用 preview_changes 生成变更预览，展示给用户
-7. 用户确认后调用 execute_upload（支持排除指定行号）
-注意：resolve_and_validate 之后必须调用 audit_data，不可跳过。每一步都要向用户展示结果，不要跳步。异常价格(涨跌>30%)需要用户明确确认。
-audit_data 工具结果会自动生成结构化卡片展示给用户，你只需简短总结（1-2句话说明有无问题和下一步建议），不要重复列举审计详情。
+2. 用 analyze_columns 分析未映射列（检测是否有 supplier_id/country_id 等引用列）
+3. 根据分析结果和用户输入，确认国家、港口、供应商、生效日期
+4. 用 prepare_upload 一键验证+审计+预览（传入 supplier_name、country_name、port_name、effective_from、effective_to）
+5. 用户确认后 execute_upload（支持排除指定行号）
+6. 如有错误，可用 rollback_batch 回滚（传入 batch_id）
+注意：parse_file 后必须立即调用 analyze_columns。
+prepare_upload 返回卡片后等待用户确认。
+简短回复，不要重复卡片已展示的信息。
 {skill_summary}"""
 
 
-def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None = None):
+def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None = None,
+                       scenario: str | None = None):
     """Create a ReAct agent configured for chat with general-purpose + query tools."""
     from services.agent.config import LLMConfig
     from services.agent.llm.gemini_provider import GeminiProvider
@@ -240,7 +343,7 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     registry = create_chat_registry(ctx, enabled_tools=enabled_tools)
 
     # Build dynamic system prompt
-    system_prompt = _build_system_prompt(enabled_tools, ctx)
+    system_prompt = _build_system_prompt(enabled_tools, ctx, scenario=scenario)
 
     # Agent
     agent = ReActAgent(
@@ -394,6 +497,7 @@ async def send_message(
     session_id: str,
     content: str = Form(...),
     file: UploadFile | None = File(None),
+    scenario: str = Form(""),
     current_user: User = Depends(require_chat_user),
     db: DBSession = Depends(get_db),
 ):
@@ -418,13 +522,10 @@ async def send_message(
         file_content = await file.read()
         if len(file_content) > MAX_FILE_SIZE:
             raise HTTPException(400, "文件大小不能超过 20 MB")
-        # Save to uploads/
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        # Save to Supabase Storage
+        from services.file_storage import storage
         safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
-        path = os.path.join(UPLOAD_DIR, safe_name)
-        with open(path, "wb") as f:
-            f.write(file_content)
-        file_url = f"/uploads/{safe_name}"
+        file_url = storage.upload("chat", safe_name, file_content)
         file_bytes = file_content
 
     # Record the current max display message ID (baseline for SSE)
@@ -451,14 +552,17 @@ async def send_message(
 
     db.commit()
 
-    # Create queue BEFORE launching thread so SSE endpoint can find it
+    # Create queue and cancel event BEFORE launching thread
     get_or_create_queue(session_id)
+    cancel_event = get_or_create_cancel_event(session_id)
+    cancel_event.clear()  # Reset in case previous run left it set
 
     # Launch agent in background thread
     threading.Thread(
         target=_run_chat_agent,
         args=(session_id, content),
-        kwargs={"file_bytes": file_bytes},
+        kwargs={"file_bytes": file_bytes, "scenario": scenario.strip() or None,
+                "cancel_event": cancel_event},
         daemon=True,
     ).start()
 
@@ -571,11 +675,14 @@ async def stream_messages(
     )
 
 
-def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None = None):
+def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None = None,
+                    scenario: str | None = None, cancel_event=None):
     """Background thread: run ReAct agent with independent DB session."""
     db = SessionLocal()
     try:
-        agent = _create_chat_agent(session_id, db, file_bytes=file_bytes)
+        agent = _create_chat_agent(session_id, db, file_bytes=file_bytes, scenario=scenario)
+        if cancel_event:
+            agent.ctx.cancel_event = cancel_event
         agent.run(user_message)
     except Exception as e:
         logger.error("Chat agent error: %s", str(e), exc_info=True)
@@ -626,11 +733,34 @@ def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None
             title = None
         db.close()
 
+        # Clean up cancel event
+        remove_cancel_event(session_id)
+
         # Push done event to queue
         push_event(session_id, {
             "type": "done",
             "data": {"title": title},
         })
+
+
+# ─── Cancel ──────────────────────────────────────────────────
+
+@router.post("/sessions/{session_id}/cancel")
+def cancel_agent(
+    session_id: str,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Cancel a running agent for the given session."""
+    session = db.query(AgentSession).filter(
+        AgentSession.id == session_id,
+        AgentSession.user_id == current_user.id,
+    ).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+
+    set_cancelled(session_id)
+    return {"status": "cancelled"}
 
 
 # ─── Context Compaction ──────────────────────────────────────
