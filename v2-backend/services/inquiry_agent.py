@@ -168,12 +168,11 @@ def resolve_template(supplier_id: int, all_templates: list) -> tuple[Any | None,
     # Step 3: no exact match → return candidate list
     candidates = []
     for t in all_templates:
-        if t.field_positions:  # only templates with usable config
-            candidates.append({
-                "id": t.id,
-                "name": t.template_name,
-                "country_id": t.country_id,
-            })
+        candidates.append({
+            "id": t.id,
+            "name": t.template_name,
+            "country_id": t.country_id,
+        })
     return None, "candidates", candidates
 
 
@@ -525,14 +524,12 @@ def _generate_single_supplier(
 
     if template_id_override:
         chosen_template = next((t for t in all_templates if t.id == template_id_override), None)
-        if chosen_template and chosen_template.field_positions:
+        if chosen_template:
             selection_method = "user_selected"
-        else:
-            chosen_template = None
 
     if not chosen_template:
         template, method, candidates = resolve_template(supplier_id, all_templates)
-        if method == "exact" and template and template.field_positions:
+        if method == "exact" and template:
             chosen_template = template
             selection_method = "exact"
         elif candidates:
@@ -544,7 +541,7 @@ def _generate_single_supplier(
     # Build workbook + fields
     wb = InquiryWorkbook()
 
-    if not chosen_template or not chosen_template.field_positions:
+    if not chosen_template:
         # Generic fallback — no LLM needed
         wb.create_generic(order_meta, products, supplier_id)
         if stream_key:
@@ -629,109 +626,106 @@ def _generate_single_supplier(
             "supplier_id": supplier_id,
         })
 
-    # ── Stage 3: Single LLM call (with retry) ──
-    order_data = {k: str(v)[:200] for k, v in enriched_meta.items() if v}
-    prompt = MAPPING_PROMPT.format(
-        fields_json=json.dumps(fields, ensure_ascii=False, indent=2),
-        order_data_json=json.dumps(order_data, ensure_ascii=False, indent=2),
-        supplier_json=json.dumps(supplier_info, ensure_ascii=False, indent=2),
-    )
+    # ── Stage 3: Single LLM call for header field mapping ──
+    cell_mapping = {}
 
-    api_key = load_api_key("gemini")
-    client = genai.Client(api_key=api_key)
+    if fields:
+        order_data = {k: str(v)[:200] for k, v in enriched_meta.items() if v}
+        prompt = MAPPING_PROMPT.format(
+            fields_json=json.dumps(fields, ensure_ascii=False, indent=2),
+            order_data_json=json.dumps(order_data, ensure_ascii=False, indent=2),
+            supplier_json=json.dumps(supplier_info, ensure_ascii=False, indent=2),
+        )
 
-    cell_mapping = None
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            llm_start = time.time()
-            response = client.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                    max_output_tokens=5000,
-                    thinking_config=types.ThinkingConfig(thinking_budget=2048),
-                ),
-            )
-            llm_elapsed = time.time() - llm_start
-            logger.info("Inquiry v6.2: supplier %d LLM mapping in %.1fs", supplier_id, llm_elapsed)
+        api_key = load_api_key("gemini")
+        client = genai.Client(api_key=api_key)
 
-            # Guard: check response has text
-            resp_text = getattr(response, "text", None)
-            if not resp_text or not resp_text.strip():
-                raise ValueError("LLM returned empty response")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                llm_start = time.time()
+                response = client.models.generate_content(
+                    model="gemini-3-flash-preview",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                        max_output_tokens=5000,
+                        thinking_config=types.ThinkingConfig(thinking_budget=2048),
+                    ),
+                )
+                llm_elapsed = time.time() - llm_start
+                logger.info("Inquiry v6.2: supplier %d LLM mapping in %.1fs", supplier_id, llm_elapsed)
 
-            parsed = json.loads(resp_text.strip())
-            # LLM sometimes wraps the dict in a list — unwrap it
-            if isinstance(parsed, list):
-                if len(parsed) == 1 and isinstance(parsed[0], dict):
-                    parsed = parsed[0]
-                else:
-                    # Try merging list of dicts into one
-                    merged = {}
-                    for item in parsed:
-                        if isinstance(item, dict):
-                            merged.update(item)
-                    if merged:
-                        parsed = merged
+                resp_text = getattr(response, "text", None)
+                if not resp_text or not resp_text.strip():
+                    raise ValueError("LLM returned empty response")
+
+                parsed = json.loads(resp_text.strip())
+                if isinstance(parsed, list):
+                    if len(parsed) == 1 and isinstance(parsed[0], dict):
+                        parsed = parsed[0]
                     else:
-                        raise ValueError(f"LLM returned list with no usable dicts")
-            if not isinstance(parsed, dict):
-                raise ValueError(f"LLM returned {type(parsed).__name__}, expected dict")
+                        merged = {}
+                        for item in parsed:
+                            if isinstance(item, dict):
+                                merged.update(item)
+                        if merged:
+                            parsed = merged
+                        else:
+                            raise ValueError(f"LLM returned list with no usable dicts")
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"LLM returned {type(parsed).__name__}, expected dict")
 
-            cell_mapping = parsed
-            break
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("Inquiry v6.2: supplier %d attempt %d failed: %s", supplier_id, attempt + 1, e)
-            if attempt == max_retries - 1:
-                raise
-        except Exception as e:
-            logger.warning("Inquiry v6.2: supplier %d attempt %d API error: %s", supplier_id, attempt + 1, e)
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s
+                cell_mapping = parsed
+                break
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning("Inquiry v6.2: supplier %d attempt %d failed: %s", supplier_id, attempt + 1, e)
+                if attempt == max_retries - 1:
+                    raise
+            except Exception as e:
+                logger.warning("Inquiry v6.2: supplier %d attempt %d API error: %s", supplier_id, attempt + 1, e)
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(2 ** attempt)
 
-    # ── Stage 4: Deterministic format enforcement ──
-    # Detect date fields by field_key
-    date_field_positions = set()
-    for f in fields:
-        fk = f.get("field_key", "")
-        if "date" in fk.lower() or fk in ("order_date", "delivery_date", "payment_date"):
-            date_field_positions.add(f["position"])
+        # ── Stage 4: Deterministic format enforcement ──
+        date_field_positions = set()
+        for f in fields:
+            fk = f.get("field_key", "")
+            if "date" in fk.lower() or fk in ("order_date", "delivery_date", "payment_date"):
+                date_field_positions.add(f["position"])
 
-    for cell_ref, value in list(cell_mapping.items()):
-        if value is None or value == "":
-            continue
-        val_str = str(value)
-
-        # Date fields — enforce based on annotation
-        if cell_ref in date_field_positions:
-            ann = annotations.get(cell_ref, "")
-            parsed = _try_parse_date(val_str)
-            if parsed:
-                if re.search(r"和暦|令和", ann):
-                    reiwa_year = parsed.year - 2018
-                    cell_mapping[cell_ref] = f"R{reiwa_year}.{parsed.month:02d}.{parsed.day:02d}"
-                elif re.search(r"DD[/\-.]MM[/\-.]YYYY", ann, re.IGNORECASE):
-                    cell_mapping[cell_ref] = parsed.strftime("%d/%m/%Y")
-                else:
-                    cell_mapping[cell_ref] = parsed.strftime("%Y/%m/%d")
+        for cell_ref, value in list(cell_mapping.items()):
+            if value is None or value == "":
                 continue
+            val_str = str(value)
 
-        # Other annotations
-        ann = annotations.get(cell_ref, "")
-        if not ann:
-            # Check if column has an annotation (e.g. product row annotation applies to header)
-            for ann_cell, ann_text in annotations.items():
-                if ann_cell[0] == cell_ref[0] and len(ann_cell) <= 3 and len(cell_ref) <= 3:
-                    ann = ann_text
-                    break
-        if ann:
-            enforced = enforce_annotation(val_str, ann)
-            if enforced != val_str:
-                cell_mapping[cell_ref] = enforced
+            if cell_ref in date_field_positions:
+                ann = annotations.get(cell_ref, "")
+                parsed = _try_parse_date(val_str)
+                if parsed:
+                    if re.search(r"和暦|令和", ann):
+                        reiwa_year = parsed.year - 2018
+                        cell_mapping[cell_ref] = f"R{reiwa_year}.{parsed.month:02d}.{parsed.day:02d}"
+                    elif re.search(r"DD[/\-.]MM[/\-.]YYYY", ann, re.IGNORECASE):
+                        cell_mapping[cell_ref] = parsed.strftime("%d/%m/%Y")
+                    else:
+                        cell_mapping[cell_ref] = parsed.strftime("%Y/%m/%d")
+                    continue
+
+            ann = annotations.get(cell_ref, "")
+            if not ann:
+                for ann_cell, ann_text in annotations.items():
+                    if ann_cell[0] == cell_ref[0] and len(ann_cell) <= 3 and len(cell_ref) <= 3:
+                        ann = ann_text
+                        break
+            if ann:
+                enforced = enforce_annotation(val_str, ann)
+                if enforced != val_str:
+                    cell_mapping[cell_ref] = enforced
+    else:
+        logger.info("Inquiry v6.2: supplier %d — no header fields, skipping LLM", supplier_id)
 
     # ── Stage 5: Write workbook ──
     # Write header cells (skip null = preserve template)
