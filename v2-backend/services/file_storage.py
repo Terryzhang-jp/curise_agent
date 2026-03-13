@@ -6,7 +6,9 @@ Backward-compatible: download() falls back to local file for old /uploads/ paths
 
 import logging
 import os
+import re
 import tempfile
+import unicodedata
 
 from config import settings
 
@@ -14,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 BUCKET = settings.STORAGE_BUCKET
 UPLOAD_DIR = settings.UPLOAD_DIR
+
+
+def _safe_filename(name: str) -> str:
+    """Sanitize filename to ASCII-only for Supabase Storage keys."""
+    base, ext = os.path.splitext(name)
+    # Keep only ASCII letters, digits, hyphens, underscores, dots
+    base = re.sub(r"[^a-zA-Z0-9_\-.]", "_", base)
+    base = re.sub(r"_+", "_", base).strip("_")
+    return f"{base}{ext}" if base else f"file{ext}"
 
 
 class FileStorage:
@@ -34,6 +45,7 @@ class FileStorage:
     def upload(self, folder: str, filename: str, content: bytes,
                content_type: str = "application/octet-stream") -> str:
         """Upload file to Supabase Storage. Returns storage path like 'orders/abc.pdf'."""
+        filename = _safe_filename(filename)
         path = f"{folder}/{filename}"
         if not self.enabled:
             # Fallback: save locally
