@@ -297,3 +297,103 @@
   pointer-events: none;
 }
 
+/* ─── Chat Animations ────────────────────────────────────────── */
+
+@keyframes shimmer-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+@keyframes dot-bounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-3px); }
+}
+
+.thinking-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.thinking-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    oklch(0.72 0.12 70 / 0.08) 50%,
+    transparent 100%
+  );
+  animation: shimmer-slide 2s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.thinking-dots span {
+  display: inline-block;
+  animation: dot-bounce 1.4s ease-in-out infinite;
+}
+.thinking-dots span:nth-child(2) { animation-delay: 0.16s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.32s; }
+
+/* ─── Timeline for reasoning steps ───────────────────────────── */
+
+.reasoning-timeline {
+  position: relative;
+  padding-left: 1.25rem;
+}
+
+.reasoning-timeline::before {
+  content: '';
+  position: absolute;
+  left: 4.5px;
+  top: 0.5rem;
+  bottom: 0.5rem;
+  width: 1px;
+  background: oklch(0.72 0.12 70 / 0.15);
+}
+
+.reasoning-step {
+  position: relative;
+}
+
+.reasoning-step::before {
+  content: '';
+  position: absolute;
+  left: -1.25rem;
+  top: 0.5rem;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid var(--background);
+  background: var(--step-color, oklch(0.58 0.02 255));
+}
+
+.reasoning-step[data-type="thinking"]::before { --step-color: oklch(0.65 0.15 285); }
+.reasoning-step[data-type="action"]::before { --step-color: oklch(0.72 0.12 70); }
+.reasoning-step[data-type="observation"]::before { --step-color: oklch(0.65 0.15 155); }
+.reasoning-step[data-type="error_observation"]::before { --step-color: oklch(0.65 0.2 25); }
+.reasoning-step[data-active="true"]::before { animation: pulse 2s ease-in-out infinite; }
+
+/* ─── Collapsible smooth height animation (Radix) ────────────── */
+
+@keyframes collapsible-open {
+  from { height: 0; opacity: 0; }
+  to   { height: var(--radix-collapsible-content-height); opacity: 1; }
+}
+
+@keyframes collapsible-close {
+  from { height: var(--radix-collapsible-content-height); opacity: 1; }
+  to   { height: 0; opacity: 0; }
+}
+
+[data-state='open'][data-radix-collapsible-content] {
+  animation: collapsible-open 200ms ease-out;
+  overflow: hidden;
+}
+
+[data-state='closed'][data-radix-collapsible-content] {
+  animation: collapsible-close 150ms ease-in;
+  overflow: hidden;
+}
+

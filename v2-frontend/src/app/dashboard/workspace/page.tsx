@@ -9,6 +9,7 @@ import {
   getChatMessages,
   sendChatMessage,
   streamChatMessages,
+  cancelChatAgent,
 } from "@/lib/chat-api";
 import { toast } from "sonner";
 import SessionSidebar from "./SessionSidebar";
@@ -24,10 +25,11 @@ export default function WorkspacePage() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [activeScenario, setActiveScenario] = useState<string | null>(null);
 
   const streamAbortRef = useRef<(() => void) | null>(null);
   // Stable ref for doSend — allows useCallback handlers to avoid stale closures
-  const doSendRef = useRef<(text: string, file?: File | null) => void>(() => {});
+  const doSendRef = useRef<(text: string, file?: File | null, scenario?: string | null) => void>(() => {});
 
   // Typewriter animation state
   const typewriterRef = useRef<{
@@ -160,6 +162,7 @@ export default function WorkspacePage() {
     setMessages([]);
     setInput("");
     setError("");
+    setActiveScenario(null);
 
     const session = sessions.find((s) => s.id === id);
     setActiveSession(session || null);
@@ -176,6 +179,7 @@ export default function WorkspacePage() {
   async function handleNewSession() {
     stopStream();
     setError("");
+    setActiveScenario(null);
     try {
       const session = await createChatSession();
       setSessions((prev) => [session, ...prev]);
@@ -199,6 +203,7 @@ export default function WorkspacePage() {
         setActiveSession(null);
         setMessages([]);
         setSending(false);
+        setActiveScenario(null);
       }
       setSessions((prev) => prev.filter((s) => s.id !== id));
     } catch (e) {
@@ -207,7 +212,7 @@ export default function WorkspacePage() {
   }
 
   // Core send logic — used by both handleSend and handleRetry
-  async function doSend(text: string, currentFile: File | null = null) {
+  async function doSend(text: string, currentFile: File | null = null, scenario?: string | null) {
     if (!activeSessionId || sending) return;
     const sid = activeSessionId;
     setInput("");
@@ -227,7 +232,7 @@ export default function WorkspacePage() {
     setMessages((prev) => [...prev, optimisticMsg]);
 
     try {
-      const { last_msg_id } = await sendChatMessage(sid, text, currentFile);
+      const { last_msg_id } = await sendChatMessage(sid, text, currentFile, scenario);
 
       stopStream();
       streamAbortRef.current = streamChatMessages(
@@ -327,7 +332,9 @@ export default function WorkspacePage() {
   function handleSend() {
     if ((!input.trim() && !file) || !activeSessionId || sending) return;
     const text = input.trim() || (file ? `请帮我处理这份文件` : "");
-    doSend(text, file);
+    const scenario = activeScenario;
+    setActiveScenario(null);
+    doSend(text, file, scenario);
   }
 
   // Retry handler — stable ref to avoid breaking React.memo on ChatBubble
@@ -335,9 +342,27 @@ export default function WorkspacePage() {
     doSendRef.current(`请重新执行上一步操作 (${toolName})`);
   }, []);
 
+  // Stop handler — cancel the running agent and close SSE stream
+  const handleStop = useCallback(async () => {
+    if (!activeSessionId) return;
+    stopStream();
+    setSending(false);
+    try {
+      await cancelChatAgent(activeSessionId);
+    } catch {
+      // Best effort — agent may have already finished
+    }
+  }, [activeSessionId, stopStream]);
+
   // Quick action handler — stable ref to avoid breaking React.memo on ChatBubble
-  const handleQuickAction = useCallback((text: string) => {
-    doSendRef.current(text);
+  const handleQuickAction = useCallback((text: string, scenario?: string) => {
+    if (text.trim()) {
+      // Has text → send immediately with scenario
+      doSendRef.current(text, null, scenario);
+    } else if (scenario) {
+      // No text but has scenario → set scenario, wait for user input
+      setActiveScenario(scenario);
+    }
   }, []);
 
   return (
@@ -356,12 +381,15 @@ export default function WorkspacePage() {
         input={input}
         onInputChange={setInput}
         onSend={handleSend}
+        onStop={handleStop}
         sending={sending}
         error={error}
         file={file}
         onFileChange={setFile}
         onRetry={handleRetry}
         onQuickAction={handleQuickAction}
+        activeScenario={activeScenario}
+        onClearScenario={() => setActiveScenario(null)}
       />
     </div>
   );

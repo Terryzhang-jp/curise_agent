@@ -9,17 +9,36 @@ import {
   TrendingUp,
   TrendingDown,
   Download,
+  RefreshCw,
+  Clock,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { exportToCSV } from "@/lib/export-csv";
 import type { FinancialData, FinancialBreakdown } from "@/lib/orders-api";
 
 interface FinancialPreviewProps {
   data: FinancialData;
+  onChangeCurrency?: (currency: string) => void;
+  changingCurrency?: boolean;
 }
 
 type SortKey = "product_name" | "quantity" | "order_price" | "supplier_price" | "profit" | "margin";
 type SortDir = "asc" | "desc";
+
+const COMMON_CURRENCIES = ["USD", "JPY", "AUD", "EUR", "GBP", "KRW", "THB", "SGD", "CNY", "NZD"];
 
 function fmtNum(n: number, decimals = 2): string {
   return n.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
@@ -35,7 +54,7 @@ function profitColor(profit: number): string {
   return profit >= 0 ? "text-emerald-500" : "text-destructive";
 }
 
-export default function FinancialPreview({ data }: FinancialPreviewProps) {
+export default function FinancialPreview({ data, onChangeCurrency, changingCurrency }: FinancialPreviewProps) {
   const { summary, product_analyses, supplier_breakdown, category_breakdown, warnings } = data;
 
   const [sortKey, setSortKey] = useState<SortKey>("margin");
@@ -63,6 +82,7 @@ export default function FinancialPreview({ data }: FinancialPreviewProps) {
     currency_mismatch: warnings.filter((w) => w.type === "currency_mismatch"),
     negative_margin: warnings.filter((w) => w.type === "negative_margin"),
     missing_price: warnings.filter((w) => w.type === "missing_price"),
+    rate_stale: warnings.filter((w) => w.type === "rate_stale"),
   };
 
   return (
@@ -72,32 +92,62 @@ export default function FinancialPreview({ data }: FinancialPreviewProps) {
         <div>
           <div className="text-sm font-semibold">财务分析详情</div>
           <div className="text-[10px] text-muted-foreground mt-0.5">
-            {summary.currency && `币种: ${summary.currency} · `}
+            {summary.currency && `基准币种: ${summary.currency} · `}
             分析了 {summary.analyzed_count}/{summary.total_products} 个产品
+            {(summary.converted_count ?? 0) > 0 && (
+              <span className="text-blue-500"> · {summary.converted_count} 个已汇率转换</span>
+            )}
           </div>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-8 text-xs"
-          onClick={() => {
-            exportToCSV(
-              ["产品名称", "产品代码", "数量", "卖价", "成本", "利润", "利润率"],
-              sortedProducts.map((p) => [
-                p.product_name,
-                p.product_code || "",
-                p.quantity,
-                fmtNum(p.order_price),
-                fmtNum(p.supplier_price),
-                fmtNum(p.profit),
-                `${p.margin}%`,
-              ]),
-              `财务分析_${new Date().toISOString().slice(0, 10)}.csv`
-            );
-          }}
-        >
-          <Download className="mr-1 h-3 w-3" /> 导出 CSV
-        </Button>
+        <div className="flex items-center gap-2">
+          {onChangeCurrency && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-muted-foreground">基准币种:</span>
+              <Select
+                value={summary.base_currency || summary.currency || ""}
+                onValueChange={(val) => onChangeCurrency(val)}
+                disabled={changingCurrency}
+              >
+                <SelectTrigger className="h-7 w-[80px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {COMMON_CURRENCIES.map((c) => (
+                    <SelectItem key={c} value={c} className="text-xs">
+                      {c}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {changingCurrency && <RefreshCw className="h-3 w-3 animate-spin text-muted-foreground" />}
+            </div>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 text-xs"
+            onClick={() => {
+              exportToCSV(
+                ["产品名称", "产品代码", "数量", "卖价", "成本", "利润", "利润率", "转换信息"],
+                sortedProducts.map((p) => [
+                  p.product_name,
+                  p.product_code || "",
+                  p.quantity,
+                  fmtNum(p.order_price),
+                  fmtNum(p.supplier_price),
+                  fmtNum(p.profit),
+                  `${p.margin}%`,
+                  p.conversion_info
+                    ? `${p.conversion_info.original_currency} ${fmtNum(p.conversion_info.original_price)} → ${p.conversion_info.target_currency} ${fmtNum(p.conversion_info.converted_price)} @${p.conversion_info.rate}`
+                    : "",
+                ]),
+                `财务分析_${new Date().toISOString().slice(0, 10)}.csv`
+              );
+            }}
+          >
+            <Download className="mr-1 h-3 w-3" /> 导出 CSV
+          </Button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
@@ -141,6 +191,9 @@ export default function FinancialPreview({ data }: FinancialPreviewProps) {
               {")"}
             </span>
           )}
+          {(summary.converted_count ?? 0) > 0 && (
+            <span className="text-blue-500"> · {summary.converted_count} 个产品价格已通过汇率转换</span>
+          )}
         </div>
 
         {/* Warnings */}
@@ -160,10 +213,14 @@ export default function FinancialPreview({ data }: FinancialPreviewProps) {
                   if (items.length === 0) return null;
                   const label =
                     type === "currency_mismatch" ? "币种不匹配" :
-                    type === "negative_margin" ? "负利润" : "缺少价格";
+                    type === "negative_margin" ? "负利润" :
+                    type === "rate_stale" ? "汇率过期" : "缺少价格";
+                  const icon = type === "rate_stale" ? Clock : AlertTriangle;
+                  const IconComp = icon;
                   return (
                     <div key={type}>
-                      <div className="text-[10px] font-medium text-amber-600 dark:text-amber-400 mb-1">
+                      <div className="text-[10px] font-medium text-amber-600 dark:text-amber-400 mb-1 flex items-center gap-1">
+                        {type === "rate_stale" && <IconComp className="h-2.5 w-2.5" />}
                         {label} ({items.length})
                       </div>
                       {items.map((w, i) => (
@@ -214,27 +271,51 @@ export default function FinancialPreview({ data }: FinancialPreviewProps) {
                     </tr>
                   </thead>
                   <tbody>
-                    {sortedProducts.map((p, i) => (
-                      <tr key={i} className="border-b border-border/30 hover:bg-muted/30">
-                        <td className="px-3 py-2">
-                          <div className="font-medium truncate max-w-[200px]" title={p.product_name}>
-                            {p.product_name}
-                          </div>
-                          {p.product_code && (
-                            <div className="text-[10px] text-muted-foreground">{p.product_code}</div>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 text-right">{p.quantity}</td>
-                        <td className="px-3 py-2 text-right">{fmtNum(p.order_price)}</td>
-                        <td className="px-3 py-2 text-right">{fmtNum(p.supplier_price)}</td>
-                        <td className={cn("px-3 py-2 text-right font-medium", profitColor(p.profit))}>
-                          {fmtNum(p.profit)}
-                        </td>
-                        <td className={cn("px-3 py-2 text-right font-medium", marginColor(p.margin))}>
-                          {p.margin}%
-                        </td>
-                      </tr>
-                    ))}
+                    <TooltipProvider>
+                      {sortedProducts.map((p, i) => (
+                        <tr key={i} className="border-b border-border/30 hover:bg-muted/30">
+                          <td className="px-3 py-2">
+                            <div className="font-medium truncate max-w-[200px]" title={p.product_name}>
+                              {p.product_name}
+                            </div>
+                            {p.product_code && (
+                              <div className="text-[10px] text-muted-foreground">{p.product_code}</div>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 text-right">{p.quantity}</td>
+                          <td className="px-3 py-2 text-right">{fmtNum(p.order_price)}</td>
+                          <td className="px-3 py-2 text-right">
+                            {p.conversion_info ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="cursor-help border-b border-dashed border-blue-400 text-blue-600 dark:text-blue-400">
+                                    {fmtNum(p.supplier_price)}
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="text-xs">
+                                  <div>
+                                    {p.conversion_info.original_currency} {fmtNum(p.conversion_info.original_price)}
+                                    {" → "}
+                                    {p.conversion_info.target_currency} {fmtNum(p.conversion_info.converted_price)}
+                                  </div>
+                                  <div className="text-muted-foreground">
+                                    汇率: {p.conversion_info.rate} ({p.conversion_info.rate_date})
+                                  </div>
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              fmtNum(p.supplier_price)
+                            )}
+                          </td>
+                          <td className={cn("px-3 py-2 text-right font-medium", profitColor(p.profit))}>
+                            {fmtNum(p.profit)}
+                          </td>
+                          <td className={cn("px-3 py-2 text-right font-medium", marginColor(p.margin))}>
+                            {p.margin}%
+                          </td>
+                        </tr>
+                      ))}
+                    </TooltipProvider>
                   </tbody>
                 </table>
               </div>

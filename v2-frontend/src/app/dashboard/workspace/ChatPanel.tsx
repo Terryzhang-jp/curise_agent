@@ -6,7 +6,7 @@ import { ChatBubble, ReasoningBlock } from "@/components/chat-bubble";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { SendHorizontal, MessageSquare, Loader2, Paperclip, X } from "lucide-react";
+import { SendHorizontal, MessageSquare, Loader2, Paperclip, X, Upload, Search, ClipboardList, Package, Square } from "lucide-react";
 import { toast } from "sonner";
 
 interface ChatPanelProps {
@@ -15,12 +15,15 @@ interface ChatPanelProps {
   input: string;
   onInputChange: (value: string) => void;
   onSend: () => void;
+  onStop?: () => void;
   sending: boolean;
   error: string;
   file: File | null;
   onFileChange: (f: File | null) => void;
   onRetry?: (toolName: string) => void;
-  onQuickAction?: (text: string) => void;
+  onQuickAction?: (text: string, scenario?: string) => void;
+  activeScenario?: string | null;
+  onClearScenario?: () => void;
 }
 
 const ALLOWED_EXTENSIONS = [".xlsx", ".xls", ".pdf", ".csv"];
@@ -81,18 +84,57 @@ function groupMessages(messages: ChatMessage[]): MessageGroup[] {
   return groups;
 }
 
+const SCENARIO_LABELS: Record<string, string> = {
+  data_upload: "上传数据",
+  query: "查询数据",
+  order_management: "订单管理",
+  fulfillment: "履约管理",
+};
+
+const SCENARIO_PLACEHOLDERS: Record<string, string> = {
+  data_upload: "描述你要上传的数据，或直接拖入文件...",
+  query: "输入你想查询的内容，如「日本有多少供应商？」",
+  order_management: "输入订单相关问题，如「最近的订单有哪些？」",
+  fulfillment: "输入履约相关操作，如「订单123已交货」",
+};
+
+function ScenarioButton({ icon, label, desc, onClick }: {
+  icon: React.ReactNode;
+  label: string;
+  desc: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="group flex items-start gap-3 p-3.5 rounded-xl border border-border/60 hover:border-primary/40 hover:bg-accent/50 hover:shadow-sm transition-all text-left"
+    >
+      <div className="shrink-0 w-8 h-8 rounded-lg bg-primary/10 group-hover:bg-primary/15 flex items-center justify-center transition-colors">
+        <div className="text-primary">{icon}</div>
+      </div>
+      <div className="min-w-0">
+        <div className="text-sm font-medium leading-tight">{label}</div>
+        <div className="text-xs text-muted-foreground mt-0.5 leading-snug">{desc}</div>
+      </div>
+    </button>
+  );
+}
+
 export default function ChatPanel({
   session,
   messages,
   input,
   onInputChange,
   onSend,
+  onStop,
   sending,
   error,
   file,
   onFileChange,
   onRetry,
   onQuickAction,
+  activeScenario,
+  onClearScenario,
 }: ChatPanelProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -148,11 +190,38 @@ export default function ChatPanel({
           )}
 
           {session && messages.length === 0 && !sending && (
-            <div className="flex flex-col items-center justify-center h-[60vh] text-center">
-              <h2 className="text-base font-medium mb-1">有什么我可以帮你的？</h2>
-              <p className="text-xs text-muted-foreground max-w-xs">
-                试试问：「数据库里有多少产品？」「日本的供应商有哪些？」
-              </p>
+            <div className="flex flex-col items-center justify-center h-[60vh] text-center gap-5">
+              <div className="text-4xl">👋</div>
+              <div>
+                <h2 className="text-lg font-semibold">有什么我可以帮你的？</h2>
+                <p className="text-sm text-muted-foreground mt-1">选择一个场景快速开始，或直接输入问题</p>
+              </div>
+              <div className="grid grid-cols-2 gap-2.5 w-full max-w-[420px]">
+                <ScenarioButton
+                  icon={<Upload className="h-4 w-4" />}
+                  label="上传数据"
+                  desc="上传报价单、更新产品价格"
+                  onClick={() => onQuickAction?.("我要上传产品数据", "data_upload")}
+                />
+                <ScenarioButton
+                  icon={<Search className="h-4 w-4" />}
+                  label="查询数据"
+                  desc="查产品、供应商、订单信息"
+                  onClick={() => onQuickAction?.("", "query")}
+                />
+                <ScenarioButton
+                  icon={<ClipboardList className="h-4 w-4" />}
+                  label="订单管理"
+                  desc="查看订单、生成询价单"
+                  onClick={() => onQuickAction?.("", "order_management")}
+                />
+                <ScenarioButton
+                  icon={<Package className="h-4 w-4" />}
+                  label="履约管理"
+                  desc="交货验收、发票付款"
+                  onClick={() => onQuickAction?.("", "fulfillment")}
+                />
+              </div>
             </div>
           )}
 
@@ -194,12 +263,17 @@ export default function ChatPanel({
                     />
                   );
                 })}
-                {/* Sending indicator — only when last group is NOT reasoning (it has its own spinner) */}
+                {/* Sending indicator — only when no reasoning block or streaming is visible */}
                 {sending && !hasStreaming && !lastIsReasoning && (
-                  <div className="flex justify-start">
-                    <div className="flex items-center gap-2 px-4 py-2.5 rounded-2xl rounded-bl-md bg-card border border-border/50">
+                  <div className="flex justify-start animate-in fade-in-0 duration-300">
+                    <div className="thinking-shimmer flex items-center gap-2 px-4 py-2.5 rounded-2xl rounded-bl-md bg-card border border-border/40 shadow-sm">
                       <Loader2 className="h-3.5 w-3.5 text-primary animate-spin" />
-                      <span className="text-xs text-muted-foreground">思考中...</span>
+                      <span className="text-xs text-muted-foreground">
+                        思考中
+                        <span className="thinking-dots ml-0.5">
+                          <span>.</span><span>.</span><span>.</span>
+                        </span>
+                      </span>
                     </div>
                   </div>
                 )}
@@ -225,6 +299,20 @@ export default function ChatPanel({
             <p className="text-center text-muted-foreground text-xs py-1">创建新对话开始聊天</p>
           ) : (
             <>
+              {/* Active scenario indicator */}
+              {activeScenario && (
+                <div className="flex items-center gap-1.5 mb-2">
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-primary/10 text-primary text-xs font-medium">
+                    {SCENARIO_LABELS[activeScenario] || activeScenario}
+                    <button
+                      onClick={onClearScenario}
+                      className="ml-0.5 hover:bg-primary/20 rounded-full p-0.5 transition-colors"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </span>
+                </div>
+              )}
               {/* File preview */}
               {file && (
                 <div className="flex items-center gap-2 mb-2 px-2 py-1.5 rounded-lg bg-muted/50 border border-border/50 text-xs">
@@ -277,20 +365,32 @@ export default function ChatPanel({
                     value={input}
                     onChange={(e) => onInputChange(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder={file ? "描述这份文件..." : "输入消息..."}
+                    placeholder={file ? "描述这份文件..." : (activeScenario && SCENARIO_PLACEHOLDERS[activeScenario]) || "输入消息..."}
                     disabled={sending}
                     rows={1}
                     className="min-h-[40px] max-h-24 resize-none pr-10 text-sm"
                   />
-                  <Button
-                    onClick={onSend}
-                    disabled={(!input.trim() && !file) || sending}
-                    size="icon"
-                    variant="ghost"
-                    className="absolute right-1 bottom-1 h-8 w-8 text-primary"
-                  >
-                    <SendHorizontal className="h-4 w-4" />
-                  </Button>
+                  {sending ? (
+                    <Button
+                      onClick={onStop}
+                      size="icon"
+                      variant="ghost"
+                      className="absolute right-1 bottom-1 h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
+                      title="停止"
+                    >
+                      <Square className="h-3.5 w-3.5 fill-current" />
+                    </Button>
+                  ) : (
+                    <Button
+                      onClick={onSend}
+                      disabled={!input.trim() && !file}
+                      size="icon"
+                      variant="ghost"
+                      className="absolute right-1 bottom-1 h-8 w-8 text-primary"
+                    >
+                      <SendHorizontal className="h-4 w-4" />
+                    </Button>
+                  )}
                 </div>
               </div>
             </>

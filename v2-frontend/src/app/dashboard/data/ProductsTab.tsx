@@ -28,7 +28,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { EmptyState } from "@/components/empty-state";
-import { Loader2, Package, Download, Plus, MoreHorizontal } from "lucide-react";
+import { Loader2, Package, Download, Plus, MoreHorizontal, Search } from "lucide-react";
 import { exportToCSV } from "@/lib/export-csv";
 import { toast } from "sonner";
 import { getUser } from "@/lib/auth";
@@ -105,6 +105,9 @@ export default function ProductsTab() {
   const [filterCountry, setFilterCountry] = useState("all");
   const [currentPage, setCurrentPage] = useState(0);
 
+  const [searchText, setSearchText] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<ProductItem | null>(null);
   const [saving, setSaving] = useState(false);
@@ -121,6 +124,7 @@ export default function ProductsTab() {
       limit: PAGE_SIZE,
       offset: page * PAGE_SIZE,
     };
+    if (debouncedSearch) params.search = debouncedSearch;
     // Map filter name back to id for server-side filtering
     if (filterCategory !== "all") {
       const cat = categories.find((c) => c.name === filterCategory);
@@ -135,7 +139,7 @@ export default function ProductsTab() {
       if (cty) params.country_id = cty.id;
     }
     return params;
-  }, [filterCategory, filterSupplier, filterCountry, categories, suppliers, countries]);
+  }, [debouncedSearch, filterCategory, filterSupplier, filterCountry, categories, suppliers, countries]);
 
   const fetchProducts = useCallback((page: number) => {
     const params = getFilterParams(page);
@@ -166,14 +170,20 @@ export default function ProductsTab() {
       .finally(() => setLoading(false));
   }, []);
 
-  // Re-fetch when filters change → reset to page 0
+  // Debounce search text → 500ms
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(searchText), 500);
+    return () => clearTimeout(timer);
+  }, [searchText]);
+
+  // Re-fetch when filters or search change → reset to page 0
   useEffect(() => {
     if (!loading) {
       setCurrentPage(0);
       fetchProducts(0);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterCategory, filterSupplier, filterCountry]);
+  }, [filterCategory, filterSupplier, filterCountry, debouncedSearch]);
 
   function openCreate() {
     setEditing(null);
@@ -246,7 +256,33 @@ export default function ProductsTab() {
       setDialogOpen(false);
       reload();
     } catch (err: unknown) {
-      toast.error(err instanceof Error ? err.message : "操作失败");
+      const msg = err instanceof Error ? err.message : "操作失败";
+      if (msg.includes("已存在")) {
+        // Try to find existing product and open it for editing
+        try {
+          const { items } = await listProducts({
+            search: form.product_name_en.trim(),
+            limit: 10,
+          });
+          const countryId = form.country_id ? Number(form.country_id) : null;
+          const portId = form.port_id ? Number(form.port_id) : null;
+          const existing = items.find(
+            (p) =>
+              p.product_name_en === form.product_name_en.trim() &&
+              p.country_id === countryId &&
+              p.port_id === portId
+          );
+          if (existing) {
+            setDialogOpen(false);
+            toast.info("该产品已存在，已为您打开编辑");
+            openEdit(existing);
+            return;
+          }
+        } catch {
+          // fallback to just showing the error
+        }
+      }
+      toast.error(msg);
     } finally {
       setSaving(false);
     }
@@ -385,6 +421,16 @@ export default function ProductsTab() {
 
   const toolbar = (
     <div className="flex items-center gap-2 flex-1">
+      <div className="relative max-w-xs">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+        <Input
+          placeholder="搜索产品名或代码..."
+          value={searchText}
+          onChange={(e) => setSearchText(e.target.value)}
+          className="pl-9 h-8 text-xs w-56"
+        />
+      </div>
+
       <Select value={filterCategory} onValueChange={setFilterCategory}>
         <SelectTrigger className="h-8 w-32 text-xs">
           <SelectValue placeholder="类别" />
@@ -460,8 +506,6 @@ export default function ProductsTab() {
       <DataTable
         columns={columns}
         data={products}
-        searchKey="product_name_en"
-        searchPlaceholder="搜索产品名..."
         pageSize={PAGE_SIZE}
         toolbar={toolbar}
         emptyState={<EmptyState icon={Package} title="暂无产品数据" />}

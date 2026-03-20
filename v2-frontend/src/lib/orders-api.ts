@@ -158,6 +158,15 @@ export interface InquiryData {
   agent_steps?: number;
 }
 
+export interface ConversionInfo {
+  original_price: number;
+  original_currency: string;
+  converted_price: number;
+  target_currency: string;
+  rate: number;
+  rate_date: string;
+}
+
 export interface FinancialProductAnalysis {
   product_name: string;
   product_code: string;
@@ -171,6 +180,7 @@ export interface FinancialProductAnalysis {
   currency: string;
   supplier_id: number | null;
   category_id: number | null;
+  conversion_info?: ConversionInfo;
 }
 
 export interface FinancialBreakdown {
@@ -186,7 +196,7 @@ export interface FinancialBreakdown {
 }
 
 export interface FinancialWarning {
-  type: "currency_mismatch" | "negative_margin" | "missing_price";
+  type: "currency_mismatch" | "negative_margin" | "missing_price" | "rate_stale";
   product_name: string;
   product_code?: string;
   description: string;
@@ -204,11 +214,13 @@ export interface FinancialData {
     total_profit: number;
     overall_margin: number;
     currency: string;
+    base_currency?: string;
     analyzed_count: number;
     skipped_unmatched: number;
     skipped_currency_mismatch: number;
     skipped_missing_price: number;
     total_products: number;
+    converted_count?: number;
   };
   product_analyses: FinancialProductAnalysis[];
   supplier_breakdown: FinancialBreakdown[];
@@ -470,9 +482,10 @@ export async function runAnomalyCheck(orderId: number): Promise<Order> {
   return handleResponse<Order>(res);
 }
 
-export async function runFinancialAnalysis(orderId: number): Promise<Order> {
+export async function runFinancialAnalysis(orderId: number, baseCurrency?: string): Promise<Order> {
+  const qs = baseCurrency ? `?base_currency=${encodeURIComponent(baseCurrency)}` : "";
   const res = await fetchWithAuth(
-    `${API_BASE}/api/orders/${orderId}/financial-analysis`,
+    `${API_BASE}/api/orders/${orderId}/financial-analysis${qs}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

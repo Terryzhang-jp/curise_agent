@@ -92,6 +92,39 @@ export interface UploadResultData {
   failures: string[];
 }
 
+export interface UploadReviewDiff {
+  field: string;
+  old: string | number | null;
+  new: string | number | null;
+}
+
+export interface UploadReviewData {
+  card_type: "upload_review";
+  batch_id: number;
+  supplier: { name: string | null; id: number | null };
+  country: { name: string | null; id: number | null };
+  port: { name: string | null; id: number | null };
+  effective_from: string | null;
+  effective_to: string | null;
+  stats: { new: number; update: number; no_change: number; total: number };
+  new_items: Array<{
+    row: number; name: string; code: string | null;
+    price: number | null; unit: string | null;
+    pack_size: string | null; brand: string | null;
+  }>;
+  updates: Array<{
+    row: number; name: string; code: string | null;
+    confidence: number; match_method: string; db_name: string;
+    diffs: UploadReviewDiff[];
+    warning: string | null;
+  }>;
+  audit_findings: Array<{
+    severity: string; message: string; suggestion: string;
+  }>;
+  missing_supplier: boolean;
+  missing_country: boolean;
+}
+
 export interface ConfirmationCardData {
   card_type: "confirmation";
   title: string;
@@ -126,6 +159,7 @@ export interface DataAuditCardData {
 
 export type StructuredCard =
   | UploadValidationData | UploadPreviewData | UploadResultData
+  | UploadReviewData
   | ConfirmationCardData | QueryTableCardData
   | DataAuditCardData;
 
@@ -183,6 +217,18 @@ export async function deleteChatSession(
   }
 }
 
+// ─── Cancel ─────────────────────────────────────────────────────
+
+export async function cancelChatAgent(
+  sessionId: string
+): Promise<{ status: string }> {
+  const res = await fetchWithAuth(`${API_BASE}/api/chat/sessions/${sessionId}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  return handleResponse<{ status: string }>(res);
+}
+
 // ─── Messages ──────────────────────────────────────────────────
 
 export async function getChatMessages(
@@ -199,6 +245,7 @@ export async function sendChatMessage(
   sessionId: string,
   content: string,
   file?: File | null,
+  scenario?: string | null,
 ): Promise<{ status: string; session_id: string; last_msg_id: number }> {
   const url = `${API_BASE}/api/chat/sessions/${sessionId}/message`;
 
@@ -207,6 +254,9 @@ export async function sendChatMessage(
   formData.append("content", content);
   if (file) {
     formData.append("file", file);
+  }
+  if (scenario) {
+    formData.append("scenario", scenario);
   }
   const res = await fetchWithAuth(url, {
     method: "POST",

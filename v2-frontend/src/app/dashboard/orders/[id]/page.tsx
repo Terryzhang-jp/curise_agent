@@ -57,6 +57,13 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { toast } from "sonner";
 import {
   ArrowLeft,
@@ -124,6 +131,11 @@ export default function OrderDetailPage() {
   const [showRematchDialog, setShowRematchDialog] = useState(false);
   const [showInquiryOverwriteDialog, setShowInquiryOverwriteDialog] = useState(false);
 
+  // Financial analysis currency change
+  const [changingCurrency, setChangingCurrency] = useState(false);
+  const [showCurrencyDialog, setShowCurrencyDialog] = useState(false);
+  const [selectedCurrency, setSelectedCurrency] = useState("USD");
+
   // Inquiry streaming
   const [inquiryGenerating, setInquiryGenerating] = useState(false);
   const [inquirySteps, setInquirySteps] = useState<InquiryStep[]>([]);
@@ -180,6 +192,18 @@ export default function OrderDetailPage() {
       toast.error(err instanceof Error ? err.message : "操作失败");
     } finally {
       setActionLoading("");
+    }
+  };
+
+  const handleChangeCurrency = async (currency: string) => {
+    setChangingCurrency(true);
+    try {
+      const result = await runFinancialAnalysis(orderId, currency);
+      setOrder(result);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "切换币种失败");
+    } finally {
+      setChangingCurrency(false);
     }
   };
 
@@ -493,7 +517,11 @@ export default function OrderDetailPage() {
                   </DropdownMenuItem>
                 )}
                 {isReady && order.match_results && (
-                  <DropdownMenuItem onClick={() => handleAction("financial", () => runFinancialAnalysis(orderId))}>
+                  <DropdownMenuItem onClick={() => {
+                    const currency = order.order_metadata?.currency || order.financial_data?.summary?.base_currency || "USD";
+                    setSelectedCurrency(currency);
+                    setShowCurrencyDialog(true);
+                  }}>
                     <DollarSign className="mr-2 h-3.5 w-3.5" />
                     {order.financial_data ? "重新计算财务分析" : "运行财务分析"}
                   </DropdownMenuItem>
@@ -651,7 +679,11 @@ export default function OrderDetailPage() {
             </TabsContent>
             <TabsContent value="financial" className="h-full m-0">
               {order.financial_data && (
-                <FinancialPreview data={order.financial_data} />
+                <FinancialPreview
+                  data={order.financial_data}
+                  onChangeCurrency={handleChangeCurrency}
+                  changingCurrency={changingCurrency}
+                />
               )}
             </TabsContent>
             <TabsContent value="inquiry" className="h-full m-0">
@@ -722,6 +754,37 @@ export default function OrderDetailPage() {
       </AlertDialog>
 
       {/* Inquiry overwrite confirmation dialog */}
+      {/* Currency selection dialog for financial analysis */}
+      <Dialog open={showCurrencyDialog} onOpenChange={setShowCurrencyDialog}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>选择基准币种</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            订单价格将按此币种计算，供应商价格会自动转换。
+          </p>
+          <Select value={selectedCurrency} onValueChange={setSelectedCurrency}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {["USD", "JPY", "AUD", "EUR", "GBP", "KRW", "THB", "SGD", "CNY", "NZD"].map((c) => (
+                <SelectItem key={c} value={c}>{c}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowCurrencyDialog(false)}>取消</Button>
+            <Button onClick={() => {
+              setShowCurrencyDialog(false);
+              handleAction("financial", () => runFinancialAnalysis(orderId, selectedCurrency));
+            }}>
+              开始分析
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <AlertDialog open={showInquiryOverwriteDialog} onOpenChange={setShowInquiryOverwriteDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>

@@ -235,3 +235,51 @@ export function updateProduct(id: number, data: Partial<ProductCreateData>) {
 export function deleteProduct(id: number) {
   return apiVoid(`/api/data/products/${id}`, { method: "DELETE" });
 }
+
+// ─── Exchange Rate CRUD ──────────────────────────────────────
+
+export interface ExchangeRateItem {
+  id: number;
+  from_currency: string;
+  to_currency: string;
+  rate: number;
+  effective_date: string;
+  source: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function listExchangeRates(params?: {
+  from_currency?: string;
+  to_currency?: string;
+}): Promise<ExchangeRateItem[]> {
+  const qs = new URLSearchParams();
+  if (params?.from_currency) qs.set("from_currency", params.from_currency);
+  if (params?.to_currency) qs.set("to_currency", params.to_currency);
+  const query = qs.toString();
+  return api<ExchangeRateItem[]>(`/api/data/exchange-rates${query ? `?${query}` : ""}`);
+}
+
+export function createExchangeRate(data: {
+  from_currency: string;
+  to_currency: string;
+  rate: number;
+  effective_date: string;
+}) {
+  return api<ExchangeRateItem>("/api/data/exchange-rates", jsonBody(data));
+}
+
+export function updateExchangeRate(id: number, data: Partial<{ rate: number; effective_date: string }>) {
+  return api<ExchangeRateItem>(`/api/data/exchange-rates/${id}`, patchBody(data));
+}
+
+export function deleteExchangeRate(id: number) {
+  return apiVoid(`/api/data/exchange-rates/${id}`, { method: "DELETE" });
+}
+
+export function fetchExchangeRates(baseCurrency: string = "USD", targetCurrencies?: string[]) {
+  return api<{ created: number; updated: number; base: string; date: string }>(
+    "/api/data/exchange-rates/fetch",
+    jsonBody({ base_currency: baseCurrency, target_currencies: targetCurrencies || [] }),
+  );
+}
