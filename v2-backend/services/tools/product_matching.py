@@ -13,6 +13,30 @@ from difflib import SequenceMatcher
 
 logger = logging.getLogger(__name__)
 
+# ─── Canonical field vocabulary for matched_product dicts ─────────
+# Maps database column names → canonical names expected by templates.
+# Templates use field_keys like "unit_price", but DB column is "price".
+# This dict is the single source of truth for that translation.
+DB_TO_CANONICAL = {
+    "price": "unit_price",
+    "code": "product_code",
+}
+
+
+def normalize_matched_product(mp: dict) -> dict:
+    """Add canonical aliases to a matched_product dict.
+
+    Ensures that downstream consumers (template filling, Excel generation)
+    can find values using either the DB column name or the canonical name.
+    E.g., both mp["price"] and mp["unit_price"] resolve to the same value.
+    """
+    if not mp:
+        return mp
+    for db_key, canonical_key in DB_TO_CANONICAL.items():
+        if db_key in mp and canonical_key not in mp:
+            mp[canonical_key] = mp[db_key]
+    return mp
+
 
 def _persist_session_data(ctx):
     """Write ctx.session_data back to PipelineSession.phase_results."""
@@ -112,7 +136,7 @@ def _match_products_against_db(products, db, country_id=None, port_id=None, deli
         }
 
         if best_match and best_score >= 0.7:
-            match_result["matched_product"] = {
+            match_result["matched_product"] = normalize_matched_product({
                 "id": best_match.id,
                 "code": best_match.code,
                 "product_name_en": best_match.product_name_en,
@@ -123,7 +147,7 @@ def _match_products_against_db(products, db, country_id=None, port_id=None, deli
                 "category_id": best_match.category_id,
                 "pack_size": best_match.pack_size,
                 "unit": best_match.unit,
-            }
+            })
 
         results.append(match_result)
 

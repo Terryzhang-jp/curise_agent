@@ -96,25 +96,18 @@ def _fill_with_template(ws, template, metadata: dict, products: list[dict],
             if col_letter.upper() in formula_columns or col_letter in formula_columns:
                 continue  # Skip formula columns
 
-            # Resolve value based on field key
+            # Resolve value: product dict first, then matched (normalized) dict.
+            # Special cases only for fields that need cross-dict or metadata fallback.
             if field_key == "line_number":
                 value = i + 1
             elif field_key == "po_number":
-                value = metadata.get("po_number", "")
+                value = product.get("po_number") or metadata.get("po_number", "")
             elif field_key == "currency":
-                value = matched.get("currency") or metadata.get("currency", "")
+                value = product.get("currency") or matched.get("currency") or metadata.get("currency", "")
             elif field_key == "description":
                 value = matched.get("pack_size") or product.get("description", "")
-            elif field_key == "product_code":
-                value = product.get("product_code") or matched.get("code", "")
             elif field_key == "product_name_en":
                 value = product.get("product_name") or matched.get("product_name_en", "")
-            elif field_key == "product_name_jp":
-                value = matched.get("product_name_jp", "")
-            elif field_key == "unit_price":
-                value = product.get("unit_price") or matched.get("price", "")
-            elif field_key == "total_price" or field_key == "amount":
-                value = product.get("total_price", "")
             else:
                 value = product.get(field_key) or matched.get(field_key, "")
 
@@ -258,11 +251,14 @@ class InquiryWorkbook:
             return results
 
     def write_product_rows(self, start_row: int, columns: dict[str, str],
-                           products: list[dict], formula_columns: list[str] | None = None) -> int:
+                           products: list[dict], formula_columns: list[str] | None = None,
+                           metadata: dict | None = None) -> int:
         """Write product data rows. Returns count of rows written.
         columns: {"A": "line_number", "C": "product_code", ...}
+        metadata: optional order metadata for fields like po_number, currency.
         """
         skip = set(c.upper() for c in (formula_columns or []))
+        meta = metadata or {}
         with self._lock:
             for i, product in enumerate(products):
                 row = start_row + i
@@ -270,8 +266,17 @@ class InquiryWorkbook:
                 for col_letter, field_key in columns.items():
                     if col_letter.upper() in skip:
                         continue
+                    # Resolve value: product → matched (normalized) → metadata fallback
                     if field_key == "line_number":
                         value = i + 1
+                    elif field_key == "po_number":
+                        value = product.get("po_number") or meta.get("po_number", "")
+                    elif field_key == "currency":
+                        value = product.get("currency") or matched.get("currency") or meta.get("currency", "")
+                    elif field_key == "description":
+                        value = matched.get("pack_size") or product.get("description", "")
+                    elif field_key == "product_name_en":
+                        value = product.get("product_name") or matched.get("product_name_en", "")
                     else:
                         value = product.get(field_key) or matched.get(field_key, "")
                     if value != "" and value is not None:

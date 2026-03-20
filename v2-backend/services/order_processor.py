@@ -604,6 +604,8 @@ def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
     if 0 < len(ambiguous) <= 20:
         refined = _refine_with_llm(order_id, ambiguous, db, country_id, port_id, delivery_date_dt)
         if refined:
+            from services.tools.product_matching import normalize_matched_product
+
             refined_lookup = {}
             for r in refined:
                 key = (r.get("product_code", ""), r.get("product_name", ""))
@@ -618,12 +620,12 @@ def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
                         all_results[i]["match_status"] = ref["match_status"]
                         all_results[i]["match_reason"] = ref.get("match_reason", "")
                         if ref.get("matched_product"):
-                            all_results[i]["matched_product"] = ref["matched_product"]
+                            all_results[i]["matched_product"] = normalize_matched_product(ref["matched_product"])
                     elif ref.get("match_status") == "possible_match" and result["match_status"] == "not_matched":
                         all_results[i]["match_status"] = ref["match_status"]
                         all_results[i]["match_reason"] = ref.get("match_reason", "")
                         if ref.get("matched_product"):
-                            all_results[i]["matched_product"] = ref["matched_product"]
+                            all_results[i]["matched_product"] = normalize_matched_product(ref["matched_product"])
     elif len(ambiguous) > 20:
         logger.info("Order %d: skipping LLM refine — %d ambiguous items (too many)", order_id, len(ambiguous))
 
@@ -969,21 +971,45 @@ def run_anomaly_check(order: Order) -> dict:
     }
 
 
-def run_financial_analysis(order: Order) -> dict:
+def run_financial_analysis(order: Order, base_currency: str | None = None) -> dict:
     """Run financial analysis on an order's matched products. Returns financial_data dict.
 
     Calculates per-product revenue/cost/profit/margin, aggregated by supplier and category.
     Only processes products with match_status == "matched" and valid prices.
+    Supports exchange rate conversion when currencies differ.
     """
+    from datetime import date as date_type, timedelta
+
     match_results = order.match_results or []
     order_meta = order.order_metadata or {}
     order_currency = (order_meta.get("currency") or "").strip().upper()
+
+    # Determine analysis base currency
+    analysis_currency = (base_currency or order_currency or "").strip().upper()
 
     product_analyses = []
     warnings = []
     skipped_unmatched = 0
     skipped_currency_mismatch = 0
     skipped_missing_price = 0
+    converted_count = 0
+
+    # Load exchange rate helper
+    rate_cache: dict[str, tuple[float, date_type] | None] = {}
+
+    def _lookup_rate(from_c: str, to_c: str) -> tuple[float, date_type] | None:
+        key = f"{from_c}->{to_c}"
+        if key not in rate_cache:
+            try:
+                from routes.data import get_exchange_rate
+                rate_db = SessionLocal()
+                try:
+                    rate_cache[key] = get_exchange_rate(rate_db, from_c, to_c)
+                finally:
+                    rate_db.close()
+            except Exception:
+                rate_cache[key] = None
+        return rate_cache[key]
 
     # Aggregation accumulators
     supplier_agg: dict[int, dict] = {}  # supplier_id -> {revenue, cost, profit, count}
@@ -1026,19 +1052,83 @@ def run_financial_analysis(order: Order) -> dict:
             })
             continue
 
-        # Currency check
+        # Currency handling with exchange rate conversion
         product_currency = (matched.get("currency") or "").strip().upper()
-        if order_currency and product_currency and order_currency != product_currency:
-            skipped_currency_mismatch += 1
-            warnings.append({
-                "type": "currency_mismatch",
-                "product_name": product_name,
-                "product_code": product_code,
-                "order_currency": order_currency,
-                "product_currency": product_currency,
-                "description": f"{product_name}: 订单币种({order_currency})与供应商币种({product_currency})不一致",
-            })
-            continue
+        conversion_info = None
+
+        # Determine effective prices for analysis
+        effective_order_price = order_price
+        effective_supplier_price = supplier_price
+
+        # Convert order price to analysis currency if needed
+        if order_currency and analysis_currency and order_currency != analysis_currency:
+            result = _lookup_rate(order_currency, analysis_currency)
+            if result:
+                rate, rate_date = result
+                effective_order_price = round(order_price * rate, 4)
+                stale = (date_type.today() - rate_date).days > 7
+                if stale and not any(
+                    w.get("type") == "rate_stale" and w.get("description", "").startswith(f"订单币种汇率")
+                    for w in warnings
+                ):
+                    warnings.append({
+                        "type": "rate_stale",
+                        "product_name": "(全局)",
+                        "product_code": "",
+                        "description": f"订单币种汇率({order_currency}→{analysis_currency})已超过 7 天（{rate_date}）",
+                    })
+            else:
+                # No exchange rate for order currency — skip product
+                skipped_currency_mismatch += 1
+                warnings.append({
+                    "type": "currency_mismatch",
+                    "product_name": product_name,
+                    "product_code": product_code,
+                    "order_currency": order_currency,
+                    "product_currency": product_currency,
+                    "description": f"{product_name}: 订单币种({order_currency})→分析币种({analysis_currency})无可用汇率",
+                })
+                continue
+
+        # Convert supplier price to analysis currency if needed
+        if product_currency and analysis_currency and product_currency != analysis_currency:
+            result = _lookup_rate(product_currency, analysis_currency)
+            if result:
+                rate, rate_date = result
+                original_supplier_price = supplier_price
+                effective_supplier_price = round(supplier_price * rate, 4)
+                converted_count += 1
+                conversion_info = {
+                    "original_price": original_supplier_price,
+                    "original_currency": product_currency,
+                    "converted_price": effective_supplier_price,
+                    "target_currency": analysis_currency,
+                    "rate": rate,
+                    "rate_date": str(rate_date),
+                }
+                stale = (date_type.today() - rate_date).days > 7
+                if stale and not any(
+                    w.get("type") == "rate_stale" and w.get("product_code") == product_code
+                    for w in warnings
+                ):
+                    warnings.append({
+                        "type": "rate_stale",
+                        "product_name": product_name,
+                        "product_code": product_code,
+                        "description": f"{product_name}: 供应商币种汇率({product_currency}→{analysis_currency})已超过 7 天（{rate_date}）",
+                    })
+            else:
+                # No exchange rate available — skip with currency_mismatch warning
+                skipped_currency_mismatch += 1
+                warnings.append({
+                    "type": "currency_mismatch",
+                    "product_name": product_name,
+                    "product_code": product_code,
+                    "order_currency": order_currency,
+                    "product_currency": product_currency,
+                    "description": f"{product_name}: 供应商币种({product_currency})→分析币种({analysis_currency})无可用汇率",
+                })
+                continue
 
         # Parse quantity (default 1.0)
         try:
@@ -1048,21 +1138,21 @@ def run_financial_analysis(order: Order) -> dict:
         except (ValueError, TypeError):
             quantity = 1.0
 
-        revenue = round(order_price * quantity, 2)
-        cost = round(supplier_price * quantity, 2)
+        revenue = round(effective_order_price * quantity, 2)
+        cost = round(effective_supplier_price * quantity, 2)
         profit = round(revenue - cost, 2)
         margin = round((profit / revenue) * 100, 1) if revenue != 0 else 0.0
 
-        currency = order_currency or product_currency or ""
+        currency = analysis_currency or order_currency or product_currency or ""
 
         supplier_id = matched.get("supplier_id")
         category_id = matched.get("category_id")
 
-        product_analyses.append({
+        analysis_entry = {
             "product_name": product_name,
             "product_code": product_code,
-            "order_price": order_price,
-            "supplier_price": supplier_price,
+            "order_price": effective_order_price,
+            "supplier_price": effective_supplier_price,
             "quantity": quantity,
             "revenue": revenue,
             "cost": cost,
@@ -1071,7 +1161,11 @@ def run_financial_analysis(order: Order) -> dict:
             "currency": currency,
             "supplier_id": supplier_id,
             "category_id": category_id,
-        })
+        }
+        if conversion_info:
+            analysis_entry["conversion_info"] = conversion_info
+
+        product_analyses.append(analysis_entry)
 
         # Negative margin warning
         if margin < 0:
@@ -1080,9 +1174,9 @@ def run_financial_analysis(order: Order) -> dict:
                 "product_name": product_name,
                 "product_code": product_code,
                 "margin": margin,
-                "order_price": order_price,
-                "supplier_price": supplier_price,
-                "description": f"{product_name}: 利润率为 {margin}%（卖价 {order_price} < 成本 {supplier_price}）",
+                "order_price": effective_order_price,
+                "supplier_price": effective_supplier_price,
+                "description": f"{product_name}: 利润率为 {margin}%（卖价 {effective_order_price} < 成本 {effective_supplier_price}）",
             })
 
         # Aggregate by supplier
@@ -1173,12 +1267,14 @@ def run_financial_analysis(order: Order) -> dict:
             "total_cost": total_cost,
             "total_profit": total_profit,
             "overall_margin": overall_margin,
-            "currency": order_currency or "",
+            "currency": analysis_currency or order_currency or "",
+            "base_currency": analysis_currency or "",
             "analyzed_count": len(product_analyses),
             "skipped_unmatched": skipped_unmatched,
             "skipped_currency_mismatch": skipped_currency_mismatch,
             "skipped_missing_price": skipped_missing_price,
             "total_products": len(match_results),
+            "converted_count": converted_count,
         },
         "product_analyses": product_analyses,
         "supplier_breakdown": supplier_breakdown,

@@ -741,7 +741,7 @@ def _generate_single_supplier(
     columns = table_config.get("columns", {})
     start_row = table_config.get("start_row", 22)
     formula_cols = table_config.get("formula_columns", [])
-    count = wb.write_product_rows(start_row, columns, products, formula_cols)
+    count = wb.write_product_rows(start_row, columns, products, formula_cols, metadata=enriched_meta)
 
     # Post-fill: pack_size → description column
     if wb._ws:
@@ -929,10 +929,18 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
     """
     from services.agent.stream_queue import push_event
 
+    from services.tools.product_matching import normalize_matched_product
+
     overall_start = time.time()
     order_id = order.id
     match_results = order.match_results or []
     order_meta = order.order_metadata or {}
+
+    # Normalize matched_product dicts (ensures canonical field names like
+    # "unit_price" exist even for orders matched before the normalize fix)
+    for item in match_results:
+        if item.get("matched_product"):
+            normalize_matched_product(item["matched_product"])
 
     # Group products by supplier_id
     supplier_groups: dict[int, list[dict]] = {}
@@ -1093,9 +1101,16 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
 def run_inquiry_single_supplier(order, db, supplier_id: int, stream_key: str = "", template_id: int | None = None) -> dict:
     """Run inquiry for a single supplier (for re-do). Returns per-supplier result dict."""
     from services.agent.stream_queue import push_event
+    from services.tools.product_matching import normalize_matched_product
 
     match_results = order.match_results or []
     order_meta = order.order_metadata or {}
+
+    # Normalize matched_product dicts (ensures canonical field names for old orders)
+    for item in match_results:
+        if item.get("matched_product"):
+            normalize_matched_product(item["matched_product"])
+
     sid_products = [
         item for item in match_results
         if (item.get("matched_product") or {}).get("supplier_id") == supplier_id

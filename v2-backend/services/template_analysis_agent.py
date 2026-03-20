@@ -257,6 +257,16 @@ def _derive_field_positions(cell_map: dict) -> dict:
     return fp
 
 
+_CANONICAL_PRODUCT_FIELDS = {
+    "line_number", "po_number", "product_code", "product_name_en",
+    "product_name_jp", "description", "quantity", "unit",
+    "unit_price", "currency", "total_price", "item_amount",
+    "amount", "notes", "item_notes", "ship_name", "delivery_date",
+    "supplier_name", "order_status", "adjusted_quantity", "adjusted_amount",
+    "product_name",
+}
+
+
 def _normalize_product_table(pt: dict) -> dict:
     """Normalize product_table into product_table_config format."""
     if not pt:
@@ -268,6 +278,13 @@ def _normalize_product_table(pt: dict) -> dict:
         config["start_row"] = pt["start_row"]
     # columns: {"A": "line_number", ...}
     cols = pt.get("columns", {})
+    # Warn about unrecognized field keys (helps catch AI analysis drift)
+    for col, fk in cols.items():
+        if fk and fk not in _CANONICAL_PRODUCT_FIELDS:
+            logger.warning(
+                "Template analysis: column %s has non-canonical field_key '%s'. "
+                "Known fields: %s", col, fk, ", ".join(sorted(_CANONICAL_PRODUCT_FIELDS))
+            )
     config["columns"] = cols
     # formula_columns: could be dict {"L": "=H*J"} or list ["L"]
     fc = pt.get("formula_columns", {})
