@@ -742,7 +742,32 @@ def _generate_single_supplier(
     columns = table_config.get("columns", {})
     start_row = table_config.get("start_row", 22)
     formula_cols = table_config.get("formula_columns", [])
-    count = wb.write_product_rows(start_row, columns, products, formula_cols, metadata=enriched_meta)
+    count = len(products)
+
+    # ── Dynamic row expansion ──
+    # If products exceed template capacity, insert rows to push summary/footer down.
+    # openpyxl.insert_rows auto-adjusts inter-formula references (e.g., L33→L72).
+    extra_rows = 0
+    if template_formulas and wb._ws and count > 0:
+        # Find the first summary formula row (= boundary between product area and summary)
+        summary_row_nums = []
+        for fc_ref in template_formulas:
+            row_num = int(re.search(r"(\d+)", fc_ref).group(1))
+            if row_num > start_row + 10:  # outside per-row formula range
+                summary_row_nums.append(row_num)
+
+        if summary_row_nums:
+            first_summary_row = min(summary_row_nums)
+            template_capacity = first_summary_row - start_row
+            if count > template_capacity:
+                extra_rows = count - template_capacity
+                wb._ws.insert_rows(first_summary_row, extra_rows)
+                logger.info(
+                    "Inserted %d rows at row %d (template_capacity=%d, products=%d)",
+                    extra_rows, first_summary_row, template_capacity, count,
+                )
+
+    wb.write_product_rows(start_row, columns, products, formula_cols, metadata=enriched_meta)
 
     # Post-fill: pack_size → description column
     if wb._ws:
@@ -798,43 +823,77 @@ def _generate_single_supplier(
                                     pass
 
     # Rebuild formulas
-    # Layer 2.1: Only rebuild formulas in columns declared by formula_columns (whitelist)
+    # After insert_rows, summary formulas have shifted to new positions (auto by openpyxl).
+    # We still need to:
+    #   1. Rebuild per-row formulas for ALL product rows (template only has formulas for sample rows)
+    #   2. Adjust summary SUM ranges to cover all product rows (insert_rows doesn't extend ranges)
     allowed_formula_cols = set(c.upper() for c in formula_cols) if formula_cols else set()
     if template_formulas and wb._ws:
         last_data_row = start_row + count - 1
         per_row_formulas: dict[str, tuple[str, int]] = {}
-        summary_formulas: dict[str, str] = {}
+        summary_formulas: dict[str, tuple[str, str]] = {}  # {orig_ref: (orig_formula, new_ref)}
 
         for fc_ref, fc_val in template_formulas.items():
             col_letter = re.match(r"([A-Z]+)", fc_ref).group(1)
             row_num = int(re.search(r"(\d+)", fc_ref).group(1))
-            if start_row <= row_num <= start_row + 10:
-                # Only rebuild per-row formulas in whitelisted columns
+            if row_num < start_row:
+                # Header formula (e.g., H16=L35) — skip, insert_rows already adjusted it
+                continue
+            elif start_row <= row_num <= start_row + 10:
+                # Per-row formula (within product area)
                 if allowed_formula_cols and col_letter.upper() not in allowed_formula_cols:
                     logger.debug("Skipping non-whitelisted per-row formula at %s: %s", fc_ref, fc_val[:60])
                     continue
                 if col_letter not in per_row_formulas:
                     per_row_formulas[col_letter] = (fc_val, row_num)
             else:
-                summary_formulas[fc_ref] = fc_val
+                # Summary formula — after insert_rows it's at row_num + extra_rows
+                new_row = row_num + extra_rows
+                new_ref = f"{col_letter}{new_row}"
+                summary_formulas[fc_ref] = (fc_val, new_ref)
 
+        # 1. Per-row formulas: write for each product row
         for col, (formula_template, orig_row) in per_row_formulas.items():
             for row_idx in range(start_row, start_row + count):
                 new_formula = re.sub(str(orig_row), str(row_idx), formula_template)
                 wb.safe_set_cell(f"{col}{row_idx}", new_formula)
-            # Clear leftover formula rows
-            for row_idx in range(start_row + count, start_row + 20):
+            # Clear leftover formula rows (between last product and first summary)
+            clear_end = start_row + count + 10
+            if summary_formulas:
+                first_new_summary = min(
+                    int(re.search(r"(\d+)", nr).group(1))
+                    for _, (_, nr) in summary_formulas.items()
+                )
+                clear_end = min(clear_end, first_new_summary)
+            for row_idx in range(start_row + count, clear_end):
                 c = wb._ws[f"{col}{row_idx}"]
                 if not isinstance(c, MergedCell) and c.value and isinstance(c.value, str) and c.value.startswith("="):
                     wb.safe_set_cell(f"{col}{row_idx}", None)
 
-        for fc_ref, formula in summary_formulas.items():
+        # 2. Summary formulas: adjust SUM ranges to cover all product rows
+        # Build row shift map for inter-formula references (e.g., L33*0.08 → L72*0.08)
+        row_shift_map: dict[int, int] = {}
+        for fc_ref, (_, new_ref) in summary_formulas.items():
+            old_row = int(re.search(r"(\d+)", fc_ref).group(1))
+            new_row = int(re.search(r"(\d+)", new_ref).group(1))
+            if old_row != new_row:
+                row_shift_map[old_row] = new_row
+
+        for fc_ref, (orig_formula, new_ref) in summary_formulas.items():
+            # Expand range references (e.g., SUM(L22:L32) → SUM(L22:L71))
             new_formula = re.sub(
                 r"([A-Z]+)(\d+):([A-Z]+)(\d+)",
                 lambda m_: f"{m_.group(1)}{start_row}:{m_.group(3)}{last_data_row}",
-                formula,
+                orig_formula,
             )
-            wb.safe_set_cell(fc_ref, new_formula)
+            # Shift single cell references for inter-formula deps (e.g., L33 → L72)
+            if row_shift_map:
+                def _shift_cell_ref(m_):
+                    col_part = m_.group(1)
+                    row_part = int(m_.group(2))
+                    return f"{col_part}{row_shift_map.get(row_part, row_part)}"
+                new_formula = re.sub(r"([A-Z]+)(\d+)", _shift_cell_ref, new_formula)
+            wb.safe_set_cell(new_ref, new_formula)
 
     # ── Stage 6: Save ──
     return _save_workbook(wb, chosen_template, selection_method, order_meta, supplier_id,
