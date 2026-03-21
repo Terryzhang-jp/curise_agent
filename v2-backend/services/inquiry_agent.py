@@ -742,6 +742,38 @@ def _generate_single_supplier(
     columns = table_config.get("columns", {})
     start_row = table_config.get("start_row", 22)
     formula_cols = table_config.get("formula_columns", [])
+
+    # ── Auto-correct formula_columns/columns conflict ──
+    # AI template analysis sometimes marks data columns (D, E, K) as formula_columns.
+    # If a column is in both `columns` and `formula_columns`, it creates a contradiction:
+    # the data won't be written because formula_columns means "skip writing".
+    # Fix: only keep columns in formula_columns if they are NOT in the data columns mapping,
+    # OR if they have actual formulas in template_formulas.
+    if formula_cols and columns:
+        actual_formula_cols = set()
+        for fc in formula_cols:
+            fc_upper = fc.upper()
+            # Keep it if there's an actual formula in the template for this column
+            has_real_formula = any(
+                re.match(r"([A-Z]+)", ref).group(1).upper() == fc_upper
+                for ref in (template_formulas or {})
+            )
+            if has_real_formula:
+                actual_formula_cols.add(fc)
+            elif fc_upper in {c.upper() for c in columns}:
+                logger.warning(
+                    "Auto-corrected: column %s removed from formula_columns "
+                    "(no actual formula found, but it's in data columns)", fc
+                )
+            else:
+                actual_formula_cols.add(fc)
+        if len(actual_formula_cols) != len(formula_cols):
+            logger.info(
+                "formula_columns corrected: %s → %s",
+                formula_cols, sorted(actual_formula_cols),
+            )
+            formula_cols = sorted(actual_formula_cols)
+
     count = len(products)
 
     # ── Dynamic row expansion ──
