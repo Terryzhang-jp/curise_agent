@@ -452,6 +452,37 @@ MAPPING_PROMPT = """你是询价单填写专家。根据模板字段定义和订
 只返回 JSON。"""
 
 
+# ─── Row formatting copy helper ────────────────────────────────
+
+def _copy_row_formatting(ws, source_row: int, insert_start: int, num_rows: int) -> None:
+    """Copy row height and cell styles from source_row to inserted rows.
+
+    After ws.insert_rows(), newly inserted rows have no formatting.
+    This copies the source row's height and each cell's style (border, font,
+    alignment, fill, number_format) to make inserted rows visually consistent.
+    """
+    from copy import copy
+    src_height = ws.row_dimensions[source_row].height
+    # Get max column from the source row
+    max_col = ws.max_column or 14  # fallback to N
+
+    for offset in range(num_rows):
+        target_row = insert_start + offset
+        if src_height:
+            ws.row_dimensions[target_row].height = src_height
+
+        for col_idx in range(1, max_col + 1):
+            src_cell = ws.cell(row=source_row, column=col_idx)
+            tgt_cell = ws.cell(row=target_row, column=col_idx)
+            if src_cell.has_style:
+                tgt_cell.font = copy(src_cell.font)
+                tgt_cell.border = copy(src_cell.border)
+                tgt_cell.fill = copy(src_cell.fill)
+                tgt_cell.number_format = src_cell.number_format
+                tgt_cell.alignment = copy(src_cell.alignment)
+                tgt_cell.protection = copy(src_cell.protection)
+
+
 # ─── Per-Supplier Generation (replaces Agent) ─────────────────
 
 def _generate_single_supplier(
@@ -778,7 +809,8 @@ def _generate_single_supplier(
 
     # ── Dynamic row expansion ──
     # If products exceed template capacity, insert rows to push summary/footer down.
-    # openpyxl.insert_rows auto-adjusts inter-formula references (e.g., L33→L72).
+    # NOTE: openpyxl.insert_rows does NOT reliably adjust formula references.
+    # We must manually fix header formulas and summary formulas after insertion.
     extra_rows = 0
     if template_formulas and wb._ws and count > 0:
         # Find the first summary formula row (= boundary between product area and summary)
@@ -798,6 +830,8 @@ def _generate_single_supplier(
                     "Inserted %d rows at row %d (template_capacity=%d, products=%d)",
                     extra_rows, first_summary_row, template_capacity, count,
                 )
+                # Copy formatting from last template product row to inserted rows
+                _copy_row_formatting(wb._ws, first_summary_row - 1, first_summary_row, extra_rows)
 
     wb.write_product_rows(start_row, columns, products, formula_cols, metadata=enriched_meta)
 
@@ -855,13 +889,15 @@ def _generate_single_supplier(
                                     pass
 
     # Rebuild formulas
-    # After insert_rows, summary formulas have shifted to new positions (auto by openpyxl).
-    # We still need to:
-    #   1. Rebuild per-row formulas for ALL product rows (template only has formulas for sample rows)
-    #   2. Adjust summary SUM ranges to cover all product rows (insert_rows doesn't extend ranges)
+    # openpyxl.insert_rows does NOT reliably adjust formula references.
+    # We must manually handle all three categories:
+    #   1. Header formulas (row < start_row): update references to shifted summary rows
+    #   2. Per-row formulas: replicate for ALL product rows
+    #   3. Summary formulas: relocate + adjust SUM ranges
     allowed_formula_cols = set(c.upper() for c in formula_cols) if formula_cols else set()
     if template_formulas and wb._ws:
         last_data_row = start_row + count - 1
+        header_formulas: list[tuple[str, str]] = []  # [(ref, formula), ...]
         per_row_formulas: dict[str, tuple[str, int]] = {}
         summary_formulas: dict[str, tuple[str, str]] = {}  # {orig_ref: (orig_formula, new_ref)}
 
@@ -869,7 +905,8 @@ def _generate_single_supplier(
             col_letter = re.match(r"([A-Z]+)", fc_ref).group(1)
             row_num = int(re.search(r"(\d+)", fc_ref).group(1))
             if row_num < start_row:
-                # Header formula (e.g., H16=L35) — skip, insert_rows already adjusted it
+                # Header formula (e.g., H16=L35) — must manually adjust references
+                header_formulas.append((fc_ref, fc_val))
                 continue
             elif start_row <= row_num <= start_row + 10:
                 # Per-row formula (within product area)
@@ -926,6 +963,19 @@ def _generate_single_supplier(
                     return f"{col_part}{row_shift_map.get(row_part, row_part)}"
                 new_formula = re.sub(r"([A-Z]+)(\d+)", _shift_cell_ref, new_formula)
             wb.safe_set_cell(new_ref, new_formula)
+
+        # 3. Header formulas: update references to shifted summary rows
+        if extra_rows > 0 and header_formulas and row_shift_map:
+            for hf_ref, hf_formula in header_formulas:
+                new_formula = hf_formula
+                def _shift_header_ref(m_, _map=row_shift_map):
+                    col_part = m_.group(1)
+                    row_part = int(m_.group(2))
+                    return f"{col_part}{_map.get(row_part, row_part)}"
+                new_formula = re.sub(r"([A-Z]+)(\d+)", _shift_header_ref, new_formula)
+                if new_formula != hf_formula:
+                    wb.safe_set_cell(hf_ref, new_formula)
+                    logger.info("Header formula %s updated: %s → %s", hf_ref, hf_formula, new_formula)
 
     # ── Stage 6: Save ──
     return _save_workbook(wb, chosen_template, selection_method, order_meta, supplier_id,
