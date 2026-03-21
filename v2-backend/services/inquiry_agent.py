@@ -27,6 +27,7 @@ from typing import Any
 from google import genai
 from google.genai import types
 from openpyxl import load_workbook as _load_workbook_raw
+from openpyxl.cell.cell import MergedCell
 
 from services.agent.config import load_api_key
 
@@ -755,7 +756,7 @@ def _generate_single_supplier(
                 matched = product.get("matched_product") or {}
                 pack_size = matched.get("pack_size", "")
                 if pack_size:
-                    wb._ws[f"{desc_col}{start_row + i}"] = pack_size
+                    wb.safe_set_cell(f"{desc_col}{start_row + i}", pack_size)
 
     # Enforce annotations on product rows + set number_format
     if wb._ws and annotations:
@@ -768,15 +769,18 @@ def _generate_single_supplier(
             if ann_row_num >= start_row:
                 for ri in range(start_row, start_row + count):
                     cell_ref = f"{ann_col}{ri}"
-                    cell_val = wb._ws[cell_ref].value
+                    cell = wb._ws[cell_ref]
+                    if isinstance(cell, MergedCell):
+                        continue
+                    cell_val = cell.value
                     if cell_val is not None:
                         original = str(cell_val)
                         enforced = enforce_annotation(original, ann_text)
                         if enforced != original:
                             try:
-                                wb._ws[cell_ref] = float(enforced)
+                                wb.safe_set_cell(cell_ref, float(enforced))
                             except (ValueError, TypeError):
-                                wb._ws[cell_ref] = enforced
+                                wb.safe_set_cell(cell_ref, enforced)
                         # number_format for decimals
                         dec_match = re.search(
                             r"小数点\s*(?:后面|まで)?\s*(\d+|[一二两三四五六七八九十]+)\s*位|(\d+)\s*decimal",
@@ -788,8 +792,8 @@ def _generate_single_supplier(
                             pl = cn_d.get(raw_d, None) if not raw_d.isdigit() else int(raw_d)
                             if pl:
                                 try:
-                                    wb._ws[cell_ref].value = float(wb._ws[cell_ref].value)
-                                    wb._ws[cell_ref].number_format = "0." + "0" * pl
+                                    val = float(cell.value)
+                                    wb.safe_set_cell(cell_ref, val, number_format="0." + "0" * pl)
                                 except (ValueError, TypeError):
                                     pass
 
@@ -817,12 +821,12 @@ def _generate_single_supplier(
         for col, (formula_template, orig_row) in per_row_formulas.items():
             for row_idx in range(start_row, start_row + count):
                 new_formula = re.sub(str(orig_row), str(row_idx), formula_template)
-                wb._ws[f"{col}{row_idx}"] = new_formula
+                wb.safe_set_cell(f"{col}{row_idx}", new_formula)
             # Clear leftover formula rows
             for row_idx in range(start_row + count, start_row + 20):
                 c = wb._ws[f"{col}{row_idx}"]
-                if c.value and isinstance(c.value, str) and c.value.startswith("="):
-                    wb._ws[f"{col}{row_idx}"] = None
+                if not isinstance(c, MergedCell) and c.value and isinstance(c.value, str) and c.value.startswith("="):
+                    wb.safe_set_cell(f"{col}{row_idx}", None)
 
         for fc_ref, formula in summary_formulas.items():
             new_formula = re.sub(
@@ -830,7 +834,7 @@ def _generate_single_supplier(
                 lambda m_: f"{m_.group(1)}{start_row}:{m_.group(3)}{last_data_row}",
                 formula,
             )
-            wb._ws[fc_ref] = new_formula
+            wb.safe_set_cell(fc_ref, new_formula)
 
     # ── Stage 6: Save ──
     return _save_workbook(wb, chosen_template, selection_method, order_meta, supplier_id,

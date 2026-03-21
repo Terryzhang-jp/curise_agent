@@ -285,6 +285,25 @@ class InquiryWorkbook:
                             cell.value = value
             return len(products)
 
+    def safe_set_cell(self, ref: str, value, number_format: str | None = None) -> bool:
+        """Write a single cell safely, skipping MergedCells.
+
+        Returns True if the write succeeded, False if skipped (merged/error).
+        All external code should use this instead of accessing _ws directly.
+        """
+        try:
+            cell = self._ws[ref]
+            if isinstance(cell, MergedCell):
+                logger.debug("Skipping merged cell %s", ref)
+                return False
+            cell.value = value
+            if number_format:
+                cell.number_format = number_format
+            return True
+        except Exception as e:
+            logger.warning("Failed to write cell %s: %s", ref, e)
+            return False
+
     def render_html(self) -> str:
         """Convert current workbook state to HTML via xlsx2html."""
         if self._wb is None:
