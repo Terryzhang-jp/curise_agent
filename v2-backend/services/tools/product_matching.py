@@ -136,18 +136,28 @@ def _match_products_against_db(products, db, country_id=None, port_id=None, deli
         }
 
         if best_match and best_score >= 0.7:
-            match_result["matched_product"] = normalize_matched_product({
+            mp = normalize_matched_product({
                 "id": best_match.id,
                 "code": best_match.code,
                 "product_name_en": best_match.product_name_en,
                 "product_name_jp": best_match.product_name_jp,
-                "price": float(best_match.price) if best_match.price else None,
+                "price": float(best_match.price) if best_match.price is not None else None,
                 "currency": best_match.currency,
                 "supplier_id": best_match.supplier_id,
                 "category_id": best_match.category_id,
                 "pack_size": best_match.pack_size,
                 "unit": best_match.unit,
             })
+            match_result["matched_product"] = mp
+
+            # Layer 2: DB-authoritative override — when a product is matched,
+            # DB values for structured fields take precedence over AI extraction.
+            # This ensures that even if Layer 1 normalization missed something,
+            # the final data uses the authoritative source.
+            if mp.get("unit"):
+                match_result["unit"] = mp["unit"]
+            if mp.get("price") is not None:
+                match_result["unit_price"] = mp["price"]
 
         results.append(match_result)
 

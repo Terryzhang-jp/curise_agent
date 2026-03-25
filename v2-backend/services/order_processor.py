@@ -785,8 +785,15 @@ def process_order(order_id: int, file_bytes: bytes, template_id_override: int | 
 
         order.extraction_data = extracted
         order.order_metadata = extracted.get("order_metadata")
-        order.products = extracted.get("products")
-        order.product_count = len(extracted.get("products", []))
+
+        # Layer 1: Structural validation — clean AI extraction artifacts
+        # (e.g., "KG2.2" → "KG", "100CT" → 100, empty rows removed)
+        # Deep copy so extraction_data retains original AI values for audit
+        import copy
+        from services.product_normalizer import normalize_products
+        raw_products = copy.deepcopy(extracted.get("products") or [])
+        order.products = normalize_products(raw_products)
+        order.product_count = len(order.products)
         total_amount = extracted.get("order_metadata", {}).get("total_amount")
         if total_amount is not None:
             try:

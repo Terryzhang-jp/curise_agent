@@ -109,7 +109,8 @@ def _fill_with_template(ws, template, metadata: dict, products: list[dict],
             elif field_key == "product_name_en":
                 value = product.get("product_name") or matched.get("product_name_en", "")
             else:
-                value = product.get(field_key) or matched.get(field_key, "")
+                val = product.get(field_key)
+                value = val if val is not None else matched.get(field_key, "")
 
             if value != "" and value is not None:
                 cell = ws[f"{col_letter}{row}"]
@@ -260,13 +261,37 @@ class InquiryWorkbook:
         skip = set(c.upper() for c in (formula_columns or []))
         meta = metadata or {}
         with self._lock:
+            # ── Preemptive merge cleanup ──────────────────────────
+            # Templates may have merged cells (e.g. summary zone I:J merges)
+            # in the rows we're about to write to. Remove merge ranges and
+            # purge MergedCell objects so every cell is writable.
+            write_end = start_row + len(products) - 1
+            merges_to_remove = [
+                mr for mr in list(self._ws.merged_cells.ranges)
+                if mr.min_row <= write_end and mr.max_row >= start_row
+            ]
+            for mr in merges_to_remove:
+                self._ws.merged_cells.remove(mr)
+            if merges_to_remove:
+                max_col = self._ws.max_column or 12
+                for row in range(start_row, write_end + 1):
+                    for col in range(1, max_col + 1):
+                        if (row, col) in self._ws._cells and isinstance(
+                            self._ws._cells[(row, col)], MergedCell
+                        ):
+                            del self._ws._cells[(row, col)]
+                logger.info(
+                    "write_product_rows: removed %d merge ranges in rows %d-%d",
+                    len(merges_to_remove), start_row, write_end,
+                )
+
             for i, product in enumerate(products):
                 row = start_row + i
                 matched = product.get("matched_product") or {}
                 for col_letter, field_key in columns.items():
                     if col_letter.upper() in skip:
                         continue
-                    # Resolve value: product → matched (normalized) → metadata fallback
+                    # Resolve value: matched (authoritative) → product (extracted) → metadata fallback
                     if field_key == "line_number":
                         value = i + 1
                     elif field_key == "po_number":
@@ -277,8 +302,18 @@ class InquiryWorkbook:
                         value = matched.get("pack_size") or product.get("description", "")
                     elif field_key == "product_name_en":
                         value = product.get("product_name") or matched.get("product_name_en", "")
+                    elif field_key == "unit":
+                        # matched_product.unit is authoritative (clean DB value);
+                        # product.unit from extraction can be corrupted (e.g. "KG2.2")
+                        value = matched.get("unit") or product.get("unit", "")
+                    elif field_key == "unit_price":
+                        # matched_product uses "price" not "unit_price"
+                        # Use `is not None` — price=0 is valid, `or` treats it as falsy
+                        val = product.get("unit_price")
+                        value = val if val is not None else matched.get("price", "")
                     else:
-                        value = product.get(field_key) or matched.get(field_key, "")
+                        val = product.get(field_key)
+                        value = val if val is not None else matched.get(field_key, "")
                     if value != "" and value is not None:
                         cell = self._ws[f"{col_letter}{row}"]
                         if not isinstance(cell, MergedCell):
