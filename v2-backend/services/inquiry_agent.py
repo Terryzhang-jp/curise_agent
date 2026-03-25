@@ -12,6 +12,7 @@ logic is now a straight-line function (~6 stages) instead of an agent loop.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -105,8 +106,9 @@ def run_inquiry_pre_analysis(order, db) -> dict:
         subtotal = 0.0
         for p in products:
             mp = p.get("matched_product") or {}
-            qty = p.get("quantity") or 0
-            price = p.get("unit_price") or mp.get("price") or 0
+            qty = p.get("quantity") if p.get("quantity") is not None else 0
+            val = p.get("unit_price")
+            price = val if val is not None else (mp.get("price") if mp.get("price") is not None else 0)
             try:
                 subtotal += float(qty) * float(price)
             except (TypeError, ValueError):
@@ -483,6 +485,75 @@ def _copy_row_formatting(ws, source_row: int, insert_start: int, num_rows: int) 
                 tgt_cell.protection = copy(src_cell.protection)
 
 
+def _build_order_data_for_engine(
+    order_id: int, order_meta: dict, supplier_id: int,
+    products: list[dict], supplier_info: dict, _db=None,
+) -> dict:
+    """Build order_data dict in the format expected by template_engine.fill_template().
+
+    Mirrors the structure from prepare_inquiry_workspace (services/tools/inquiry.py).
+    """
+    sid = str(supplier_id)
+    currency = order_meta.get("currency") or "JPY"
+
+    # Clean products for engine format
+    cleaned = []
+    for p in products:
+        mp = p.get("matched_product") or {}
+        cleaned.append({
+            "product_code": mp.get("code") or p.get("product_code", ""),
+            "product_name": p.get("product_name", ""),
+            "product_name_jp": mp.get("product_name_jp", ""),
+            "quantity": p.get("quantity"),
+            "unit": mp.get("unit") or p.get("unit", ""),
+            "unit_price": mp.get("price") if mp.get("price") is not None else p.get("unit_price"),
+            "pack_size": mp.get("pack_size", ""),
+            "currency": currency,
+        })
+
+    # Get company config + delivery location if DB available
+    company_info = {}
+    delivery_info = {}
+    if _db:
+        try:
+            from models import CompanyConfig, DeliveryLocation
+            for c in _db.query(CompanyConfig).order_by(CompanyConfig.sort_order).all():
+                company_info[c.key] = c.value
+            loc = _db.query(DeliveryLocation).filter(DeliveryLocation.is_default == True).first()
+            if loc:
+                delivery_info = {
+                    "name": loc.name, "address": loc.address,
+                    "contact_person": loc.contact_person,
+                    "contact_phone": loc.contact_phone,
+                    "delivery_notes": loc.delivery_notes,
+                    "ship_name_label": loc.ship_name_label,
+                }
+        except Exception:
+            pass
+
+    return {
+        "order_id": order_id,
+        "po_number": order_meta.get("po_number", ""),
+        "ship_name": order_meta.get("ship_name", ""),
+        "delivery_date": order_meta.get("delivery_date", ""),
+        "order_date": order_meta.get("order_date", ""),
+        "currency": currency,
+        "destination_port": order_meta.get("destination_port") or order_meta.get("port_name", ""),
+        "delivery_address": order_meta.get("delivery_address", ""),
+        "voyage": order_meta.get("voyage", ""),
+        "company": company_info,
+        "delivery_location": delivery_info,
+        "suppliers": {
+            sid: {
+                "supplier_name": supplier_info.get("name", ""),
+                "supplier_info": supplier_info,
+                "product_count": len(cleaned),
+                "products": cleaned,
+            }
+        },
+    }
+
+
 # ─── Per-Supplier Generation (replaces Agent) ─────────────────
 
 def _generate_single_supplier(
@@ -586,6 +657,87 @@ def _generate_single_supplier(
         # Save generic
         return _save_workbook(wb, None, selection_method, order_meta, supplier_id,
                               products, upload_dir, {}, stream_key, overall_start)
+
+    # ── Fast path: deterministic engine (no LLM) ──
+    # If template has zone_config in template_styles, use template_engine
+    zone_config = None
+    if chosen_template.template_styles and isinstance(chosen_template.template_styles, dict):
+        if "zones" in chosen_template.template_styles:
+            zone_config = chosen_template.template_styles
+
+    if zone_config and chosen_template.template_file_url:
+        try:
+            from services.template_engine import fill_template as engine_fill
+            from services.template_engine import verify_output as engine_verify
+
+            engine_start = time.time()
+
+            # Download template
+            suffix = ".xls" if chosen_template.template_file_url.lower().endswith(".xls") else ".xlsx"
+            template_bytes = file_storage.download(chosen_template.template_file_url)
+
+            # Build order_data for engine (reuses prepare_inquiry_workspace data structure)
+            engine_order_data = _build_order_data_for_engine(
+                order_id, enriched_meta, supplier_id, products, supplier_info, _db=None,
+            )
+
+            # Load user field overrides if any
+            _fo_db = SessionLocal()
+            try:
+                from models import Order as _OrderModel
+                _fo_order = _fo_db.query(_OrderModel).get(order_id)
+                _fo_overrides = (
+                    (_fo_order.inquiry_data or {})
+                    .get("suppliers", {})
+                    .get(str(supplier_id), {})
+                    .get("field_overrides")
+                ) if _fo_order else None
+            finally:
+                _fo_db.close()
+
+            # Fill template
+            excel_bytes = engine_fill(
+                template_bytes, zone_config, engine_order_data, supplier_id,
+                field_overrides=_fo_overrides,
+            )
+
+            engine_elapsed = time.time() - engine_start
+            logger.info(
+                "Template engine: supplier %d, %d products in %.2fs (no LLM)",
+                supplier_id, len(products), engine_elapsed,
+            )
+
+            if stream_key:
+                push_event(stream_key, {
+                    "type": "tool_call", "tool_name": "generate", "tool_label": "生成询价单",
+                    "content": f"确定性引擎: {chosen_template.template_name}, {len(products)} 产品, {engine_elapsed:.1f}s",
+                    "elapsed_seconds": round(time.time() - overall_start, 1),
+                    "supplier_id": supplier_id,
+                })
+
+            # Verify
+            vr = engine_verify(excel_bytes, zone_config, engine_order_data, supplier_id)
+            if not vr["ok"]:
+                logger.warning(
+                    "Template engine verify: %d errors, falling back to LLM path",
+                    len(vr["errors"]),
+                )
+                # Fall through to LLM path below
+            else:
+                # Save and return
+                wb = InquiryWorkbook()
+                wb._wb = load_workbook(io.BytesIO(excel_bytes))
+                wb._ws = wb._wb.active
+                return _save_workbook(
+                    wb, chosen_template, selection_method, order_meta, supplier_id,
+                    products, upload_dir, {}, stream_key, overall_start,
+                )
+        except Exception as e:
+            logger.warning(
+                "Template engine failed for supplier %d, falling back to LLM: %s",
+                supplier_id, e, exc_info=True,
+            )
+            # Fall through to LLM path
 
     # Load template file from Supabase Storage
     template_file_path = None
@@ -1149,8 +1301,9 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
         subtotal = 0.0
         for p in sid_products:
             mp = p.get("matched_product") or {}
-            qty = p.get("quantity") or 0
-            price = p.get("unit_price") or mp.get("price") or 0
+            qty = p.get("quantity") if p.get("quantity") is not None else 0
+            val = p.get("unit_price")
+            price = val if val is not None else (mp.get("price") if mp.get("price") is not None else 0)
             try:
                 subtotal += float(qty) * float(price)
             except (TypeError, ValueError):

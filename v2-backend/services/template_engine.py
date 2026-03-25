@@ -20,6 +20,8 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.workbook.properties import CalcProperties
 from openpyxl.utils import get_column_letter, column_index_from_string
 
+from services.field_schema import _resolve_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -460,19 +462,6 @@ def _get_products(order_data: dict, sid: str) -> list[dict]:
     supplier = order_data.get("suppliers", {}).get(sid, {})
     return supplier.get("products", [])
 
-
-def _resolve_path(data: dict, path: str, sid: str) -> Any:
-    """Resolve a dotted path like 'suppliers.{sid}.supplier_info.contact'."""
-    path = path.replace("{sid}", sid)
-    obj = data
-    for key in path.split("."):
-        if isinstance(obj, dict):
-            obj = obj.get(key)
-        else:
-            return None
-        if obj is None:
-            return None
-    return obj
 
 
 def _resolve_product_field(
