@@ -42,19 +42,53 @@ class ToolContext:
     should_pause: bool = False                                    # HITL pause flag
     pause_reason: str = ""
     pause_data: dict[str, Any] = field(default_factory=dict)     # Data for frontend review display
+    cancel_event: Any = None                                      # threading.Event — set externally to abort agent
     db: Any = None                                                # SQLAlchemy session (injected at runtime)
     file_bytes: bytes | None = None                               # Uploaded file bytes
     pipeline_session_id: str | None = None
     current_phase: str | None = None
+
+    # --- Workspace ---
+    workspace_dir: str | None = None                            # Per-session workspace for generated files
+
+    # --- Tracing ---
+    tracer: Any = None                                          # AgentTracer (injected at runtime)
 
     # --- Agent general state ---
     file_hashes: dict[str, str] = field(default_factory=dict)
     todo_items: list[dict] = field(default_factory=list)
     todo_next_id: int = 1
 
+    # --- Artifact tracking ---
+    _referenced_order_ids: set[int] = field(default_factory=set)
+
+    # --- Memory (DeerFlow alignment) ---
+    user_id: int | None = None                                   # Current user (for memory loading)
+    session_id: str | None = None                                # Current session ID
+    memory_text: str = ""                                        # Injected by MemoryMiddleware
+    _conversation_log: str = ""                                  # Built during run for memory extraction
+
+    # --- Sub-agent governance ---
+    _is_sub_agent: bool = False                                  # Recursive delegation protection
+
+    # --- Summarization ---
+    _should_compact: bool = False                                # Set by SummarizationMiddleware
+
     # --- Skill state ---
     skills: dict[str, SkillDef] = field(default_factory=dict)
     skill_paths: list[str] = field(default_factory=list)
+
+    # ----------------------------------------------------------
+    # Artifact tracking — tools register orders they reference
+    # ----------------------------------------------------------
+
+    def register_order(self, order_id: int):
+        """Track an order ID referenced during this session."""
+        self._referenced_order_ids.add(int(order_id))
+
+    @property
+    def referenced_order_ids(self) -> set[int]:
+        return self._referenced_order_ids
 
     # ----------------------------------------------------------
     # Todo helpers

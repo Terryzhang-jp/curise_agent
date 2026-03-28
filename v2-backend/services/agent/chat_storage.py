@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 import time
 
@@ -41,31 +42,42 @@ def _generate_summary(text: str, max_len: int = 60) -> str:
     return text[:50].strip() + "..."
 
 
-_TOOL_SUMMARY_MAP: dict[str, str] = {
-    "query_db": "查询数据库",
-    "get_db_schema": "获取表结构",
-    "think": "思考",
-    "calculate": "数学计算",
-    "get_current_time": "获取当前时间",
-    "todo_write": "更新任务清单",
-    "todo_read": "读取任务清单",
-    "use_skill": "调用技能",
-    "web_fetch": "获取网页内容",
-    "search_product_database": "搜索产品数据库",
-    "get_order_overview": "查看订单概览",
-    "generate_order_inquiry": "生成询价Excel",
-    "parse_file": "解析上传文件",
-    "resolve_and_validate": "验证暂存数据",
-    "create_references": "创建引用数据",
-    "preview_changes": "预览变更",
-    "execute_upload": "执行产品导入",
-    "audit_data": "数据质量审计",
-    "get_order_fulfillment": "查看履约状态",
-    "update_order_fulfillment": "更新履约状态",
-    "record_delivery_receipt": "记录交货验收",
-    "attach_order_file": "附加订单文件",
-    "request_confirmation": "请求用户确认",
-}
+def _extract_bash_summary(result: str) -> str:
+    """Generate a concise summary for bash tool results."""
+    if not result:
+        return "执行命令"
+    if "Error" in result:
+        return "执行出错"
+    if ".xlsx" in result:
+        return "生成 Excel 文件"
+    if ".csv" in result:
+        return "生成 CSV 文件"
+    if ".pdf" in result:
+        return "生成 PDF 文件"
+    # Truncate to first meaningful line
+    first_line = result.split("\n")[0].strip()
+    return "执行命令" + (f": {first_line[:50]}" if first_line else "")
+
+
+def _build_tool_summary_map() -> dict[str, str | Callable[[str], str]]:
+    """Build tool summary map from auto-discovered TOOL_META.
+
+    Falls back to display_name if no summary is specified.
+    Special case: bash uses _extract_bash_summary callable for richer summaries.
+    """
+    try:
+        from services.tools.registry_loader import get_tool_summaries
+        summaries = get_tool_summaries()
+    except Exception:
+        summaries = {}
+
+    # Override bash with callable for richer summaries
+    summaries["bash"] = _extract_bash_summary
+
+    return summaries
+
+
+_TOOL_SUMMARY_MAP: dict[str, str | Callable[[str], str]] = _build_tool_summary_map()
 
 
 _STRUCTURED_MARKER = "\n__STRUCTURED__\n"
@@ -86,6 +98,48 @@ def _extract_structured_data(text: str) -> tuple[str, dict | None]:
         return clean, json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
         return clean, None
+
+
+def _detect_xlsx_in_workspace(tool_name: str, output_text: str, session_id: str) -> str | None:
+    """Detect a generated/modified xlsx file from tool output.
+
+    Strategy:
+    1. If output mentions a .xlsx filename AND that file exists in workspace → use it
+    2. For bash: if output doesn't mention .xlsx but indicates success (exit 0, no error),
+       scan workspace for the most recently modified .xlsx file
+    Returns filename or None.
+    """
+    import os
+    from config import settings
+
+    ws_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
+    if not os.path.isdir(ws_dir):
+        return None
+
+    # Strategy 1: filename mentioned in output
+    fn_match = re.search(r"[\w\u4e00-\u9fff\u3040-\u30ff\-]+\.xlsx", output_text)
+    if fn_match:
+        _fn = fn_match.group(0)
+        if os.path.isfile(os.path.join(ws_dir, _fn)):
+            return _fn
+
+    # Strategy 2 (bash only): scan workspace for recently modified xlsx
+    # Only trigger when bash succeeded and output hints at file operations
+    if tool_name == "bash" and "Exit code: 0" in output_text:
+        _HINTS = ("save", "wrote", "生成", "updated", "created", "output", "formula",
+                  "tax", "修改", "完成", ".xlsx")
+        if any(h in output_text.lower() for h in _HINTS):
+            xlsx_files = []
+            for f in os.listdir(ws_dir):
+                if f.endswith(".xlsx") and not f.startswith("template") and not f.startswith("~"):
+                    fpath = os.path.join(ws_dir, f)
+                    xlsx_files.append((os.path.getmtime(fpath), f))
+            if xlsx_files:
+                xlsx_files.sort(reverse=True)
+                # Return the most recently modified file
+                return xlsx_files[0][1]
+
+    return None
 
 
 class ChatStorage:
@@ -200,8 +254,15 @@ class ChatStorage:
                 if text:
                     # Fix 1: user text parts use "user_input" msg_type
                     display_type = "user_input" if role == "user" else "text"
+                    # Strip internal file-context prefix from display (user shouldn't see it)
+                    display_text = text
+                    if role == "user" and display_text.startswith("[用户上传了文件:"):
+                        # Remove the injected prefix, keep only the user's original message
+                        nl_idx = display_text.find("\n\n")
+                        if nl_idx > 0:
+                            display_text = display_text[nl_idx + 2:]
                     self._write_display_message(
-                        session_id, self._map_role(role), display_type, text,
+                        session_id, self._map_role(role), display_type, display_text,
                     )
             elif ptype == "tool_call":
                 tool_name = data.get("name", "")
@@ -214,13 +275,16 @@ class ChatStorage:
                             metadata={"summary": _generate_summary(thought)},
                         )
                 else:
+                    summary_val = _TOOL_SUMMARY_MAP.get(tool_name, f"调用 {tool_name}")
+                    # Static string or callable (for bash etc.)
+                    summary = summary_val if isinstance(summary_val, str) else summary_val("")
                     self._write_display_message(
                         session_id, "assistant", "action",
                         f"调用工具: {tool_name}",
                         metadata={
                             "tool_name": tool_name,
                             "tool_args": data.get("args", {}),
-                            "summary": _TOOL_SUMMARY_MAP.get(tool_name, f"调用 {tool_name}"),
+                            "summary": summary,
                         },
                     )
             elif ptype == "tool_result":
@@ -248,6 +312,10 @@ class ChatStorage:
                     )
                 else:
                     meta = {"tool_name": tool_name, "duration_ms": data.get("duration_ms", 0)}
+                    # Dynamic summary for tools with callable summaries (e.g. bash)
+                    summary_val = _TOOL_SUMMARY_MAP.get(tool_name)
+                    if callable(summary_val):
+                        meta["summary"] = summary_val(clean_text)
                     if upload_data:
                         # Ensure card_type for backward compat
                         if "card_type" not in upload_data:
@@ -258,6 +326,17 @@ class ChatStorage:
                             }
                             upload_data["card_type"] = _LEGACY.get(upload_data.get("tool", ""), "unknown")
                         meta["structured_card"] = upload_data
+                    elif tool_name in ("bash", "generate_inquiries"):
+                        # Detect generated/modified Excel file
+                        _detected_file = _detect_xlsx_in_workspace(
+                            tool_name, clean_text, session_id
+                        )
+                        if _detected_file:
+                            meta["structured_card"] = {
+                                "card_type": "generated_file",
+                                "filename": _detected_file,
+                                "session_id": session_id,
+                            }
                     elif tool_name == "query_db":
                         # Auto-wrap query_db JSON as structured card
                         try:
@@ -430,7 +509,18 @@ class ChatStorage:
         )
 
     def update_token_usage(self, session_id: str, prompt_tokens: int, completion_tokens: int):
-        pass  # No-op for chat sessions
+        """Accumulate token usage on the session record."""
+        try:
+            from models import AgentSession
+            s = self._db.query(AgentSession).filter(AgentSession.id == session_id).first()
+            if s:
+                usage = dict(s.token_usage or {})
+                usage["prompt"] = usage.get("prompt", 0) + prompt_tokens
+                usage["completion"] = usage.get("completion", 0) + completion_tokens
+                s.token_usage = usage
+                self._db.flush()
+        except Exception as e:
+            logger.debug("update_token_usage failed: %s", e)
 
     # ----------------------------------------------------------
     # Helpers

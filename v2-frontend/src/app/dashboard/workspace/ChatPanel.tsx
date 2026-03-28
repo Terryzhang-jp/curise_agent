@@ -24,6 +24,7 @@ interface ChatPanelProps {
   onQuickAction?: (text: string, scenario?: string) => void;
   activeScenario?: string | null;
   onClearScenario?: () => void;
+  onOpenArtifact?: (filename: string) => void;
 }
 
 const ALLOWED_EXTENSIONS = [".xlsx", ".xls", ".pdf", ".csv"];
@@ -135,6 +136,7 @@ export default function ChatPanel({
   onQuickAction,
   activeScenario,
   onClearScenario,
+  onOpenArtifact,
 }: ChatPanelProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -239,7 +241,7 @@ export default function ChatPanel({
                     const msg = group.message;
                     return (
                       <ChatBubble
-                        key={msg.id}
+                        key={`${msg.id}-${msg.created_at}`}
                         role={msg.role}
                         content={msg.content}
                         msgType={msg.msg_type}
@@ -248,6 +250,7 @@ export default function ChatPanel({
                         metadata={msg.metadata}
                         onRetry={onRetry}
                         onQuickAction={onQuickAction}
+                        onOpenArtifact={onOpenArtifact}
                       />
                     );
                   }
@@ -260,6 +263,7 @@ export default function ChatPanel({
                       isActive={isActive}
                       onRetry={onRetry}
                       onQuickAction={onQuickAction}
+                      onOpenArtifact={onOpenArtifact}
                     />
                   );
                 })}

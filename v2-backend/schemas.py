@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, Any
 
 
@@ -188,6 +188,7 @@ class SupplierTemplateCreate(BaseModel):
     product_table_config: Optional[dict[str, Any]] = None
     order_format_template_id: Optional[int] = None
     field_mapping_metadata: Optional[dict[str, Any]] = None
+    template_styles: Optional[dict[str, Any]] = None
 
 
 class SupplierTemplateUpdate(BaseModel):
@@ -199,6 +200,7 @@ class SupplierTemplateUpdate(BaseModel):
     product_table_config: Optional[dict[str, Any]] = None
     order_format_template_id: Optional[int] = None
     field_mapping_metadata: Optional[dict[str, Any]] = None
+    template_styles: Optional[dict[str, Any]] = None
 
 
 class SupplierTemplateResponse(BaseModel):
@@ -213,9 +215,104 @@ class SupplierTemplateResponse(BaseModel):
     product_table_config: Optional[dict[str, Any]] = None
     order_format_template_id: Optional[int] = None
     field_mapping_metadata: Optional[dict[str, Any]] = None
+    template_styles: Optional[dict[str, Any]] = None
     created_by: Optional[int] = None
     created_at: datetime
     updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ─── Supplier Info (settings) ─────────────────────────────────
+
+class SupplierInfoUpdate(BaseModel):
+    contact: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    zip_code: Optional[str] = None
+    fax: Optional[str] = None
+    default_payment_method: Optional[str] = None
+    default_payment_terms: Optional[str] = None
+
+
+class SupplierInfoResponse(BaseModel):
+    id: int
+    name: str
+    country_id: Optional[int] = None
+    contact: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    zip_code: Optional[str] = None
+    fax: Optional[str] = None
+    default_payment_method: Optional[str] = None
+    default_payment_terms: Optional[str] = None
+    status: bool = True
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ─── Delivery Location ───────────────────────────────────────
+
+class DeliveryLocationCreate(BaseModel):
+    port_id: Optional[int] = None
+    name: str
+    address: Optional[str] = None
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    delivery_notes: Optional[str] = None
+    ship_name_label: Optional[str] = None
+    is_default: bool = True
+
+
+class DeliveryLocationUpdate(BaseModel):
+    port_id: Optional[int] = None
+    name: Optional[str] = None
+    address: Optional[str] = None
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    delivery_notes: Optional[str] = None
+    ship_name_label: Optional[str] = None
+    is_default: Optional[bool] = None
+
+
+class DeliveryLocationResponse(BaseModel):
+    id: int
+    port_id: Optional[int] = None
+    port_name: Optional[str] = None
+    name: str
+    address: Optional[str] = None
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    delivery_notes: Optional[str] = None
+    ship_name_label: Optional[str] = None
+    is_default: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ─── Company Config ──────────────────────────────────────────
+
+class CompanyConfigItem(BaseModel):
+    key: str
+    value: str
+    label: Optional[str] = None
+
+
+class CompanyConfigUpdate(BaseModel):
+    items: list[CompanyConfigItem]
+
+
+class CompanyConfigResponse(BaseModel):
+    key: str
+    value: str
+    label: Optional[str] = None
+    sort_order: int = 0
+    updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
@@ -238,6 +335,7 @@ class OrderListItem(BaseModel):
     is_reviewed: Optional[bool] = False
     fulfillment_status: str = "pending"
     template_id: Optional[int] = None
+    country_name: Optional[str] = None
     template_match_method: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -527,6 +625,33 @@ class ProductUpdate(BaseModel):
     effective_from: Optional[str] = None
     effective_to: Optional[str] = None
     status: Optional[bool] = None
+
+
+# ─── Exchange Rate ──────────────────────────────────────────────
+
+class ExchangeRateCreate(BaseModel):
+    from_currency: str = Field(..., max_length=3)
+    to_currency: str = Field(..., max_length=3)
+    rate: float = Field(..., gt=0)
+    effective_date: date
+
+
+class ExchangeRateUpdate(BaseModel):
+    rate: Optional[float] = Field(None, gt=0)
+    effective_date: Optional[date] = None
+
+
+class ExchangeRateResponse(BaseModel):
+    id: int
+    from_currency: str
+    to_currency: str
+    rate: float
+    effective_date: date
+    source: str = "manual"
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
 
 
 class ProductResponse(BaseModel):

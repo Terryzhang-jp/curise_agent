@@ -89,6 +89,7 @@ export interface SupplierTemplate {
   product_table_config: Record<string, unknown> | null;
   order_format_template_id: number | null;
   field_mapping_metadata: Record<string, unknown> | null;
+  template_styles: Record<string, unknown> | null;
   created_by: number | null;
   created_at: string;
   updated_at: string;
@@ -387,6 +388,7 @@ export function createSupplierTemplate(data: {
   product_table_config?: Record<string, unknown>;
   order_format_template_id?: number;
   field_mapping_metadata?: Record<string, unknown>;
+  template_styles?: Record<string, unknown>;
 }) {
   return api<SupplierTemplate>("/api/settings/supplier-templates", {
     method: "POST",
@@ -404,6 +406,7 @@ export function updateSupplierTemplate(
     product_table_config: Record<string, unknown>;
     order_format_template_id: number;
     field_mapping_metadata: Record<string, unknown>;
+    template_styles: Record<string, unknown>;
   }>,
 ) {
   return api<SupplierTemplate>(`/api/settings/supplier-templates/${id}`, {
@@ -546,6 +549,106 @@ export function seedSkills() {
   return api<{ detail: string }>("/api/settings/skills/seed", { method: "POST" });
 }
 
+// ─── Supplier Info (extended fields) ──────────────────────────
+
+export interface SupplierInfo {
+  id: number;
+  name: string;
+  country_id: number | null;
+  contact: string | null;
+  email: string | null;
+  phone: string | null;
+  address: string | null;
+  zip_code: string | null;
+  fax: string | null;
+  default_payment_method: string | null;
+  default_payment_terms: string | null;
+  status: boolean;
+  updated_at: string | null;
+}
+
+export function listSuppliersInfo(search?: string) {
+  const qs = search ? `?search=${encodeURIComponent(search)}` : "";
+  return api<SupplierInfo[]>(`/api/settings/suppliers${qs}`);
+}
+
+export function updateSupplierInfo(id: number, data: Partial<Omit<SupplierInfo, "id" | "name" | "status" | "updated_at" | "country_id">>) {
+  return api<SupplierInfo>(`/api/settings/suppliers/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  });
+}
+
+// ─── Delivery Locations ───────────────────────────────────────
+
+export interface DeliveryLocation {
+  id: number;
+  port_id: number | null;
+  port_name: string | null;
+  name: string;
+  address: string | null;
+  contact_person: string | null;
+  contact_phone: string | null;
+  delivery_notes: string | null;
+  ship_name_label: string | null;
+  is_default: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export function listDeliveryLocations(portId?: number) {
+  const qs = portId != null ? `?port_id=${portId}` : "";
+  return api<DeliveryLocation[]>(`/api/settings/delivery-locations${qs}`);
+}
+
+export function createDeliveryLocation(data: {
+  port_id?: number;
+  name: string;
+  address?: string;
+  contact_person?: string;
+  contact_phone?: string;
+  delivery_notes?: string;
+  ship_name_label?: string;
+  is_default?: boolean;
+}) {
+  return api<DeliveryLocation>("/api/settings/delivery-locations", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export function updateDeliveryLocation(id: number, data: Partial<Omit<DeliveryLocation, "id" | "port_name" | "created_at" | "updated_at">>) {
+  return api<DeliveryLocation>(`/api/settings/delivery-locations/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
+export function deleteDeliveryLocation(id: number) {
+  return api<{ detail: string }>(`/api/settings/delivery-locations/${id}`, { method: "DELETE" });
+}
+
+// ─── Company Config ───────────────────────────────────────────
+
+export interface CompanyConfigItem {
+  key: string;
+  value: string;
+  label: string | null;
+  sort_order: number;
+  updated_at: string | null;
+}
+
+export function getCompanyConfig() {
+  return api<CompanyConfigItem[]>("/api/settings/company-config");
+}
+
+export function updateCompanyConfig(items: { key: string; value: string; label?: string }[]) {
+  return api<{ detail: string }>("/api/settings/company-config", {
+    method: "PUT",
+    body: JSON.stringify({ items }),
+  });
+}
+
 // ─── Template Analysis ────────────────────────────────────────
 
 export interface CellClassification {
@@ -570,6 +673,7 @@ export interface TemplateAnalysisResult {
   notes: string;
   file_url: string;
   template_html?: string;
+  template_styles?: Record<string, unknown>;
   field_mapping_preview?: FieldMappingPreviewItem[];
   order_template_name?: string;
 }

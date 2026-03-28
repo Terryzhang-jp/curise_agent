@@ -2,6 +2,25 @@
 
 from datetime import datetime, timezone
 
+from services.tools.registry_loader import ToolMetaInfo
+
+TOOL_META = {
+    "calculate": ToolMetaInfo(
+        display_name="数学计算",
+        group="utility",
+        description="执行数学表达式计算",
+        prompt_description="数学计算",
+        summary="数学计算",
+    ),
+    "get_current_time": ToolMetaInfo(
+        display_name="当前时间",
+        group="utility",
+        description="获取当前日期和时间",
+        prompt_description="获取当前时间",
+        summary="获取当前时间",
+    ),
+}
+
 
 def register(registry, ctx=None):
     """注册 utility 组工具"""

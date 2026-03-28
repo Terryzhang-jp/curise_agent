@@ -487,11 +487,14 @@ def _copy_row_formatting(ws, source_row: int, insert_start: int, num_rows: int) 
 
 def _build_order_data_for_engine(
     order_id: int, order_meta: dict, supplier_id: int,
-    products: list[dict], supplier_info: dict, _db=None,
+    products: list[dict], supplier_info: dict,
+    company_info: dict | None = None,
+    delivery_info: dict | None = None,
 ) -> dict:
     """Build order_data dict in the format expected by template_engine.fill_template().
 
     Mirrors the structure from prepare_inquiry_workspace (services/tools/inquiry.py).
+    company_info / delivery_info should be pre-fetched by the caller.
     """
     sid = str(supplier_id)
     currency = order_meta.get("currency") or "JPY"
@@ -511,26 +514,6 @@ def _build_order_data_for_engine(
             "currency": currency,
         })
 
-    # Get company config + delivery location if DB available
-    company_info = {}
-    delivery_info = {}
-    if _db:
-        try:
-            from models import CompanyConfig, DeliveryLocation
-            for c in _db.query(CompanyConfig).order_by(CompanyConfig.sort_order).all():
-                company_info[c.key] = c.value
-            loc = _db.query(DeliveryLocation).filter(DeliveryLocation.is_default == True).first()
-            if loc:
-                delivery_info = {
-                    "name": loc.name, "address": loc.address,
-                    "contact_person": loc.contact_person,
-                    "contact_phone": loc.contact_phone,
-                    "delivery_notes": loc.delivery_notes,
-                    "ship_name_label": loc.ship_name_label,
-                }
-        except Exception:
-            pass
-
     return {
         "order_id": order_id,
         "po_number": order_meta.get("po_number", ""),
@@ -541,8 +524,8 @@ def _build_order_data_for_engine(
         "destination_port": order_meta.get("destination_port") or order_meta.get("port_name", ""),
         "delivery_address": order_meta.get("delivery_address", ""),
         "voyage": order_meta.get("voyage", ""),
-        "company": company_info,
-        "delivery_location": delivery_info,
+        "company": company_info or {},
+        "delivery_location": delivery_info or {},
         "suppliers": {
             sid: {
                 "supplier_name": supplier_info.get("name", ""),
@@ -579,9 +562,13 @@ def _generate_single_supplier(
     # ── Stage 1: Data loading ──
     _db = SessionLocal()
     try:
-        # Supplier info
+        # Supplier info — query ALL fields that templates may reference
         row = _db.execute(
-            sa_text("SELECT name, contact, email, phone FROM suppliers WHERE id = :sid"),
+            sa_text(
+                "SELECT name, contact, email, phone, fax, address, zip_code,"
+                " default_payment_method, default_payment_terms"
+                " FROM suppliers WHERE id = :sid"
+            ),
             {"sid": supplier_id},
         ).fetchone()
         supplier_info = {
@@ -589,6 +576,11 @@ def _generate_single_supplier(
             "contact": row[1] or "" if row else "",
             "email": row[2] or "" if row else "",
             "phone": row[3] or "" if row else "",
+            "fax": row[4] or "" if row else "",
+            "address": row[5] or "" if row else "",
+            "zip_code": row[6] or "" if row else "",
+            "default_payment_method": row[7] or "" if row else "",
+            "default_payment_terms": row[8] or "" if row else "",
         }
 
         # Port/country enrichment
@@ -615,6 +607,25 @@ def _generate_single_supplier(
                 ).fetchone()
                 if c_row:
                     enriched_meta.update({"country_name": c_row[0] or "", "country_code": c_row[1] or ""})
+
+        # Pre-fetch company config + delivery location (before closing DB)
+        _prefetched_company = {}
+        _prefetched_delivery = {}
+        try:
+            from models import CompanyConfig, DeliveryLocation
+            for c in _db.query(CompanyConfig).order_by(CompanyConfig.sort_order).all():
+                _prefetched_company[c.key] = c.value
+            loc = _db.query(DeliveryLocation).filter(DeliveryLocation.is_default == True).first()
+            if loc:
+                _prefetched_delivery = {
+                    "name": loc.name, "address": loc.address,
+                    "contact_person": loc.contact_person,
+                    "contact_phone": loc.contact_phone,
+                    "delivery_notes": loc.delivery_notes,
+                    "ship_name_label": loc.ship_name_label,
+                }
+        except Exception:
+            pass
 
         # ── Stage 2: Template resolution + parse ──
         all_templates = _db.query(SupplierTemplate).all()
@@ -678,7 +689,8 @@ def _generate_single_supplier(
 
             # Build order_data for engine (reuses prepare_inquiry_workspace data structure)
             engine_order_data = _build_order_data_for_engine(
-                order_id, enriched_meta, supplier_id, products, supplier_info, _db=None,
+                order_id, enriched_meta, supplier_id, products, supplier_info,
+                company_info=_prefetched_company, delivery_info=_prefetched_delivery,
             )
 
             # Load user field overrides if any
@@ -1150,6 +1162,21 @@ def _save_workbook(
         "inquiries", filename, excel_bytes,
         content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    # Also save to session workspace so agent's bash tool can access/modify the file
+    # (DeerFlow pattern: all tools share the same persistent directory per thread)
+    if stream_key:
+        try:
+            import os
+            from config import settings
+            ws_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, stream_key)
+            os.makedirs(ws_dir, exist_ok=True)
+            ws_path = os.path.join(ws_dir, filename)
+            with open(ws_path, "wb") as f:
+                f.write(excel_bytes)
+            logger.info("Saved inquiry to workspace: %s", ws_path)
+        except Exception as e:
+            logger.warning("Failed to save inquiry to workspace: %s", e)
 
     # Save preview HTML
     preview_filename = filename.replace(".xlsx", ".html")

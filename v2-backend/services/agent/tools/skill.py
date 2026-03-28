@@ -9,6 +9,17 @@ Two trigger methods:
 
 from pathlib import Path
 from services.agent.tool_context import _expand_template
+from services.tools.registry_loader import ToolMetaInfo
+
+TOOL_META = {
+    "use_skill": ToolMetaInfo(
+        display_name="使用技能",
+        group="skill",
+        description="调用可复用的 prompt 模板技能",
+        prompt_description="调用技能模板",
+        summary="调用技能",
+    ),
+}
 
 
 def register(registry, ctx=None):
@@ -19,18 +30,17 @@ def register(registry, ctx=None):
 
     @registry.tool(
         description=(
-            "Invoke a reusable skill (prompt template) by name. "
-            "Skills provide domain-specific instructions and workflows. "
-            "Use `list_skills` argument pattern or check system prompt for available skills."
+            "调用可复用的技能模板。技能提供特定场景的工作流指令（如数据上传、询价生成）。"
+            "查看系统 prompt 中的 Available Skills 获取可用技能列表。"
         ),
         parameters={
             "skill_name": {
                 "type": "STRING",
-                "description": "Name of the skill to invoke (e.g. 'code-review')",
+                "description": "技能名称（如 'query-data'、'generate-inquiry'）",
             },
             "arguments": {
                 "type": "STRING",
-                "description": "Arguments to substitute into the skill template ($ARGUMENTS placeholder)",
+                "description": "传给技能模板的参数（替换 $ARGUMENTS 占位符）",
                 "required": False,
             },
         },

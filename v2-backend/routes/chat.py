@@ -17,7 +17,7 @@ from datetime import datetime
 from queue import Empty
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Form, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
 
@@ -106,227 +106,56 @@ def _load_skills_into_ctx(db: DBSession, ctx):
             ctx.skills.pop(s.name, None)
 
 
-_SCENARIO_PROMPTS = {
-    "data_upload": """你是 CruiseAgent，正在帮助用户上传产品数据（报价单/价格表）。
-
-## 上传模板
-如果用户询问模板或格式要求，告知可以下载模板文件：
-- 下载地址：/uploads/product_upload_template.xlsx
-- 模板包含 16 列（product_name、country_id、category_id 等），第二个 sheet 有参考表可查 ID
-- 必填字段：product_name、country_id、category_id、effective_from
-
-## 流程
-1. parse_file 解析文件
-2. analyze_columns 分析未映射列（检测 supplier_id/country_id 等引用列）
-3. 确认国家、港口、供应商、生效日期
-4. prepare_upload 一键验证+审计+预览（传入所有参数）
-5. 用户确认后 execute_upload
-6. 如有错误可用 rollback_batch 回滚
-
-## 规则
-- parse_file 后必须立即调用 analyze_columns
-- 必须在 prepare_upload 之前确认国家、港口、生效日期
-- prepare_upload 返回卡片后等待用户确认，不要主动执行
-- 如有缺失供应商/国家，用 create_references 创建后再调用 prepare_upload
-- 简短回复，不要重复卡片已展示的信息""",
-
-    "query": """你是 CruiseAgent，正在帮助用户查询数据。
-
-## 能力
-你可以查询数据库获取产品、供应商、订单、国家、港口等信息。
-
-## 重要数据表
-- products: 产品主数据库（品名、价格、供应商、国家、港口等）
-- v2_orders: 上传的订单（含产品列表、匹配结果）
-- countries / ports: 国家和港口
-- suppliers: 供应商
-- categories: 产品分类
-
-## 规则
-- 先用 get_db_schema 了解表结构，再用 query_db 查询
-- 只允许 SELECT 查询
-- 查询结果用 markdown 表格格式展示
-- 数值字段保留合理精度，价格保留2位小数
-- 「按X统计」意味着 GROUP BY，不是 ORDER BY + LIMIT
-- 结果太多只展示关键信息并说明总数""",
-
-    "order_management": """你是 CruiseAgent，正在帮助用户管理订单。
-
-## 能力
-- 查看订单概览：get_order_overview
-- 查询订单详情：query_db
-- 为订单生成询价单：generate_order_inquiry
-
-## 重要数据表
-- v2_orders: 订单表（order_metadata, products, match_results 是 JSON 字段）
-- products: 产品匹配参考
-
-## 规则
-- v2_orders 中 JSON 字段使用 PostgreSQL JSON 操作符查询
-- 查询结果用 markdown 表格展示
-- 生成询价单前先确认订单ID""",
-
-    "fulfillment": """你是 CruiseAgent，正在帮助用户管理订单履约。
-
-## 履约周期
-pending → inquiry_sent → quoted → confirmed → delivering → delivered → invoiced → paid
-
-## 可用工具
-- get_order_fulfillment: 查看履约状态
-- update_order_fulfillment: 更新状态和财务信息
-- record_delivery_receipt: 记录交货验收（逐产品接收/拒收）
-- attach_order_file: 上传交货照片/发票扫描件
-
-## 规则
-- 理解自然语言意图（如"订单已交货"→update状态为delivered）
-- 执行重要操作前调用 request_confirmation""",
-}
-
-
 def _build_system_prompt(enabled_tools: set[str] | None, ctx,
-                         scenario: str | None = None) -> str:
-    """Build the chat system prompt with dynamic tool list.
+                         scenario: str | None = None,
+                         registered_tool_names: set[str] | None = None) -> str:
+    """Build the chat system prompt using layered prompt assembly."""
+    from services.agent.prompts import build_chat_prompt, PromptContext
 
-    If *scenario* is given and matches a key in _SCENARIO_PROMPTS, use the
-    lightweight scenario-specific prompt instead of the full generic prompt.
-    """
-    # Determine which tools to list
-    if enabled_tools is None:
-        tool_section = """## 可用工具
-- get_db_schema: 获取数据库表结构
-- query_db(sql): 执行只读 SQL 查询
-- think(thought): 内部思考和规划
-- calculate(expression): 数学计算
-- get_current_time(): 获取当前时间
-- todo_write/todo_read: 任务清单管理
-- use_skill(skill_name): 调用技能模板"""
-    else:
-        tool_lines = []
-        tool_descs = {
-            "get_db_schema": "获取数据库表结构",
-            "query_db": "执行只读 SQL 查询",
-            "think": "内部思考和规划",
-            "calculate": "数学计算",
-            "get_current_time": "获取当前时间",
-            "todo_write": "创建/更新任务清单",
-            "todo_read": "读取任务清单",
-            "use_skill": "调用技能模板",
-            "web_fetch": "获取网页内容",
-            "web_search": "搜索网络获取最新信息（天气、新闻、实时数据等）",
-            "search_product_database": "按关键词搜索产品数据库",
-            "get_order_overview": "查看订单概览（基本信息、匹配、询价状态）",
-            "generate_order_inquiry": "为指定订单生成询价 Excel 文件",
-            "parse_file": "解析上传的 Excel/CSV 文件，创建暂存数据",
-            "analyze_columns": "分析未映射列（交叉比对 DB 参考表，检测 supplier_id/country_id 等）",
-            "resolve_and_validate": "验证暂存数据（代码匹配+LLM模糊匹配+置信度分级）",
-            "create_references": "自动创建缺失的供应商/国家等引用数据",
-            "preview_changes": "生成变更预览报告（新增/更新/异常/无变化）",
-            "execute_upload": "确认后原子执行产品导入，写入变更日志",
-            "audit_data": "数据质量审计（检查列缺失、格式错误、重复数据、单位/价格合理性等）",
-            "prepare_upload": "一键准备上传（验证匹配+数据审计+变更预览，返回统一审查卡片）",
-            "rollback_batch": "回滚已完成的批次导入（删除新增、恢复更新产品原值）",
-            "get_order_fulfillment": "查看订单履约状态（交货、发票、付款）",
-            "update_order_fulfillment": "更新订单履约状态和财务信息",
-            "record_delivery_receipt": "记录港口交货验收（逐产品接收/拒收）",
-            "attach_order_file": "将上传的图片/文件附加到订单",
-            "request_confirmation": "请求用户确认（重要操作前必须调用）",
-        }
-        for name in sorted(enabled_tools):
-            desc = tool_descs.get(name, name)
-            tool_lines.append(f"- {name}: {desc}")
-        tool_section = "## 可用工具\n" + "\n".join(tool_lines)
-
-    # Skills section
-    skill_summary = ctx.get_skill_list_summary()
-
-    # Scenario-specific prompt — lightweight, focused on one task
-    if scenario and scenario in _SCENARIO_PROMPTS:
-        base = _SCENARIO_PROMPTS[scenario]
-        return f"""{base}
-
-{tool_section}
-
-## 记忆
-你拥有完整的对话记忆。
-
-{skill_summary}"""
-
-    # No scenario → full generic prompt
-    return f"""你是 CruiseAgent，邮轮供应链管理助手。
-
-## 能力
-你可以查询数据库获取产品、供应商、订单、国家、港口等信息，回答业务相关问题。
-你还可以执行数学计算、获取当前时间、管理任务清单。
-
-## 记忆
-你拥有完整的对话记忆。你可以回忆本次会话中用户之前说过的所有内容。如果用户问你是否记得之前的对话，请确认你记得，并引用具体内容。
-
-{tool_section}
-
-## 重要数据表
-- v2_orders: 上传的订单（含产品列表、匹配结果、元数据等 JSON 字段）
-- products: 产品主数据库（品名、价格、供应商、国家、港口等）
-- countries / ports: 国家和港口
-- suppliers: 供应商
-- categories: 产品分类
-- v2_upload_batches: 产品数据上传批次（file_name, status, supplier_name, summary 等）
-- v2_staging_products: 暂存产品行（batch_id, product_name, price, match_result 等）
-- v2_product_changelog: 产品变更日志（product_id, batch_id, change_type, field_changes）
-
-## 规则
-- 需要数据时，先用 get_db_schema 了解表结构，再用 query_db 查询
-- 只允许 SELECT 查询，不能修改数据
-- 用中文简洁回答
-- 如果查询结果太多，只展示关键信息并说明总数
-- v2_orders 中 products/match_results/order_metadata 是 JSON 字段，使用 PostgreSQL JSON 操作符查询
-- 复杂任务可以用 todo_write 拆分步骤，逐步完成
-- 查询结果务必用 markdown 表格格式展示，不要用列表或纯文字罗列
-- 编写 SQL 时仔细分析用户意图：「按X统计」「不同X的Y」意味着需要 GROUP BY 或窗口函数（如 ROW_NUMBER() OVER (PARTITION BY ...)），而非简单 ORDER BY + LIMIT
-- 表格中数值字段保留合理精度，价格保留2位小数
-- 执行重要操作（删除数据、批量更新、不可逆变更）前，先调用 request_confirmation 获取用户授权
-- 调用 request_confirmation 后必须停止当前回合，等待用户确认或取消
-
-## 履约管理
-你可以管理订单的完整履约周期：
-- 查看/更新履约状态: pending → inquiry_sent → quoted → confirmed → delivering → delivered → invoiced → paid
-- 记录交货验收: 逐产品记录接收数量、拒收数量和原因
-- 附加文件: 上传交货照片、发票扫描件等到订单
-- 记录发票和付款信息
-
-用户可能用自然语言描述状态更新（如"订单已交货"、"土豆只收了500kg"），你需要理解意图并调用相应工具。
-
-## 产品上传模板
-如果用户询问上传模板或格式要求，告知可以下载模板：/uploads/product_upload_template.xlsx
-模板包含 16 列，必填：product_name、country_id、category_id、effective_from。第二个 sheet 有 ID 参考表。
-
-## 产品上传流程
-如果用户上传了 Excel 文件（报价单/价格表），你应该：
-1. 用 parse_file 解析文件（自动映射列、创建暂存数据）
-2. 用 analyze_columns 分析未映射列（检测是否有 supplier_id/country_id 等引用列）
-3. 根据分析结果和用户输入，确认国家、港口、供应商、生效日期
-4. 用 prepare_upload 一键验证+审计+预览（传入 supplier_name、country_name、port_name、effective_from、effective_to）
-5. 用户确认后 execute_upload（支持排除指定行号）
-6. 如有错误，可用 rollback_batch 回滚（传入 batch_id）
-注意：parse_file 后必须立即调用 analyze_columns。
-prepare_upload 返回卡片后等待用户确认。
-简短回复，不要重复卡片已展示的信息。
-{skill_summary}"""
+    prompt_ctx = PromptContext(
+        enabled_tools=enabled_tools,
+        skill_summary=ctx.get_skill_list_summary(),
+        scenario=scenario,
+        registered_tool_names=registered_tool_names,
+        memory_text=getattr(ctx, 'memory_text', ''),  # DeerFlow: memory injection
+    )
+    return build_chat_prompt(prompt_ctx)
 
 
 def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None = None,
-                       scenario: str | None = None):
-    """Create a ReAct agent configured for chat with general-purpose + query tools."""
+                       scenario: str | None = None, user_role: str = "employee",
+                       user_id: int | None = None):
+    """Create a ReAct agent configured for chat with general-purpose + query tools.
+
+    DeerFlow 2.0 aligned middleware chain (16 middlewares → 10 for our use case):
+      1. MemoryMiddleware       — before_agent: load memories; after_agent: extract
+      2. SqlReadOnlyHook        — before_tool: block write SQL
+      3. GuardrailMiddleware    — before_tool: enhanced bash + indirect exec blocking
+      4. SubagentLimitMiddleware— after_model: cap concurrent delegates; before_tool: block recursion
+      5. ClarificationMiddleware— after_tool: intercept ask_clarification → HITL pause
+      6. ErrorRecoveryMiddleware— after_tool: consecutive error tracking
+      7. OutputSanitizationHook — after_tool: redact PII
+      8. SummarizationMiddleware— after_model/before_model: flag for context compact
+      9. LoopDetectionMiddleware— after_model: detect and break loops (LAST model hook)
+    """
     from services.agent.config import LLMConfig
-    from services.agent.llm.gemini_provider import GeminiProvider
     from services.agent.chat_storage import ChatStorage
     from services.agent.tool_context import ToolContext
     from services.agent.engine import ReActAgent
     from services.tools import create_chat_registry
     from config import settings
 
-    # Provider
-    llm_config = LLMConfig(api_key=settings.GOOGLE_API_KEY)
-    provider = GeminiProvider(llm_config)
+    # Provider — Kimi K2.5 (93% tool calling accuracy, OpenAI-compatible)
+    # Fallback to Gemini if no MOONSHOT_API_KEY configured
+    moonshot_key = getattr(settings, 'MOONSHOT_API_KEY', '') or os.getenv('MOONSHOT_API_KEY', '')
+    if moonshot_key:
+        from services.agent.llm.kimi_provider import KimiProvider
+        llm_config = LLMConfig(provider="kimi", model_name="kimi-k2.5", api_key=moonshot_key)
+        provider = KimiProvider(llm_config)
+    else:
+        from services.agent.llm.gemini_provider import GeminiProvider
+        llm_config = LLMConfig(api_key=settings.GOOGLE_API_KEY)
+        provider = GeminiProvider(llm_config)
 
     # Storage (uses AgentSession/AgentMessage)
     storage = ChatStorage(db)
@@ -334,16 +163,114 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     # Load enabled tools from DB
     enabled_tools = _load_enabled_tools(db)
 
+    # Workspace for generated files (bash tool defaults cwd here)
+    workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
+    os.makedirs(workspace_dir, exist_ok=True)
+
+    # Restore persisted files from Supabase (e.g., after server restart)
+    try:
+        from services.workspace_manager import restore_workspace
+        restored = restore_workspace(session_id, workspace_dir)
+        if restored:
+            logger.info("Restored %d file(s) for session %s: %s",
+                         len(restored), session_id, restored)
+    except Exception as e:
+        logger.debug("Workspace restore skipped: %s", e)
+
     # Tools — general-purpose + business query tools
-    ctx = ToolContext(db=db, file_bytes=file_bytes, pipeline_session_id=session_id)
+    ctx = ToolContext(db=db, file_bytes=file_bytes, pipeline_session_id=session_id,
+                      workspace_dir=workspace_dir,
+                      user_id=user_id, session_id=session_id)
+
+    # Tracer: token + tool performance tracking
+    from services.agent.tracer import AgentTracer
+    ctx.tracer = AgentTracer(db, session_id)
 
     # Load skills from DB + filesystem
     _load_skills_into_ctx(db, ctx)
 
-    registry = create_chat_registry(ctx, enabled_tools=enabled_tools)
+    # DeerFlow-aligned: ALL tools always registered, scenario only affects prompt
+    # No more tool whitelist filtering — tools never "disappear"
+    registry = create_chat_registry(ctx)
 
-    # Build dynamic system prompt
-    system_prompt = _build_system_prompt(enabled_tools, ctx, scenario=scenario)
+    # Role-based permissions
+    if user_role == "employee":
+        registry.set_permissions([
+            {"tool": "bash", "permission": "deny"},
+            {"tool": "execute_upload", "permission": "deny"},
+            {"tool": "*", "permission": "allow"},
+        ])
+    elif user_role == "admin":
+        registry.set_permissions([
+            {"tool": "bash", "permission": "deny"},
+            {"tool": "*", "permission": "allow"},
+        ])
+    # superadmin: default all allow
+
+    # ─── Middleware chain (DeerFlow 2.0 aligned, order-dependent) ───
+    from services.agent.hooks import MiddlewareChain, SqlReadOnlyHook, OutputSanitizationHook
+    from services.agent.middlewares.memory import MemoryMiddleware
+    from services.agent.middlewares.guardrail import GuardrailMiddleware, DefaultGuardrailProvider
+    from services.agent.middlewares.subagent_limit import SubagentLimitMiddleware
+    from services.agent.middlewares.clarification import ClarificationMiddleware
+    from services.agent.middlewares.error_recovery import ErrorRecoveryMiddleware
+    from services.agent.middlewares.summarization import SummarizationMiddleware
+    from services.agent.middlewares.loop_detection import LoopDetectionMiddleware
+    from services.agent.middlewares.completion_verification import CompletionVerificationMiddleware
+    from services.agent.middlewares.workspace_state import WorkspaceStateMiddleware
+
+    # Memory provider factory — uses same provider as main agent (lightweight call)
+    def _memory_provider_factory():
+        from services.agent.config import LLMConfig as _LC, create_provider as _cp
+        _moonshot = getattr(settings, 'MOONSHOT_API_KEY', '') or os.getenv('MOONSHOT_API_KEY', '')
+        if _moonshot:
+            _cfg = _LC(provider="kimi", model_name="kimi-k2.5", api_key=_moonshot,
+                        thinking_budget=0)
+        else:
+            _cfg = _LC(model_name="gemini-2.0-flash", api_key=settings.GOOGLE_API_KEY,
+                        thinking_budget=0)
+        return _cp(_cfg)
+
+    hooks = MiddlewareChain([
+        # 0. Workspace state: inject file listing before every LLM call
+        #    (DeerFlow UploadsMiddleware pattern — filesystem as ground truth)
+        WorkspaceStateMiddleware(),
+        # 1. Memory: load before agent, extract after agent
+        MemoryMiddleware(provider_factory=_memory_provider_factory),
+        # 2. SQL safety
+        SqlReadOnlyHook(),
+        # 3. Enhanced guardrails (replaces BashGuardrailHook with indirect exec detection)
+        GuardrailMiddleware(DefaultGuardrailProvider()),
+        # 4. Sub-agent governance: concurrency cap + recursion block
+        SubagentLimitMiddleware(max_concurrent=3),
+        # 5. Clarification: intercept ask_clarification → HITL pause
+        ClarificationMiddleware(),
+        # 6. Error recovery
+        ErrorRecoveryMiddleware(),
+        # 7. PII sanitization
+        OutputSanitizationHook(),
+        # 8. Summarization: flag for context compact
+        SummarizationMiddleware(token_threshold=80000, message_threshold=40),
+        # 9. Loop detection (must see final response state)
+        LoopDetectionMiddleware(),
+        # 10. Completion verification (LAST — checks final answer for fabrication)
+        CompletionVerificationMiddleware(),
+    ])
+    registry.set_hooks(hooks)
+    registry.set_ctx(ctx)
+
+    # Build dynamic system prompt AFTER registry (knows registered_tool_names)
+    # DeerFlow: inject memory into prompt context
+    system_prompt = _build_system_prompt(
+        None, ctx, scenario=scenario,
+        registered_tool_names=set(registry.names()),
+    )
+
+    # Compact threshold: adapt to model's context window
+    # Anthropic: compact at ~80% capacity, not a fixed number
+    # Kimi K2.5: 128K context → 100K threshold (78%)
+    # Gemini:    1M context   → 80K threshold (8%, conservative)
+    compact_threshold = 100_000 if moonshot_key else 80_000
 
     # Agent
     agent = ReActAgent(
@@ -353,10 +280,11 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
         ctx=ctx,
         pipeline_session_id=session_id,
         system_prompt=system_prompt,
-        max_turns=10,
+        max_turns=25,
         thinking_budget=2048,
         verbose=True,
     )
+    agent._compact_threshold = compact_threshold
 
     return agent
 
@@ -528,6 +456,15 @@ async def send_message(
         file_url = storage.upload("chat", safe_name, file_content)
         file_bytes = file_content
 
+        # Bridge: save uploaded file to workspace so Agent's bash can access it
+        from config import settings
+        ws_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
+        os.makedirs(ws_dir, exist_ok=True)
+        ws_path = os.path.join(ws_dir, file.filename)
+        with open(ws_path, "wb") as wf:
+            wf.write(file_content)
+        logger.info("Uploaded file saved to workspace: %s", ws_path)
+
     # Record the current max display message ID (baseline for SSE)
     from sqlalchemy import func
     last_id = db.query(func.max(AgentMessage.id)).filter(
@@ -557,12 +494,42 @@ async def send_message(
     cancel_event = get_or_create_cancel_event(session_id)
     cancel_event.clear()  # Reset in case previous run left it set
 
-    # Launch agent in background thread
+    # Inject uploaded file context into user message so Agent knows about it
+    agent_message = content
+    if file and file.filename:
+        agent_message = f"[用户上传了文件: {file.filename}，已保存到工作目录]\n\n{content}"
+
+    # Extract user role for permission control
+    user_role = getattr(current_user, "role", "employee") or "employee"
+
+    # Auto-detect intent — with session-level persistence
+    # Anthropic pattern: scenario context survives HITL pause/resume
+    resolved_scenario = scenario.strip() or None
+    if not resolved_scenario:
+        from services.agent.scenarios import detect_intent
+        resolved_scenario = detect_intent(content, has_file=bool(file_bytes))
+
+    # If no scenario detected, inherit from session (HITL resume, follow-up messages)
+    if not resolved_scenario:
+        prev_ctx = session.context_data or {}
+        resolved_scenario = prev_ctx.get("last_scenario")
+
+    # Persist scenario to session for future messages
+    if resolved_scenario:
+        from sqlalchemy.orm.attributes import flag_modified
+        ctx_data = session.context_data or {}
+        ctx_data["last_scenario"] = resolved_scenario
+        session.context_data = ctx_data
+        flag_modified(session, "context_data")
+        db.commit()
+
+    # Launch agent in background thread (pass user_id for memory system)
     threading.Thread(
         target=_run_chat_agent,
-        args=(session_id, content),
-        kwargs={"file_bytes": file_bytes, "scenario": scenario.strip() or None,
-                "cancel_event": cancel_event},
+        args=(session_id, agent_message),
+        kwargs={"file_bytes": file_bytes, "scenario": resolved_scenario,
+                "cancel_event": cancel_event, "user_role": user_role,
+                "user_id": current_user.id},
         daemon=True,
     ).start()
 
@@ -676,11 +643,14 @@ async def stream_messages(
 
 
 def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None = None,
-                    scenario: str | None = None, cancel_event=None):
+                    scenario: str | None = None, cancel_event=None,
+                    user_role: str = "employee", user_id: int | None = None):
     """Background thread: run ReAct agent with independent DB session."""
     db = SessionLocal()
     try:
-        agent = _create_chat_agent(session_id, db, file_bytes=file_bytes, scenario=scenario)
+        agent = _create_chat_agent(session_id, db, file_bytes=file_bytes,
+                                   scenario=scenario, user_role=user_role,
+                                   user_id=user_id)
         if cancel_event:
             agent.ctx.cancel_event = cancel_event
         agent.run(user_message)
@@ -720,6 +690,34 @@ def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None
         except Exception:
             db.rollback()
     finally:
+        # Sync workspace files to Supabase Storage (best-effort)
+        workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
+        try:
+            from services.workspace_manager import sync_workspace
+            synced = sync_workspace(session_id, workspace_dir)
+            if synced:
+                logger.info("Synced %d workspace file(s) for session %s", len(synced), session_id)
+        except Exception as e:
+            logger.debug("Workspace sync skipped: %s", e)
+
+        # Save referenced order IDs to session context (for artifact panel)
+        try:
+            if agent.ctx.referenced_order_ids:
+                _session = db.query(AgentSession).filter(AgentSession.id == session_id).first()
+                if _session:
+                    ctx_data = dict(_session.context_data or {})
+                    existing = set(ctx_data.get("referenced_order_ids", []))
+                    existing.update(agent.ctx.referenced_order_ids)
+                    ctx_data["referenced_order_ids"] = sorted(existing)
+                    _session.context_data = ctx_data
+                    db.commit()
+        except Exception as e:
+            logger.debug("Save referenced orders skipped: %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
         # Mark session as active (done processing)
         try:
             session = db.query(AgentSession).filter(AgentSession.id == session_id).first()
@@ -763,6 +761,270 @@ def cancel_agent(
     return {"status": "cancelled"}
 
 
+# ─── File Download ────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/files/{filename}")
+def download_file(
+    session_id: str,
+    filename: str,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Download a generated file from the session workspace."""
+    # Security: reject path traversal
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "无效的文件名")
+
+    # Verify session ownership
+    session = db.query(AgentSession).filter(
+        AgentSession.id == session_id,
+        AgentSession.user_id == current_user.id,
+    ).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+
+    filepath = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id, filename)
+
+    # Determine media type
+    ext = os.path.splitext(filename)[1].lower()
+    media_types = {
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".csv": "text/csv",
+        ".pdf": "application/pdf",
+    }
+    media_type = media_types.get(ext, "application/octet-stream")
+
+    from urllib.parse import quote
+    encoded = quote(filename)
+
+    # Try local workspace first
+    if os.path.isfile(filepath):
+        return FileResponse(
+            filepath,
+            media_type=media_type,
+            filename=filename,
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
+            },
+        )
+
+    # Fallback: download from Supabase Storage (inquiry files are stored there)
+    try:
+        from services.file_storage import storage
+        # Try common storage paths where inquiry files are uploaded
+        for prefix in ("inquiries", "chat"):
+            try:
+                content = storage.download(f"{prefix}/{filename}")
+                from fastapi.responses import Response
+                return Response(
+                    content=content,
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
+                    },
+                )
+            except (FileNotFoundError, Exception):
+                continue
+    except Exception:
+        pass
+
+    raise HTTPException(404, "文件不存在")
+
+
+# ─── Workspace Files ─────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/files")
+def list_workspace_files(
+    session_id: str,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """List all files in the session workspace."""
+    session = db.query(AgentSession).filter(
+        AgentSession.id == session_id,
+        AgentSession.user_id == current_user.id,
+    ).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+
+    workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
+    try:
+        from services.workspace_manager import list_workspace_files as _list_files
+        return _list_files(session_id, workspace_dir)
+    except Exception:
+        return []
+
+
+# ─── Unified Artifacts ────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/artifacts")
+def list_session_artifacts(
+    session_id: str,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """List all artifacts for a session — workspace files + order inquiry files.
+
+    Returns a unified list with source-aware download URLs.
+    """
+    session = db.query(AgentSession).filter(
+        AgentSession.id == session_id,
+        AgentSession.user_id == current_user.id,
+    ).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+
+    artifacts = []
+
+    # 1. Workspace files (local + synced)
+    workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
+    try:
+        from services.workspace_manager import list_workspace_files as _list_files
+        ws_files = _list_files(session_id, workspace_dir)
+        for f in ws_files:
+            if f.get("is_output"):
+                artifacts.append({
+                    "id": f"ws:{f['filename']}",
+                    "filename": f["filename"],
+                    "source": "workspace",
+                    "size": f.get("size", 0),
+                    "modified_at": f.get("modified_at", 0),
+                    "order_id": None,
+                    "supplier_name": None,
+                    "product_count": None,
+                })
+    except Exception:
+        pass
+
+    # 2. Order inquiry files from referenced orders
+    ctx_data = session.context_data or {}
+    order_ids = ctx_data.get("referenced_order_ids", [])
+
+    if order_ids:
+        from models import Order
+        orders = db.query(Order).filter(Order.id.in_(order_ids)).all()
+
+        # Load supplier names in bulk
+        supplier_ids = set()
+        for order in orders:
+            for f in (order.inquiry_data or {}).get("generated_files", []):
+                sid = f.get("supplier_id")
+                if sid:
+                    supplier_ids.add(sid)
+
+        supplier_names = {}
+        if supplier_ids:
+            import sqlalchemy
+            rows = db.execute(
+                sqlalchemy.text("SELECT id, name FROM suppliers WHERE id = ANY(:ids)"),
+                {"ids": list(supplier_ids)},
+            ).fetchall()
+            supplier_names = {r[0]: r[1] for r in rows}
+
+        for order in orders:
+            inquiry = order.inquiry_data or {}
+            for f in inquiry.get("generated_files", []):
+                filename = f.get("filename")
+                if not filename:
+                    continue
+                sid = f.get("supplier_id")
+                artifacts.append({
+                    "id": f"order:{order.id}:{filename}",
+                    "filename": filename,
+                    "source": "order_inquiry",
+                    "size": 0,
+                    "modified_at": 0,
+                    "order_id": order.id,
+                    "supplier_name": supplier_names.get(sid, f"供应商 #{sid}" if sid else None),
+                    "product_count": f.get("product_count"),
+                })
+
+    return artifacts
+
+
+@router.get("/sessions/{session_id}/artifacts/download")
+def download_artifact(
+    session_id: str,
+    artifact_id: str = Query(..., description="Artifact ID: ws:filename or order:id:filename"),
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Download an artifact by ID — unified proxy for workspace and order files."""
+    session = db.query(AgentSession).filter(
+        AgentSession.id == session_id,
+        AgentSession.user_id == current_user.id,
+    ).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+
+    parts = artifact_id.split(":", 2)
+    source = parts[0]
+
+    if source == "ws" and len(parts) >= 2:
+        # Workspace file — serve from local filesystem
+        filename = parts[1]
+        safe = os.path.basename(filename)
+        filepath = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id, safe)
+        if not os.path.isfile(filepath):
+            raise HTTPException(404, "文件不存在")
+        ext = os.path.splitext(safe)[1].lower()
+        media_types = {
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".xls": "application/vnd.ms-excel",
+            ".csv": "text/csv",
+            ".pdf": "application/pdf",
+        }
+        from urllib.parse import quote
+        return FileResponse(
+            filepath,
+            media_type=media_types.get(ext, "application/octet-stream"),
+            filename=safe,
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(safe)}"},
+        )
+
+    elif source == "order" and len(parts) >= 3:
+        # Order inquiry file — serve from Supabase storage
+        try:
+            order_id = int(parts[1])
+        except ValueError:
+            raise HTTPException(400, "无效的 artifact_id")
+        filename = parts[2]
+
+        # Verify order is referenced by this session
+        ctx_data = session.context_data or {}
+        if order_id not in (ctx_data.get("referenced_order_ids") or []):
+            raise HTTPException(403, "该订单未在此会话中引用")
+
+        from models import Order
+        order = db.query(Order).filter(Order.id == order_id).first()
+        if not order:
+            raise HTTPException(404, "订单不存在")
+
+        inquiry = order.inquiry_data or {}
+        files = inquiry.get("generated_files", [])
+        file_entry = next((f for f in files if f.get("filename") == filename), None)
+        if not file_entry:
+            raise HTTPException(404, "文件不存在")
+
+        file_url = file_entry.get("file_url", filename)
+        try:
+            from services.file_storage import storage
+            content = storage.download(file_url)
+        except FileNotFoundError:
+            raise HTTPException(404, "文件已丢失")
+
+        from fastapi.responses import Response
+        safe = os.path.basename(filename)
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{safe}"'},
+        )
+
+    raise HTTPException(400, "无效的 artifact_id 格式")
+
+
 # ─── Context Compaction ──────────────────────────────────────
 
 @router.post("/sessions/{session_id}/compact")
@@ -793,3 +1055,172 @@ def compact_session(
     except Exception as e:
         logger.error("Compact error for session %s: %s", session_id, str(e), exc_info=True)
         raise HTTPException(500, f"压缩失败: {str(e)}")
+
+
+# ─── Session Stats ────────────────────────────────────────────
+
+@router.get("/sessions/{session_id}/stats")
+def get_session_stats(
+    session_id: str,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Get token usage and tool performance stats for a session."""
+    session = db.query(AgentSession).filter(
+        AgentSession.id == session_id,
+        AgentSession.user_id == current_user.id,
+    ).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+
+    from services.agent.tracer import AgentTracer
+    tracer = AgentTracer(db, session_id)
+    stats = tracer.get_session_stats()
+    # Also include the accumulated token_usage from session record
+    stats["session_token_usage"] = session.token_usage or {}
+    return stats
+
+
+# ─── Memory Management ──────────────────────────────────────
+
+class MemoryUpdate(BaseModel):
+    memory_type: str | None = None
+    key: str | None = None
+    value: str | None = None
+
+
+class MemoryCreate(BaseModel):
+    memory_type: str = "fact"
+    key: str
+    value: str
+
+
+@router.get("/memories")
+def list_memories(
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """List all memories for the current user."""
+    from models import AgentMemory
+    memories = (
+        db.query(AgentMemory)
+        .filter(AgentMemory.user_id == current_user.id)
+        .order_by(AgentMemory.updated_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": m.id,
+            "memory_type": m.memory_type,
+            "key": m.key,
+            "value": m.value,
+            "source_session_id": m.source_session_id,
+            "access_count": m.access_count,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+        }
+        for m in memories
+    ]
+
+
+@router.post("/memories")
+def create_memory(
+    body: MemoryCreate,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Manually create a memory entry."""
+    from models import AgentMemory
+
+    valid_types = {"user_preference", "supplier_knowledge", "workflow_pattern", "fact"}
+    if body.memory_type not in valid_types:
+        raise HTTPException(400, f"无效的记忆类型。可选: {', '.join(valid_types)}")
+
+    # Upsert: if same type+key exists, update value
+    existing = db.query(AgentMemory).filter(
+        AgentMemory.user_id == current_user.id,
+        AgentMemory.memory_type == body.memory_type,
+        AgentMemory.key == body.key,
+    ).first()
+
+    if existing:
+        existing.value = body.value
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(existing)
+        return {"id": existing.id, "action": "updated"}
+
+    mem = AgentMemory(
+        user_id=current_user.id,
+        memory_type=body.memory_type,
+        key=body.key,
+        value=body.value,
+    )
+    db.add(mem)
+    db.commit()
+    db.refresh(mem)
+    return {"id": mem.id, "action": "created"}
+
+
+@router.put("/memories/{memory_id}")
+def update_memory(
+    memory_id: int,
+    body: MemoryUpdate,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Update an existing memory entry."""
+    from models import AgentMemory
+    mem = db.query(AgentMemory).filter(
+        AgentMemory.id == memory_id,
+        AgentMemory.user_id == current_user.id,
+    ).first()
+    if not mem:
+        raise HTTPException(404, "记忆不存在")
+
+    if body.memory_type is not None:
+        valid_types = {"user_preference", "supplier_knowledge", "workflow_pattern", "fact"}
+        if body.memory_type not in valid_types:
+            raise HTTPException(400, f"无效的记忆类型。可选: {', '.join(valid_types)}")
+        mem.memory_type = body.memory_type
+    if body.key is not None:
+        mem.key = body.key
+    if body.value is not None:
+        mem.value = body.value
+
+    mem.updated_at = datetime.utcnow()
+    db.commit()
+    return {"detail": "已更新"}
+
+
+@router.delete("/memories/{memory_id}")
+def delete_memory(
+    memory_id: int,
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Delete a memory entry."""
+    from models import AgentMemory
+    mem = db.query(AgentMemory).filter(
+        AgentMemory.id == memory_id,
+        AgentMemory.user_id == current_user.id,
+    ).first()
+    if not mem:
+        raise HTTPException(404, "记忆不存在")
+    db.delete(mem)
+    db.commit()
+    return {"detail": "已删除"}
+
+
+@router.delete("/memories")
+def clear_all_memories(
+    current_user: User = Depends(require_chat_user),
+    db: DBSession = Depends(get_db),
+):
+    """Clear all memories for the current user."""
+    from models import AgentMemory
+    count = db.query(AgentMemory).filter(
+        AgentMemory.user_id == current_user.id
+    ).delete()
+    db.commit()
+    return {"detail": f"已清除 {count} 条记忆"}

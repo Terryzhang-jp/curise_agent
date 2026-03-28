@@ -188,9 +188,9 @@ gcloud run deploy v2-cruise-backend \
   --region asia-northeast1 \
   --env-vars-file env_vars.yaml \
   --allow-unauthenticated \
-  --memory 1Gi \
+  --memory 3Gi \
   --timeout 300 \
-  --max-instances 3
+  --max-instances 4
 ```
 
 #### 参数说明

@@ -14,6 +14,11 @@ import {
   startGenerateInquirySingleSupplier,
   streamInquiryProgressWithKey,
   getInquiryPreview,
+  getInquiryDataPreview,
+  saveInquiryFieldOverrides,
+  getInquiryReadiness,
+  type InquiryDataPreview,
+  type InquiryReadiness,
   updateOrder,
   rematchOrder,
   downloadOrderFile,
@@ -21,7 +26,6 @@ import {
   type OrderStatus,
   type OrderProduct,
   type InquiryStep,
-  type InquiryData,
   type FulfillmentStatus,
   type DeliveryEnvironment,
 } from "@/lib/orders-api";
@@ -1446,30 +1450,146 @@ function InquiryTab({
   onGenerateAll?: (templateOverrides?: Record<number, number | null>) => void;
   inquiryGenerating?: boolean;
 }) {
-  const inquiry = order.inquiry_data;
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const [previewSupplierId, setPreviewSupplierId] = useState<number | null>(null);
   const [previewHtml, setPreviewHtml] = useState<string>("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [allTemplates, setAllTemplates] = useState<SupplierTemplate[]>([]);
   const [templateOverrides, setTemplateOverrides] = useState<Record<number, number | null>>({});
   const [expandedSupplierId, setExpandedSupplierId] = useState<number | null>(null);
+  const [dataPreview, setDataPreview] = useState<InquiryDataPreview | null>(null);
+  const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
+  const [dataPreviewOpen, setDataPreviewOpen] = useState(false);
+  const [fieldEdits, setFieldEdits] = useState<Record<string, string>>({});
+  const [fieldEditsDirty, setFieldEditsDirty] = useState(false);
+  const [savingOverrides, setSavingOverrides] = useState(false);
+  const [confirmGenerateOpen, setConfirmGenerateOpen] = useState(false);
+
+  // ── Readiness data (primary data source) ──
+  const [readiness, setReadiness] = useState<InquiryReadiness | null>(null);
+  const [readinessLoading, setReadinessLoading] = useState(false);
+  const prevGeneratingRef = useRef(false);
+
+  // ── Inline gap editing: per-supplier override values + debounce timers ──
+  const [inlineOverrides, setInlineOverrides] = useState<Record<number, Record<string, string>>>({});
+  const [inlineSaving, setInlineSaving] = useState<Record<number, boolean>>({});
+  const saveTimerRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
+  // Ref keeps latest overrides accessible inside stale closures (setTimeout)
+  const inlineOverridesRef = useRef(inlineOverrides);
+  inlineOverridesRef.current = inlineOverrides;
+
+  const loadReadiness = useCallback(async () => {
+    setReadinessLoading(true);
+    try {
+      const data = await getInquiryReadiness(order.id);
+      setReadiness(data);
+    } catch {
+      // Silently fail — readiness is supplementary
+    } finally {
+      setReadinessLoading(false);
+    }
+  }, [order.id]);
 
   useEffect(() => {
     listSupplierTemplates().then(setAllTemplates).catch(() => {});
   }, []);
 
-  if (!inquiry) return null;
+  useEffect(() => {
+    if (order.match_results && order.match_results.length > 0) {
+      loadReadiness();
+    }
+  }, [order.id, order.match_results?.length, loadReadiness]);
 
-  const suppliers = inquiry.suppliers || {};
-  const supplierIds = Object.keys(suppliers).map(Number).sort((a, b) => a - b);
+  // Reload readiness once after generation completes (true → false transition)
+  useEffect(() => {
+    if (prevGeneratingRef.current && !inquiryGenerating) {
+      loadReadiness();
+    }
+    prevGeneratingRef.current = !!inquiryGenerating;
+  }, [inquiryGenerating, loadReadiness]);
 
-  // Compute totals
-  const totalProducts = supplierIds.reduce(
-    (sum, sid) => sum + (suppliers[String(sid)]?.product_count ?? 0),
-    0
-  );
-  const totalElapsed = inquiry.total_elapsed_seconds;
+  // Cleanup debounce timers on unmount
+  useEffect(() => {
+    return () => {
+      Object.values(saveTimerRef.current).forEach(clearTimeout);
+    };
+  }, []);
+
+  // Derive supplier list
+  const inquiry = order.inquiry_data;
+  const readinessSuppliers = readiness?.suppliers || {};
+  const readinessIds = Object.keys(readinessSuppliers).map(Number).sort((a, b) => a - b);
+  const displaySupplierIds = readinessIds.length > 0
+    ? readinessIds
+    : Object.keys(inquiry?.suppliers || {}).map(Number).sort((a, b) => a - b);
+
+  const totalProducts = displaySupplierIds.reduce((sum, sid) => {
+    const rd = readinessSuppliers[String(sid)];
+    return sum + (rd?.product_count ?? 0);
+  }, 0);
+  const totalElapsed = inquiry?.total_elapsed_seconds;
+  const summary = readiness?.summary;
+
+  // Completed files for "download all"
+  const completedFiles = useMemo(() => {
+    const files: { supplierId: number; filename: string }[] = [];
+    for (const sid of displaySupplierIds) {
+      const rd = readinessSuppliers[String(sid)];
+      if (rd?.file?.filename) {
+        files.push({ supplierId: sid, filename: rd.file.filename });
+      }
+    }
+    return files;
+  }, [displaySupplierIds, readinessSuppliers]);
+
+  // Blocked supplier names (for confirm dialog)
+  const blockedSupplierNames = useMemo(() => {
+    return displaySupplierIds
+      .filter((sid) => readinessSuppliers[String(sid)]?.status === "blocked")
+      .map((sid) => readinessSuppliers[String(sid)]?.supplier_name || `#${sid}`);
+  }, [displaySupplierIds, readinessSuppliers]);
+
+  // ── Inline gap editing: debounced save ──
+  async function flushInlineOverrides(supplierId: number) {
+    const overrides = inlineOverridesRef.current[supplierId];
+    if (!overrides || Object.keys(overrides).length === 0) return;
+
+    setInlineSaving((prev) => ({ ...prev, [supplierId]: true }));
+    try {
+      await saveInquiryFieldOverrides(order.id, supplierId, overrides);
+      loadReadiness();
+    } catch {
+      toast.error("自动保存失败");
+    } finally {
+      setInlineSaving((prev) => ({ ...prev, [supplierId]: false }));
+    }
+  }
+
+  function handleInlineOverride(supplierId: number, cell: string, value: string) {
+    setInlineOverrides((prev) => ({
+      ...prev,
+      [supplierId]: { ...(prev[supplierId] || {}), [cell]: value },
+    }));
+
+    // Debounce: save after 800ms of no typing
+    if (saveTimerRef.current[supplierId]) {
+      clearTimeout(saveTimerRef.current[supplierId]);
+    }
+    saveTimerRef.current[supplierId] = setTimeout(() => {
+      flushInlineOverrides(supplierId);
+    }, 800);
+  }
+
+  // Flush pending overrides when collapsing a card
+  function handleToggleCard(sid: number) {
+    // If collapsing the currently expanded card, flush its pending overrides
+    if (expandedSupplierId === sid && saveTimerRef.current[sid]) {
+      clearTimeout(saveTimerRef.current[sid]);
+      flushInlineOverrides(sid);
+    }
+    setExpandedSupplierId((prev) => (prev === sid ? null : sid));
+  }
 
   async function handleDownload(filename: string) {
     setDownloadingFile(filename);
@@ -1479,6 +1599,24 @@ function InquiryTab({
       toast.error(err instanceof Error ? err.message : "下载失败");
     } finally {
       setDownloadingFile(null);
+    }
+  }
+
+  async function handleDownloadAll() {
+    setDownloadingAll(true);
+    try {
+      for (const f of completedFiles) {
+        await downloadOrderFile(order.id, f.filename);
+        // Small delay between downloads to avoid browser blocking
+        if (completedFiles.length > 1) {
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+      toast.success(`${completedFiles.length} 个文件下载完成`);
+    } catch {
+      toast.error("部分文件下载失败");
+    } finally {
+      setDownloadingAll(false);
     }
   }
 
@@ -1497,15 +1635,14 @@ function InquiryTab({
 
   function getSelectedTemplateId(sid: number): number | null {
     if (sid in templateOverrides) return templateOverrides[sid];
-    const sd = suppliers[String(sid)];
-    return sd?.template?.id ?? null;
+    const rd = readinessSuppliers[String(sid)];
+    return rd?.template?.id ?? null;
   }
 
-  // Build overrides map (only entries that differ from pre-analyzed defaults)
   function buildOverridesForGenerate(): Record<number, number | null> | undefined {
     const overrides: Record<number, number | null> = {};
     let hasOverride = false;
-    for (const sid of supplierIds) {
+    for (const sid of displaySupplierIds) {
       if (sid in templateOverrides) {
         overrides[sid] = templateOverrides[sid];
         hasOverride = true;
@@ -1514,14 +1651,72 @@ function InquiryTab({
     return hasOverride ? overrides : undefined;
   }
 
+  function handleGenerateClick() {
+    if (blockedSupplierNames.length > 0) {
+      setConfirmGenerateOpen(true);
+    } else {
+      onGenerateAll?.(buildOverridesForGenerate());
+    }
+  }
+
+  async function handleDataPreview(sid: number) {
+    setDataPreviewLoading(true);
+    setDataPreviewOpen(true);
+    setFieldEditsDirty(false);
+    try {
+      const tid = getSelectedTemplateId(sid);
+      const preview = await getInquiryDataPreview(order.id, sid, tid);
+      setDataPreview(preview);
+      const initial: Record<string, string> = {};
+      for (const f of preview.header_fields) {
+        initial[f.cell] = preview.field_overrides[f.cell] ?? f.value ?? "";
+      }
+      setFieldEdits(initial);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "加载失败");
+      setDataPreviewOpen(false);
+    } finally {
+      setDataPreviewLoading(false);
+    }
+  }
+
+  async function handleSaveOverrides() {
+    if (!dataPreview) return;
+    setSavingOverrides(true);
+    try {
+      const overrides: Record<string, string> = {};
+      for (const f of dataPreview.header_fields) {
+        const edited = fieldEdits[f.cell] ?? "";
+        const original = f.value ?? "";
+        if (edited !== original) {
+          overrides[f.cell] = edited;
+        }
+      }
+      await saveInquiryFieldOverrides(order.id, dataPreview.supplier_id, overrides);
+      setFieldEditsDirty(false);
+      toast.success("字段修改已保存");
+      loadReadiness();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "保存失败");
+    } finally {
+      setSavingOverrides(false);
+    }
+  }
+
+  if (!inquiry && displaySupplierIds.length === 0) return null;
+
+  const readyCount = summary?.ready ?? 0;
+  const blockedCount = (summary?.blocked ?? 0) + (summary?.needs_input ?? 0);
+  const totalCount = summary?.total ?? displaySupplierIds.length;
+
   return (
     <div className="h-full overflow-y-auto px-6 py-5 space-y-4">
-      {/* Summary bar */}
-      <div className="flex items-center justify-between">
-        <div className="text-xs text-muted-foreground flex items-center gap-2">
+      {/* ── Summary bar ── */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
           <FileSpreadsheet className="h-4 w-4 text-emerald-500" />
           <span className="font-medium text-foreground">询价单</span>
-          <span>{supplierIds.length} 个供应商</span>
+          <span>{displaySupplierIds.length} 个供应商</span>
           <span>&middot;</span>
           <span>{totalProducts} 产品</span>
           {totalElapsed != null && (
@@ -1530,57 +1725,140 @@ function InquiryTab({
               <span>耗时 {totalElapsed}s</span>
             </>
           )}
-          {(inquiry.unassigned_count ?? 0) > 0 && (
-            <span className="text-amber-500">({inquiry.unassigned_count} 未分配)</span>
+          {(inquiry?.unassigned_count ?? 0) > 0 && (
+            <span className="text-amber-500">({inquiry?.unassigned_count} 未分配)</span>
+          )}
+          {summary && (
+            <>
+              <span className="text-muted-foreground/40">|</span>
+              {summary.ready > 0 && (
+                <span className="flex items-center gap-0.5 text-emerald-600">
+                  <CheckCircle2 className="h-3 w-3" />
+                  {summary.ready} 就绪
+                </span>
+              )}
+              {summary.needs_input > 0 && (
+                <span className="flex items-center gap-0.5 text-amber-600">
+                  <AlertTriangle className="h-3 w-3" />
+                  {summary.needs_input} 需补充
+                </span>
+              )}
+              {summary.blocked > 0 && (
+                <span className="flex items-center gap-0.5 text-destructive">
+                  <X className="h-3 w-3" />
+                  {summary.blocked} 阻塞
+                </span>
+              )}
+            </>
+          )}
+          {readinessLoading && (
+            <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
           )}
         </div>
-        {onGenerateAll && (
-          <Button
-            size="sm"
-            className="text-xs h-7"
-            disabled={inquiryGenerating}
-            onClick={() => onGenerateAll(buildOverridesForGenerate())}
-          >
-            {inquiryGenerating ? (
-              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-            ) : (
-              <FileSpreadsheet className="mr-1 h-3 w-3" />
-            )}
-            {inquiryGenerating ? "生成中..." : "全部生成"}
-          </Button>
-        )}
+        <div className="flex items-center gap-2 shrink-0">
+          {/* P1: Download all */}
+          {completedFiles.length > 1 && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-xs h-7"
+              disabled={downloadingAll}
+              onClick={handleDownloadAll}
+            >
+              {downloadingAll ? (
+                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+              ) : (
+                <Download className="mr-1 h-3 w-3" />
+              )}
+              全部下载 ({completedFiles.length})
+            </Button>
+          )}
+          {/* P1: Generate button with blocked handling */}
+          {onGenerateAll && (
+            <Button
+              size="sm"
+              className="text-xs h-7"
+              disabled={inquiryGenerating}
+              onClick={handleGenerateClick}
+            >
+              {inquiryGenerating ? (
+                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+              ) : (
+                <FileSpreadsheet className="mr-1 h-3 w-3" />
+              )}
+              {inquiryGenerating
+                ? "生成中..."
+                : blockedCount > 0
+                ? `生成 ${readyCount}/${totalCount} 就绪`
+                : "全部生成"}
+            </Button>
+          )}
+        </div>
       </div>
 
-      {/* Supplier cards grid */}
+      {/* ── Supplier cards grid ── */}
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-        {supplierIds.map((sid) => (
-          <SupplierInquiryCard
-            key={sid}
-            supplierId={sid}
-            data={suppliers[String(sid)]}
-            allTemplates={allTemplates}
-            selectedTemplateId={getSelectedTemplateId(sid)}
-            onTemplateChange={(tid) =>
-              setTemplateOverrides((prev) => ({ ...prev, [sid]: tid }))
-            }
-            expanded={expandedSupplierId === sid}
-            onToggle={() =>
-              setExpandedSupplierId((prev) => (prev === sid ? null : sid))
-            }
-            onPreview={() => handlePreview(sid)}
-            onDownload={(f) => handleDownload(f)}
-            onRedo={() =>
-              onRedoSupplier?.(
-                sid,
-                templateOverrides[sid] !== undefined
-                  ? templateOverrides[sid] ?? undefined
-                  : undefined
-              )
-            }
-            downloadingFile={downloadingFile}
-          />
-        ))}
+        {displaySupplierIds.map((sid) => {
+          const rd = readinessSuppliers[String(sid)];
+          if (!rd) return null;
+          return (
+            <SupplierInquiryCard
+              key={sid}
+              supplierId={sid}
+              data={rd}
+              allTemplates={allTemplates}
+              selectedTemplateId={getSelectedTemplateId(sid)}
+              onTemplateChange={(tid) =>
+                setTemplateOverrides((prev) => ({ ...prev, [sid]: tid }))
+              }
+              expanded={expandedSupplierId === sid}
+              onToggle={() => handleToggleCard(sid)}
+              onPreview={() => handlePreview(sid)}
+              onDataPreview={() => handleDataPreview(sid)}
+              onDownload={(f) => handleDownload(f)}
+              onRedo={() =>
+                onRedoSupplier?.(
+                  sid,
+                  templateOverrides[sid] !== undefined
+                    ? templateOverrides[sid] ?? undefined
+                    : undefined
+                )
+              }
+              downloadingFile={downloadingFile}
+              onFieldOverride={(cell, value) => handleInlineOverride(sid, cell, value)}
+              fieldOverrideValues={inlineOverrides[sid] || {}}
+              savingOverrides={inlineSaving[sid]}
+            />
+          );
+        })}
       </div>
+
+      {/* P1: Confirm dialog for generating with blocked suppliers */}
+      <AlertDialog open={confirmGenerateOpen} onOpenChange={setConfirmGenerateOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>部分供应商缺必填字段</AlertDialogTitle>
+            <AlertDialogDescription>
+              以下供应商缺少必填字段，生成的询价单可能不完整：
+              <span className="block mt-2 font-medium text-foreground">
+                {blockedSupplierNames.join("、")}
+              </span>
+              <span className="block mt-1">是否跳过这些供应商，继续生成其余？</span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmGenerateOpen(false);
+                onGenerateAll?.(buildOverridesForGenerate());
+              }}
+            >
+              继续生成
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Preview dialog */}
       <Dialog
@@ -1607,6 +1885,182 @@ function InquiryTab({
               />
             )}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* P0: Renamed from "数据预览" to "编辑字段", removed engine/LLM badge */}
+      <Dialog open={dataPreviewOpen} onOpenChange={setDataPreviewOpen}>
+        <DialogContent className="max-w-6xl w-[90vw] max-h-[90vh] overflow-hidden flex flex-col">
+          <DialogHeader>
+            <DialogTitle className="text-sm flex items-center gap-2">
+              <FileSpreadsheet className="h-4 w-4" />
+              编辑字段 — {dataPreview?.supplier_name || "加载中..."}
+              {dataPreview?.template.name && (
+                <span className="text-xs font-normal text-muted-foreground ml-1">
+                  模板: {dataPreview.template.name}
+                </span>
+              )}
+            </DialogTitle>
+          </DialogHeader>
+
+          {dataPreviewLoading ? (
+            <div className="flex items-center justify-center py-10">
+              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : dataPreview ? (
+            <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+              {/* Warnings */}
+              {dataPreview.warnings.length > 0 && (
+                <div className="space-y-1">
+                  {dataPreview.warnings.map((w, i) => (
+                    <div key={i} className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/50 rounded px-3 py-1.5">
+                      <AlertTriangle className="h-3 w-3 shrink-0" />
+                      <span>{w}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* P1: Header fields — label-first, cell ref as secondary */}
+              {dataPreview.header_fields.length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h4 className="text-xs font-medium text-muted-foreground">表头字段</h4>
+                    <Button
+                      size="sm"
+                      className="text-xs h-7"
+                      disabled={!fieldEditsDirty || savingOverrides}
+                      onClick={handleSaveOverrides}
+                    >
+                      {savingOverrides ? (
+                        <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                      ) : (
+                        <Save className="mr-1 h-3 w-3" />
+                      )}
+                      保存修改
+                    </Button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                    {dataPreview.header_fields.map((f) => {
+                      const isOverridden = dataPreview.field_overrides[f.cell] != null;
+                      const editedValue = fieldEdits[f.cell] ?? "";
+                      return (
+                        <div key={f.cell} className="flex items-center gap-2 text-xs py-1 border-b border-border/30">
+                          <span className="text-muted-foreground shrink-0 w-24 truncate" title={`${f.label} (${f.cell})`}>
+                            {f.label}
+                          </span>
+                          <input
+                            className={`flex-1 min-w-0 bg-transparent border-b px-1 py-0.5 text-xs outline-none transition-colors ${
+                              editedValue !== (f.value ?? "")
+                                ? "border-primary text-primary"
+                                : isOverridden
+                                ? "border-amber-500/50 text-foreground"
+                                : editedValue
+                                ? "border-transparent text-foreground hover:border-border"
+                                : "border-destructive/30 text-destructive/60 italic hover:border-border"
+                            } focus:border-primary`}
+                            value={editedValue}
+                            placeholder="未填写"
+                            onChange={(e) => {
+                              setFieldEdits((prev) => ({ ...prev, [f.cell]: e.target.value }));
+                              setFieldEditsDirty(true);
+                            }}
+                          />
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
+                            f.source === "order" ? "bg-blue-500/10 text-blue-500" :
+                            f.source === "supplier" ? "bg-orange-500/10 text-orange-500" :
+                            f.source === "company" ? "bg-purple-500/10 text-purple-500" :
+                            "bg-emerald-500/10 text-emerald-500"
+                          }`}>
+                            {f.source === "order" ? "订单" : f.source === "supplier" ? "供应商" : f.source === "company" ? "公司" : "交付"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Product data */}
+              {dataPreview.products.length > 0 && (
+                <div>
+                  <h4 className="text-xs font-medium mb-2 text-muted-foreground">
+                    产品数据 ({dataPreview.total_products} 行{dataPreview.total_products > 20 ? "，显示前 20" : ""})
+                  </h4>
+                  <div className="overflow-x-auto rounded border border-border/50">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="bg-muted/50">
+                          <th className="px-2 py-1.5 text-left font-medium text-muted-foreground">#</th>
+                          {dataPreview.product_columns ? (
+                            dataPreview.product_columns.map(([col, field]) => (
+                              <th key={col} className="px-2 py-1.5 text-left font-medium text-muted-foreground">
+                                {field}
+                              </th>
+                            ))
+                          ) : (
+                            <>
+                              <th className="px-2 py-1.5 text-left font-medium text-muted-foreground">代码</th>
+                              <th className="px-2 py-1.5 text-left font-medium text-muted-foreground">品名</th>
+                              <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">数量</th>
+                              <th className="px-2 py-1.5 text-left font-medium text-muted-foreground">单位</th>
+                              <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">单价</th>
+                            </>
+                          )}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {dataPreview.products.map((p, i) => (
+                          <tr key={i} className="border-t border-border/30 hover:bg-muted/20">
+                            <td className="px-2 py-1 text-muted-foreground/50">{p._index as number}</td>
+                            {dataPreview.product_columns ? (
+                              dataPreview.product_columns.map(([col, field]) => (
+                                <td key={col} className={`px-2 py-1 ${
+                                  field === "quantity" || field === "unit_price" ? "text-right font-mono" : ""
+                                } ${p[field] == null ? "text-muted-foreground/30 italic" : ""}`}>
+                                  {p[field] != null ? String(p[field]) : "—"}
+                                </td>
+                              ))
+                            ) : (
+                              <>
+                                <td className="px-2 py-1 font-mono">{String(p.product_code ?? "")}</td>
+                                <td className="px-2 py-1 max-w-[200px] truncate">{String(p.product_name ?? "")}</td>
+                                <td className="px-2 py-1 text-right font-mono">{p.quantity != null ? String(p.quantity) : "—"}</td>
+                                <td className="px-2 py-1">{String(p.unit ?? "")}</td>
+                                <td className="px-2 py-1 text-right font-mono">{p.unit_price != null ? String(p.unit_price) : "—"}</td>
+                              </>
+                            )}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* Formula columns */}
+              {dataPreview.formula_columns && dataPreview.formula_columns.length > 0 && (
+                <div className="text-xs text-muted-foreground">
+                  <span className="font-medium">公式列: </span>
+                  {dataPreview.formula_columns.map((c) => (
+                    <span key={c} className="inline-block font-mono bg-purple-500/10 text-purple-400 px-1.5 py-0.5 rounded mr-1">{c}</span>
+                  ))}
+                </div>
+              )}
+
+              {/* Summary formulas */}
+              {dataPreview.summary_formulas && dataPreview.summary_formulas.length > 0 && (
+                <div className="text-xs text-muted-foreground">
+                  <span className="font-medium">汇总公式: </span>
+                  {dataPreview.summary_formulas.map((sf, i) => (
+                    <span key={i} className="inline-block font-mono bg-amber-500/10 text-amber-400 px-1.5 py-0.5 rounded mr-1">
+                      {sf.cell} ({sf.label || sf.type})
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
         </DialogContent>
       </Dialog>
     </div>

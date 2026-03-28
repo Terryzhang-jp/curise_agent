@@ -43,21 +43,21 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
 
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="用户未激活")
+
     if user.locked_until and user.locked_until > datetime.utcnow():
         mins = int((user.locked_until - datetime.utcnow()).total_seconds() / 60)
         raise HTTPException(status_code=423, detail=f"账号已锁定，请 {mins} 分钟后重试")
 
     if not verify_password(body.password, user.hashed_password):
-        user.failed_login_attempts += 1
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
         user.last_failed_login = datetime.utcnow()
         if user.failed_login_attempts >= 5:
             user.locked_until = datetime.utcnow() + timedelta(minutes=15)
         db.commit()
         remaining = max(0, 5 - user.failed_login_attempts)
         raise HTTPException(status_code=401, detail=f"邮箱或密码错误，还可尝试 {remaining} 次")
-
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="用户未激活")
 
     user.failed_login_attempts = 0
     user.locked_until = None

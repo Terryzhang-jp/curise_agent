@@ -1,6 +1,23 @@
 """request_confirmation — agent asks user before impactful operations."""
 import json
 
+from services.tools.registry_loader import ToolMetaInfo
+
+TOOL_META = {
+    "request_confirmation": ToolMetaInfo(
+        display_name="请求确认",
+        group="utility",
+        description="执行重要操作前请求用户确认",
+        prompt_description="请求用户确认（重要操作前必须调用）",
+        summary="请求用户确认",
+    ),
+}
+
+
+def register(registry, ctx=None):
+    """Auto-discovery compatible alias."""
+    create_confirmation_tools(registry, ctx)
+
 
 def create_confirmation_tools(registry, ctx):
     @registry.tool(

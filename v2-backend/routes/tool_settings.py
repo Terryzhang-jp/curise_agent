@@ -28,27 +28,22 @@ from schemas import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/settings", tags=["tool-settings"])
 
-# ─── Built-in tool seed data ────────────────────────────────
+# ─── Built-in tool seed data (auto-discovered from TOOL_META) ─
 
-BUILTIN_TOOLS = [
-    {"tool_name": "think", "group_name": "reasoning", "display_name": "思考推理", "description": "记录思考过程，用来分析信息、制定计划、反思结果", "is_enabled": True},
-    {"tool_name": "query_db", "group_name": "business", "display_name": "数据库查询", "description": "执行只读 SQL 查询获取业务数据", "is_enabled": True},
-    {"tool_name": "get_db_schema", "group_name": "business", "display_name": "数据库结构", "description": "获取数据库表结构信息", "is_enabled": True},
-    {"tool_name": "calculate", "group_name": "utility", "display_name": "数学计算", "description": "执行数学表达式计算", "is_enabled": True},
-    {"tool_name": "get_current_time", "group_name": "utility", "display_name": "当前时间", "description": "获取当前日期和时间", "is_enabled": True},
-    {"tool_name": "todo_write", "group_name": "todo", "display_name": "任务写入", "description": "创建/更新任务清单项", "is_enabled": True},
-    {"tool_name": "todo_read", "group_name": "todo", "display_name": "任务读取", "description": "读取当前任务清单", "is_enabled": True},
-    {"tool_name": "use_skill", "group_name": "skill", "display_name": "使用技能", "description": "调用可复用的 prompt 模板技能", "is_enabled": True},
-    {"tool_name": "web_fetch", "group_name": "web", "display_name": "网页抓取", "description": "获取网页内容（HTTP GET）", "is_enabled": False},
-    {"tool_name": "web_search", "group_name": "web", "display_name": "网络搜索", "description": "使用搜索引擎查询最新信息（天气、新闻等），免费无需API Key", "is_enabled": True},
-    {"tool_name": "search_product_database", "group_name": "business", "display_name": "产品搜索", "description": "按关键词搜索产品数据库", "is_enabled": False},
-]
+def _get_builtin_tools() -> list[dict]:
+    """Get built-in tool seed data from auto-discovered TOOL_META."""
+    try:
+        from services.tools.registry_loader import get_builtin_tools_seed
+        return get_builtin_tools_seed()
+    except Exception as e:
+        logger.warning("Failed to auto-discover tools, using empty list: %s", e)
+        return []
 
 
 def _seed_builtin_tools(db: DBSession) -> int:
     """Insert missing built-in tools, return count of newly created."""
     created = 0
-    for tool_data in BUILTIN_TOOLS:
+    for tool_data in _get_builtin_tools():
         existing = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_data["tool_name"]).first()
         if not existing:
             db.add(ToolConfig(**tool_data, is_builtin=True))

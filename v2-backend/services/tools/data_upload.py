@@ -1,15 +1,20 @@
 """
 Data upload tools — staging-based product upload with confidence matching,
-reference creation, audit logging, and atomic execution.
+reference creation, audit logging, atomic execution, and rollback.
 
 Tools:
   1. parse_file: Parse Excel, create UploadBatch + StagingProduct rows
-  2. resolve_and_validate: Code match + LLM fuzzy match with confidence scoring
-  3. create_references: Create missing suppliers/countries in dependency order
-  4. preview_changes: Generate change preview report
-  5. execute_upload: Atomic write to products table + ProductChangeLog
+  2. analyze_columns: Cross-reference unmapped columns against DB ref tables
+  3. resolve_and_validate: Code match + LLM fuzzy match with confidence scoring
+  4. create_references: Create missing suppliers/countries in dependency order
+  5. preview_changes: Generate change preview report
+  6. execute_upload: Atomic write to products table + ProductChangeLog
+  7. audit_data: Structural + LLM semantic data quality audit
+  8. prepare_upload: One-step validation + audit + preview
+  9. rollback_batch: Undo a completed batch import
 
-All tools use the closure pattern: create_data_upload_tools(registry, ctx).
+Tools use the closure pattern: create_data_upload_tools(registry, ctx).
+Conditional registration: completed batches only get rollback_batch.
 """
 
 from __future__ import annotations
@@ -23,7 +28,90 @@ from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from io import BytesIO
 
+from services.tools.registry_loader import ToolMetaInfo
+
 logger = logging.getLogger(__name__)
+
+TOOL_META = {
+    "parse_file": ToolMetaInfo(
+        display_name="解析上传文件",
+        group="business",
+        description="解析上传的 Excel/CSV 文件，创建暂存数据",
+        prompt_description="解析上传的 Excel/CSV 文件，创建暂存数据",
+        summary="解析上传文件",
+        auto_register=False,  # Only when file is attached or batch exists
+    ),
+    "analyze_columns": ToolMetaInfo(
+        display_name="分析列映射",
+        group="business",
+        description="分析未映射列（交叉比对 DB 参考表，检测 supplier_id/country_id 等）",
+        prompt_description="分析未映射列（交叉比对 DB 参考表，检测 supplier_id/country_id 等）",
+        summary="分析列映射",
+        auto_register=False,
+    ),
+    "resolve_and_validate": ToolMetaInfo(
+        display_name="验证暂存数据",
+        group="business",
+        description="验证暂存数据（代码匹配+LLM模糊匹配+置信度分级）",
+        prompt_description="验证暂存数据（代码匹配+LLM模糊匹配+置信度分级）",
+        summary="验证暂存数据",
+        auto_register=False,
+    ),
+    "create_references": ToolMetaInfo(
+        display_name="创建引用数据",
+        group="business",
+        description="自动创建缺失的供应商/国家等引用数据",
+        prompt_description="自动创建缺失的供应商/国家等引用数据",
+        summary="创建引用数据",
+        auto_register=False,
+    ),
+    "preview_changes": ToolMetaInfo(
+        display_name="预览变更",
+        group="business",
+        description="生成变更预览报告（新增/更新/异常/无变化）",
+        prompt_description="生成变更预览报告（新增/更新/异常/无变化）",
+        summary="预览变更",
+        auto_register=False,
+    ),
+    "execute_upload": ToolMetaInfo(
+        display_name="执行产品导入",
+        group="business",
+        description="确认后原子执行产品导入，写入变更日志",
+        prompt_description="确认后原子执行产品导入，写入变更日志",
+        summary="执行产品导入",
+        auto_register=False,
+    ),
+    "audit_data": ToolMetaInfo(
+        display_name="数据质量审计",
+        group="business",
+        description="数据质量审计（检查列缺失、格式错误、重复数据、单位/价格合理性等）",
+        prompt_description="数据质量审计（检查列缺失、格式错误、重复数据、单位/价格合理性等）",
+        summary="数据质量审计",
+        auto_register=False,
+    ),
+    "prepare_upload": ToolMetaInfo(
+        display_name="准备上传",
+        group="business",
+        description="一键准备上传（验证匹配+数据审计+变更预览，返回统一审查卡片）",
+        prompt_description="一键准备上传（验证匹配+数据审计+变更预览，返回统一审查卡片）",
+        summary="准备上传",
+        auto_register=False,
+    ),
+    "rollback_batch": ToolMetaInfo(
+        display_name="回滚批次",
+        group="business",
+        description="回滚已完成的批次导入（删除新增、恢复更新产品原值）",
+        prompt_description="回滚已完成的批次导入（删除新增、恢复更新产品原值）",
+        summary="回滚批次",
+        auto_register=False,
+    ),
+}
+
+
+def register(registry, ctx=None):
+    """Auto-discovery compatible — only registers if upload context exists."""
+    if has_upload_context(ctx) or (ctx and ctx.file_bytes):
+        create_data_upload_tools(registry, ctx)
 
 
 class _NoChangeSignal(Exception):
@@ -79,12 +167,19 @@ def _heuristic_column_mapping(labels: list[str], cols: list[str]) -> dict:
         ("brand", brand_kw),
         ("currency", currency_kw),
         ("country_of_origin", origin_kw),
+        # ID columns
+        ("country_id", ["country_id"]),
+        ("supplier_id", ["supplier_id"]),
+        ("port_id", ["port_id"]),
+        ("category_id", ["category_id", "cat_id"]),
     ]
 
     for label, col in zip(labels, cols):
         lower = label.lower()
+        # Normalize separators: "country id", "country-id", "country.id" → "country_id"
+        normalized = re.sub(r"[\s\-\.]+", "_", lower)
         for field, keywords in keyword_map:
-            if field not in mapping and any(k in lower for k in keywords):
+            if field not in mapping and any(k in lower or k in normalized for k in keywords):
                 mapping[field] = col
                 break
 
@@ -132,6 +227,24 @@ def _recover_batch_id(ctx) -> int | None:
     return None
 
 
+def _recover_any_batch_id(ctx) -> int | None:
+    """Recover most recent batch (including completed) for rollback availability."""
+    session_id = ctx.pipeline_session_id
+    if not session_id:
+        return None
+    from models import UploadBatch
+    batch = (
+        ctx.db.query(UploadBatch)
+        .filter(
+            UploadBatch.session_id == session_id,
+            UploadBatch.status.notin_(["failed", "rolled_back"]),
+        )
+        .order_by(UploadBatch.created_at.desc())
+        .first()
+    )
+    return batch.id if batch else None
+
+
 def _make_new_match_result(sp, batch, ctx) -> dict:
     """Build a match_result dict for a staging row that has no match in the target port.
 
@@ -166,22 +279,238 @@ def _make_new_match_result(sp, batch, ctx) -> dict:
 
 
 def has_upload_context(ctx) -> bool:
-    """Check if there's an active upload batch for this session (for __init__.py)."""
+    """Check if there's any upload batch (active or completed) for this session."""
     if _get_active_batch_id(ctx):
         return True
-    return _recover_batch_id(ctx) is not None
+    if _recover_batch_id(ctx) is not None:
+        return True
+    return _recover_any_batch_id(ctx) is not None
+
+
+def _auto_resolve_id_columns(batch, products: list[dict], column_mapping: dict, ctx) -> list[str]:
+    """Auto-resolve ID columns (country_id, supplier_id, port_id, category_id)
+    from column_mapping. Sets resolved IDs on batch and returns info lines."""
+    from sqlalchemy import text
+
+    id_fields = {
+        "country_id": ("countries", "country_id", "country_name"),
+        "supplier_id": ("suppliers", "supplier_id", "supplier_name"),
+        "port_id": ("ports", "port_id", "port_name"),
+        "category_id": ("categories", "category_id", None),
+    }
+
+    info_lines = []
+
+    for field_key, (table_name, batch_id_attr, batch_name_attr) in id_fields.items():
+        col = column_mapping.get(field_key)
+        if not col:
+            continue
+
+        # Collect unique integer values from this column across all products
+        raw_values = set()
+        for p in products:
+            raw_cells = p.get("raw_cells", {})
+            v = raw_cells.get(col, "")
+            if v is not None and str(v).strip():
+                try:
+                    raw_values.add(int(float(str(v).strip())))
+                except (ValueError, TypeError):
+                    pass
+
+        if not raw_values:
+            continue
+
+        # Resolve IDs from DB
+        id_list = sorted(raw_values)
+        try:
+            with ctx.db.begin_nested():
+                rows = ctx.db.execute(
+                    text(f"SELECT id, name FROM {table_name} WHERE id = ANY(:ids)"),
+                    {"ids": id_list},
+                ).fetchall()
+            resolved = {r[0]: r[1] for r in rows}
+        except Exception as e:
+            logger.warning("Auto-resolve %s failed: %s", field_key, e)
+            continue
+
+        if len(id_list) == 1:
+            # Single unique value → auto-set on batch
+            single_id = id_list[0]
+            name = resolved.get(single_id)
+            if name:
+                setattr(batch, batch_id_attr, single_id)
+                if batch_name_attr:
+                    setattr(batch, batch_name_attr, name)
+                ctx.db.commit()
+                info_lines.append(f"{table_name}: {name} (id={single_id}) [自动识别]")
+            else:
+                info_lines.append(f"{field_key} 列值 {single_id} 在 {table_name} 表中未找到")
+        else:
+            # Multiple unique values → report for Agent
+            resolved_strs = []
+            for vid in id_list[:10]:
+                vname = resolved.get(vid)
+                if vname:
+                    resolved_strs.append(f"{vid}: {vname}")
+                else:
+                    resolved_strs.append(f"{vid}: (未找到)")
+            info_lines.append(f"{field_key} 列有多个值 {{{', '.join(resolved_strs)}}}")
+
+    return info_lines
 
 
 # ── Tool Registration ─────────────────────────────────────────
 
 
 def create_data_upload_tools(registry, ctx):
-    """Register 6 data upload tools onto the registry."""
+    """Register data upload tools onto the registry.
+
+    If the session's batch is completed, only register rollback_batch.
+    Otherwise register the full tool set.
+    """
+    active_batch_id = _get_active_batch_id(ctx) or _recover_batch_id(ctx)
+    completed_batch_id = None
+    if not active_batch_id:
+        completed_batch_id = _recover_any_batch_id(ctx)
+
+    # rollback always registered when any batch exists
+    if active_batch_id or completed_batch_id:
+        _register_rollback_tool(registry, ctx)
+
+    # workflow tools only when active batch or new file
+    if active_batch_id or ctx.file_bytes:
+        _register_workflow_tools(registry, ctx)
+
+
+def _register_rollback_tool(registry, ctx):
+    """Register the rollback_batch tool."""
+
+    @registry.tool(
+        description=(
+            "Rollback a completed batch import. Deletes created products and "
+            "restores updated products to original values. Use when import was "
+            "done with wrong parameters (e.g., wrong supplier). Only works on "
+            "completed batches. Pass batch_id."
+        ),
+        parameters={
+            "batch_id": {
+                "type": "NUMBER",
+                "description": "要回滚的批次ID",
+            },
+        },
+        group="data_upload",
+    )
+    def rollback_batch(batch_id: int = 0) -> str:
+        from models import UploadBatch, Product, ProductChangeLog
+
+        if not batch_id:
+            return "Error: 请提供 batch_id 参数。"
+        batch_id = int(batch_id)
+
+        batch = ctx.db.query(UploadBatch).filter(UploadBatch.id == batch_id).first()
+        if not batch:
+            return f"Error: 批次 {batch_id} 不存在。"
+        if batch.status == "rolled_back":
+            return f"Error: 批次 {batch_id} 已经被回滚过了。"
+        if batch.status != "completed":
+            return f"Error: 只能回滚已完成的批次（当前状态: {batch.status}）。"
+
+        # Load changelog entries in reverse order
+        logs = (
+            ctx.db.query(ProductChangeLog)
+            .filter(
+                ProductChangeLog.batch_id == batch_id,
+                ProductChangeLog.change_type.in_(["created", "updated"]),
+            )
+            .order_by(ProductChangeLog.id.desc())
+            .all()
+        )
+
+        if not logs:
+            return f"Error: 批次 {batch_id} 没有变更日志记录，无法回滚。"
+
+        deleted_count = 0
+        restored_count = 0
+        failed_items = []
+        user_id = batch.user_id
+
+        for log_entry in logs:
+            try:
+                with ctx.db.begin_nested():
+                    product = ctx.db.query(Product).filter(Product.id == log_entry.product_id).first()
+
+                    if log_entry.change_type == "created":
+                        if product:
+                            ctx.db.delete(product)
+                            deleted_count += 1
+                        else:
+                            # Product already deleted
+                            deleted_count += 1
+
+                    elif log_entry.change_type == "updated":
+                        if not product:
+                            failed_items.append(f"产品 id={log_entry.product_id}: 已不存在，无法恢复")
+                            continue
+
+                        field_changes = log_entry.field_changes or []
+                        for change in field_changes:
+                            field = change.get("field")
+                            old_value = change.get("old_value")
+                            if not field or field == "all":
+                                continue
+                            # Handle type conversion
+                            if field == "price":
+                                old_value = Decimal(str(old_value)) if old_value is not None else None
+                            setattr(product, field, old_value)
+                        restored_count += 1
+
+                    # Audit log for rollback
+                    rollback_log = ProductChangeLog(
+                        product_id=log_entry.product_id,
+                        batch_id=batch_id,
+                        change_type="rolled_back",
+                        field_changes=[{
+                            "original_change_type": log_entry.change_type,
+                            "original_log_id": log_entry.id,
+                        }],
+                        changed_by=user_id,
+                    )
+                    ctx.db.add(rollback_log)
+
+            except Exception as e:
+                failed_items.append(f"产品 id={log_entry.product_id}: {str(e)}")
+
+        # Mark batch as rolled back
+        batch.status = "rolled_back"
+        batch.rolled_back_at = datetime.utcnow()
+        batch.rolled_back_by = user_id
+        ctx.db.commit()
+
+        lines = [
+            f"批次 #{batch_id} 回滚完成:",
+            f"- 已删除新增产品: {deleted_count} 个",
+            f"- 已恢复更新产品: {restored_count} 个",
+        ]
+        if failed_items:
+            lines.append(f"- 回滚失败: {len(failed_items)} 个")
+            for msg in failed_items[:10]:
+                lines.append(f"  - {msg}")
+
+        return "\n".join(lines)
+
+
+def _register_workflow_tools(registry, ctx):
+    """Register the full set of data upload workflow tools."""
 
     # ── Tool 1: parse_file ────────────────────────────────────
 
     @registry.tool(
-        description="解析上传的 Excel 文件，自动映射列，创建暂存数据。无需参数，直接读取上传文件。",
+        description=(
+            "Parse an uploaded Excel/CSV file, auto-detect column mappings, "
+            "and create staging rows. Call this first when the user uploads "
+            "a price list or quotation. No parameters — reads from uploaded "
+            "file. Returns product count, column mapping, and sample preview."
+        ),
         parameters={},
         group="data_upload",
     )
@@ -236,8 +565,12 @@ def create_data_upload_tools(registry, ctx):
 - brand: 品牌
 - currency: 货币
 - country_of_origin: 原产地
+- country_id: 国家ID（整数，如 9）
+- supplier_id: 供应商ID（整数，如 2）
+- port_id: 港口ID（整数，如 19）
+- category_id: 类别ID（整数，如 14）
 
-只返回 JSON，格式如: {{"product_name": "B", "product_code": "A", "price": "D", ...}}
+只返回 JSON，格式如: {{"product_name": "B", "product_code": "A", "price": "D", "country_id": "E", ...}}
 """
         try:
             from config import settings
@@ -318,6 +651,7 @@ def create_data_upload_tools(registry, ctx):
             file_hash=file_hash,
             status="staging",
             column_mapping=column_mapping,
+            summary={"header_labels": dict(zip(header_cols, header_labels))},
         )
         ctx.db.add(batch)
         ctx.db.flush()  # Get batch.id
@@ -347,6 +681,9 @@ def create_data_upload_tools(registry, ctx):
         # 7. Store batch ID in session data
         ctx.session_data["_upload_batch_id"] = batch.id
 
+        # 7b. Auto-resolve ID columns from column_mapping
+        id_resolve_info = _auto_resolve_id_columns(batch, products, column_mapping, ctx)
+
         # 8. Build summary
         with_price = sum(1 for p in products if p.get("price") is not None)
         with_code = sum(1 for p in products if p.get("product_code"))
@@ -358,23 +695,304 @@ def create_data_upload_tools(registry, ctx):
             f"- 有产品代码: {with_code} 个",
             f"- 有价格: {with_price} 个",
             f"- 列映射: {json.dumps(column_mapping, ensure_ascii=False)}",
-            "",
-            "前 5 个产品预览:",
         ]
+
+        # Show auto-resolved ID columns
+        if id_resolve_info:
+            lines.append("")
+            for info_line in id_resolve_info:
+                lines.append(f"- {info_line}")
+
+        lines.append("")
+        lines.append("前 5 个产品预览:")
         for p in products[:5]:
             price_str = f"${p['price']}" if p.get("price") is not None else "无价格"
             lines.append(f"  行{p['row_number']}: {p['product_name']} [{p.get('product_code', '')}] {price_str}")
 
         return "\n".join(lines)
 
+    # ── Tool 1b: analyze_columns ──────────────────────────────
+
+    @registry.tool(
+        description=(
+            "Analyze unmapped columns by cross-referencing values against "
+            "DB reference tables (suppliers, countries, ports, categories). "
+            "Call immediately after parse_file to detect hidden reference "
+            "columns like supplier_id or country_id. Critical for preventing "
+            "wrong-supplier imports. No parameters needed."
+        ),
+        parameters={},
+        group="data_upload",
+    )
+    def analyze_columns() -> str:
+        from sqlalchemy import text
+        from models import StagingProduct
+
+        batch, err = _load_batch(ctx)
+        if err:
+            return err
+
+        # Load column mapping from batch
+        col_mapping = batch.column_mapping or {}
+        mapped_cols = set(v for v in col_mapping.values() if v)
+
+        # Load first 200 staging rows' raw_data
+        staging_rows = (
+            ctx.db.query(StagingProduct)
+            .filter(StagingProduct.batch_id == batch.id)
+            .order_by(StagingProduct.row_number)
+            .limit(200)
+            .all()
+        )
+        if not staging_rows:
+            return "Error: 暂存表中没有数据。"
+
+        # Reference tables to check against: (table_name, field_name)
+        ref_tables = [
+            ("suppliers", "supplier_id"),
+            ("countries", "country_id"),
+            ("ports", "port_id"),
+            ("categories", "category_id"),
+        ]
+
+        lines = [f"## 列分析（批次 #{batch.id}）\n"]
+        found_supplier_col = False
+
+        # ── Report already-mapped ID columns ──
+        id_fields = ["country_id", "supplier_id", "port_id", "category_id"]
+        mapped_id_cols = {f: col_mapping[f] for f in id_fields if col_mapping.get(f)}
+        if mapped_id_cols:
+            lines.append("### 已映射的 ID 列\n")
+            for field, col in mapped_id_cols.items():
+                if "supplier" in field:
+                    found_supplier_col = True
+                # Collect unique values for this column
+                id_values = set()
+                for sp in staging_rows:
+                    raw = sp.raw_data or {}
+                    v = raw.get(col, "")
+                    if v is not None and str(v).strip():
+                        try:
+                            id_values.add(int(float(str(v).strip())))
+                        except (ValueError, TypeError):
+                            pass
+
+                if id_values:
+                    table_name = next((t for t, f in ref_tables if f == field), None)
+                    if table_name:
+                        try:
+                            with ctx.db.begin_nested():
+                                rows = ctx.db.execute(
+                                    text(f"SELECT id, name FROM {table_name} WHERE id = ANY(:ids)"),
+                                    {"ids": sorted(id_values)},
+                                ).fetchall()
+                            resolved = {r[0]: r[1] for r in rows}
+                            display = ", ".join(f"{vid}={resolved.get(vid, '?')}" for vid in sorted(id_values)[:10])
+                            lines.append(f"- Column {col} → {field}: {display}")
+                        except Exception:
+                            lines.append(f"- Column {col} → {field}: 值={sorted(id_values)[:10]}")
+                    else:
+                        lines.append(f"- Column {col} → {field}: 值={sorted(id_values)[:10]}")
+                else:
+                    lines.append(f"- Column {col} → {field}: (无有效值)")
+            lines.append("")
+
+        # Also count batch-level resolved supplier as found
+        if batch.supplier_id:
+            found_supplier_col = True
+
+        # ── Analyze unmapped columns ──
+        all_cols = set()
+        for sp in staging_rows:
+            raw = sp.raw_data or {}
+            all_cols.update(raw.keys())
+
+        unmapped_cols = sorted(all_cols - mapped_cols)
+        if not unmapped_cols:
+            if not found_supplier_col:
+                lines.append("⚠️ 未检测到 supplier 列。请确认数据中的供应商信息。")
+            return "\n".join(lines)
+
+        # Gather unique values per unmapped column
+        col_values: dict[str, list] = {}
+        for col in unmapped_cols:
+            values = []
+            for sp in staging_rows:
+                raw = sp.raw_data or {}
+                v = raw.get(col, "")
+                if v is not None and str(v).strip():
+                    values.append(str(v).strip())
+            col_values[col] = values
+
+        # Load header_labels from batch.summary for header-based detection
+        header_labels = (batch.summary or {}).get("header_labels", {})
+
+        lines.append("### 未映射列分析\n")
+
+        for col in unmapped_cols:
+            values = col_values[col]
+            if not values:
+                continue
+
+            unique_values = list(dict.fromkeys(values))  # preserve order, dedupe
+            col_findings = []
+
+            # ── Header-based detection (primary signal) ──
+            header = header_labels.get(col, "").lower().replace("*", "").strip()
+            header_match = None
+            if header:
+                for table_name, field_name in ref_tables:
+                    # Match "country_id", "supplier_id", etc. or stripped form like "country", "supplier"
+                    base_name = field_name.replace("_id", "")
+                    if field_name in header or (base_name == header):
+                        header_match = (table_name, field_name)
+                        break
+
+            if header_match:
+                table_name, field_name = header_match
+                if "supplier" in field_name:
+                    found_supplier_col = True
+
+                # Resolve values from DB
+                int_values = []
+                for v in unique_values:
+                    try:
+                        int_values.append(int(float(v)))
+                    except (ValueError, TypeError):
+                        pass
+
+                if int_values:
+                    id_set = list(set(int_values))
+                    try:
+                        with ctx.db.begin_nested():
+                            rows = ctx.db.execute(
+                                text(f"SELECT id, name FROM {table_name} WHERE id = ANY(:ids)"),
+                                {"ids": id_set},
+                            ).fetchall()
+                        matched = {r[0]: r[1] for r in rows}
+                        display = ", ".join(f"{vid}={matched.get(vid, '?')}" for vid in id_set[:10])
+                        lines.append(f"### Column {col} (列头: \"{header_labels.get(col, '')}\") → {field_name}")
+                        lines.append(f"  已解析: {display}")
+                    except Exception:
+                        lines.append(f"### Column {col} (列头: \"{header_labels.get(col, '')}\") → {field_name}")
+                        lines.append(f"  值: {id_set[:10]}")
+                else:
+                    lines.append(f"### Column {col} (列头: \"{header_labels.get(col, '')}\") → {field_name}")
+                    lines.append(f"  值预览: {unique_values[:8]}")
+                lines.append("")
+                continue
+
+            # ── Value-based detection (fallback) ──
+            # Try integer detection
+            int_values = []
+            for v in unique_values:
+                try:
+                    int_values.append(int(float(v)))
+                except (ValueError, TypeError):
+                    pass
+
+            int_ratio = len(int_values) / len(unique_values) if unique_values else 0
+
+            if int_ratio >= 0.8 and int_values:
+                # Integer column — check against ID-based reference tables
+                id_set = list(set(int_values))
+
+                for table_name, field_name in ref_tables:
+                    try:
+                        with ctx.db.begin_nested():
+                            rows = ctx.db.execute(
+                                text(f"SELECT id, name FROM {table_name} WHERE id = ANY(:ids)"),
+                                {"ids": id_set},
+                            ).fetchall()
+                        matched = {r[0]: r[1] for r in rows}
+                        hit_rate = len(matched) / len(id_set) if id_set else 0
+                        if hit_rate >= 0.5:
+                            col_findings.append((field_name, hit_rate, matched, id_set))
+                            if "supplier" in field_name:
+                                found_supplier_col = True
+                    except Exception as e:
+                        logger.warning("analyze_columns %s lookup failed: %s", table_name, e)
+
+            else:
+                # String column — check against name-based reference tables
+                sample_names = unique_values[:20]
+                like_patterns = [f"%{n}%" for n in sample_names]
+
+                for table_name, field_name in ref_tables:
+                    try:
+                        with ctx.db.begin_nested():
+                            rows = ctx.db.execute(
+                                text(f"SELECT id, name FROM {table_name} WHERE name ILIKE ANY(:names)"),
+                                {"names": like_patterns},
+                            ).fetchall()
+                        if rows:
+                            matched_names = set()
+                            for r in rows:
+                                for sn in sample_names:
+                                    if sn.lower() in (r[1] or "").lower():
+                                        matched_names.add(sn)
+                            hit_rate = len(matched_names) / len(sample_names) if sample_names else 0
+                            if hit_rate >= 0.5:
+                                matched = {r[0]: r[1] for r in rows}
+                                col_findings.append((field_name, hit_rate, matched, sample_names))
+                                if "supplier" in field_name:
+                                    found_supplier_col = True
+                    except Exception as e:
+                        logger.warning("analyze_columns %s name lookup failed: %s", table_name, e)
+
+            # Format output for this column
+            if col_findings:
+                col_findings.sort(key=lambda x: x[1], reverse=True)
+                best = col_findings[0]
+                field_name, hit_rate, matched, checked = best
+                confidence = "很可能" if hit_rate >= 0.8 else "可能"
+
+                lines.append(f"### Column {col} — {confidence}是 {field_name}（命中率 {hit_rate:.0%}）")
+                display_matched = dict(list(matched.items())[:10])
+                lines.append(f"  匹配: {display_matched}")
+                if isinstance(checked, list):
+                    if isinstance(checked[0], int):
+                        unmatched = [v for v in checked if v not in matched]
+                    else:
+                        unmatched = checked
+                else:
+                    unmatched = [v for v in checked if v not in matched]
+                if unmatched and isinstance(checked[0], int):
+                    lines.append(f"  未匹配: {unmatched[:10]}")
+
+                if field_name == "supplier_id" and len(matched) > 1:
+                    lines.append(f"  ⚠️ 检测到多供应商数据（{len(matched)} 个供应商），请确认是否需要分别处理。")
+
+                lines.append("")
+            else:
+                preview = unique_values[:8]
+                lines.append(f"### Column {col} — 未匹配任何参考表")
+                lines.append(f"  值预览: {preview}")
+                lines.append("")
+
+        if not found_supplier_col:
+            lines.append("⚠️ 未检测到 supplier 列。请确认数据中的供应商信息。")
+
+        return "\n".join(lines)
+
     # ── Tool 2: resolve_and_validate ──────────────────────────
 
     @registry.tool(
-        description="验证暂存数据：代码精确匹配 + LLM 模糊匹配 + 置信度分级。传入供应商名/国家名/港口名/有效日期以缩小匹配范围。",
+        description=(
+            "Validate staging data with code-exact + fuzzy name + LLM matching "
+            "and confidence scoring. Pass supplier_name/supplier_id, country_name/country_id, "
+            "port_name/port_id, and effective dates. ID params take priority over name. "
+            "Prefer prepare_upload which combines this with audit and preview."
+        ),
         parameters={
             "supplier_name": {
                 "type": "STRING",
                 "description": "供应商名称（可选，用于筛选 DB 产品范围）",
+                "required": False,
+            },
+            "supplier_id": {
+                "type": "NUMBER",
+                "description": "供应商ID（可选，优先于 supplier_name）",
                 "required": False,
             },
             "country_name": {
@@ -382,9 +1000,19 @@ def create_data_upload_tools(registry, ctx):
                 "description": "国家名称（可选，用于筛选 DB 产品范围）",
                 "required": False,
             },
+            "country_id": {
+                "type": "NUMBER",
+                "description": "国家ID（可选，优先于 country_name）",
+                "required": False,
+            },
             "port_name": {
                 "type": "STRING",
                 "description": "目标港口名称（如 横浜、Bangkok），决定更新哪个港口的价格记录",
+                "required": False,
+            },
+            "port_id": {
+                "type": "NUMBER",
+                "description": "港口ID（可选，优先于 port_name）",
                 "required": False,
             },
             "effective_from": {
@@ -400,7 +1028,7 @@ def create_data_upload_tools(registry, ctx):
         },
         group="data_upload",
     )
-    def resolve_and_validate(supplier_name: str = "", country_name: str = "", port_name: str = "", effective_from: str = "", effective_to: str = "") -> str:
+    def resolve_and_validate(supplier_name: str = "", supplier_id: int = 0, country_name: str = "", country_id: int = 0, port_name: str = "", port_id: int = 0, effective_from: str = "", effective_to: str = "") -> str:
         from sqlalchemy import text
         from models import UploadBatch, StagingProduct, Product
 
@@ -410,8 +1038,8 @@ def create_data_upload_tools(registry, ctx):
 
         # ── Required field validation ──
         # Check both batch state (from previous calls) and current params
-        has_country = batch.country_id or country_name.strip()
-        has_port = batch.port_id or port_name.strip()
+        has_country = batch.country_id or country_id or country_name.strip()
+        has_port = batch.port_id or port_id or port_name.strip()
         if has_country and not has_port:
             return "Error: 请提供目标港口名称（port_name 参数）。例如：横浜、Bangkok 等。这决定了更新哪个港口的价格记录。"
         if not batch.effective_from and not effective_from.strip():
@@ -428,8 +1056,21 @@ def create_data_upload_tools(registry, ctx):
         if not staging_rows:
             return "Error: 暂存表中没有数据"
 
-        # ── Phase A: Resolve supplier & country ──
-        if supplier_name.strip():
+        # ── Phase A: Resolve supplier & country (ID params take priority) ──
+        if supplier_id and not batch.supplier_id:
+            supplier_id = int(supplier_id)
+            try:
+                with ctx.db.begin_nested():
+                    row = ctx.db.execute(
+                        text("SELECT id, name FROM suppliers WHERE id = :id"),
+                        {"id": supplier_id},
+                    ).fetchone()
+                if row:
+                    batch.supplier_id = row[0]
+                    batch.supplier_name = row[1]
+            except Exception as e:
+                logger.warning("Supplier ID lookup failed: %s", e)
+        elif supplier_name.strip() and not batch.supplier_id:
             try:
                 sp_savepoint = ctx.db.begin_nested()
                 rows = ctx.db.execute(
@@ -444,7 +1085,20 @@ def create_data_upload_tools(registry, ctx):
                 sp_savepoint.rollback()
                 logger.warning("Supplier lookup failed: %s", e)
 
-        if country_name.strip():
+        if country_id and not batch.country_id:
+            country_id = int(country_id)
+            try:
+                with ctx.db.begin_nested():
+                    row = ctx.db.execute(
+                        text("SELECT id, name FROM countries WHERE id = :id"),
+                        {"id": country_id},
+                    ).fetchone()
+                if row:
+                    batch.country_id = row[0]
+                    batch.country_name = row[1]
+            except Exception as e:
+                logger.warning("Country ID lookup failed: %s", e)
+        elif country_name.strip() and not batch.country_id:
             try:
                 ct_savepoint = ctx.db.begin_nested()
                 rows = ctx.db.execute(
@@ -459,8 +1113,21 @@ def create_data_upload_tools(registry, ctx):
                 ct_savepoint.rollback()
                 logger.warning("Country lookup failed: %s", e)
 
-        # ── Port lookup ──
-        if port_name.strip() and not batch.port_id:
+        # ── Port lookup (ID takes priority) ──
+        if port_id and not batch.port_id:
+            port_id = int(port_id)
+            try:
+                with ctx.db.begin_nested():
+                    row = ctx.db.execute(
+                        text("SELECT id, name FROM ports WHERE id = :id"),
+                        {"id": port_id},
+                    ).fetchone()
+                if row:
+                    batch.port_id = row[0]
+                    batch.port_name = row[1]
+            except Exception as e:
+                logger.warning("Port ID lookup failed: %s", e)
+        elif port_name.strip() and not batch.port_id:
             try:
                 pt_savepoint = ctx.db.begin_nested()
                 rows = ctx.db.execute(
@@ -508,7 +1175,7 @@ def create_data_upload_tools(registry, ctx):
 
         # ── Phase A: Code-level matching ──
         unmatched_rows = []
-        stats = {"new": 0, "update": 0, "no_change": 0, "anomaly": 0}
+        stats = {"new": 0, "update": 0, "no_change": 0}
 
         for sp in staging_rows:
             code = (sp.product_code or "").upper()
@@ -551,8 +1218,6 @@ def create_data_upload_tools(registry, ctx):
                     price_change_pct = round((new_price - old_price) / old_price * 100, 1)
                     if abs(price_change_pct) < 0.01:
                         action = "no_change"
-                    elif abs(price_change_pct) > 30:
-                        action = "anomaly"
                 elif new_price is None and old_price is not None:
                     action = "no_change"
 
@@ -565,7 +1230,7 @@ def create_data_upload_tools(registry, ctx):
                     "price_change_pct": price_change_pct,
                     "db_product_name": matched_db.product_name_en,
                 }
-                sp.validation_status = "quarantined" if (confidence < 0.7 or action == "anomaly") else "valid"
+                sp.validation_status = "quarantined" if confidence < 0.7 else "valid"
                 stats[action] += 1
             else:
                 # No match or very low confidence → mark for LLM
@@ -603,8 +1268,6 @@ def create_data_upload_tools(registry, ctx):
                                     price_change_pct = round((new_price - old_price) / old_price * 100, 1)
                                     if abs(price_change_pct) < 0.01:
                                         action = "no_change"
-                                    elif abs(price_change_pct) > 30:
-                                        action = "anomaly"
 
                                 sp.match_result = {
                                     "action": action,
@@ -615,7 +1278,7 @@ def create_data_upload_tools(registry, ctx):
                                     "price_change_pct": price_change_pct,
                                     "db_product_name": matched_product.product_name_en,
                                 }
-                                sp.validation_status = "quarantined" if (llm_conf < 0.7 or action == "anomaly") else "valid"
+                                sp.validation_status = "quarantined" if llm_conf < 0.7 else "valid"
                                 stats[action] += 1
                                 continue
 
@@ -654,7 +1317,6 @@ def create_data_upload_tools(registry, ctx):
             f"- 新增: {stats['new']}",
             f"- 更新: {stats['update']}",
             f"- 无变化: {stats['no_change']}",
-            f"- 价格异常(涨跌>30%): {stats['anomaly']}",
         ]
 
         if batch.supplier_name:
@@ -744,7 +1406,12 @@ def create_data_upload_tools(registry, ctx):
     # ── Tool 3: create_references ─────────────────────────────
 
     @registry.tool(
-        description="自动创建缺失的供应商/国家等引用数据。传入 JSON 指定需要创建的实体，或留空自动检测。",
+        description=(
+            "Create missing supplier or country entities in the database. "
+            "Pass a JSON string with entities to create. Call when "
+            "prepare_upload reports missing_supplier or missing_country, "
+            "then re-run prepare_upload."
+        ),
         parameters={
             "entities": {
                 "type": "STRING",
@@ -852,7 +1519,11 @@ def create_data_upload_tools(registry, ctx):
     # ── Tool 4: preview_changes ───────────────────────────────
 
     @registry.tool(
-        description="生成变更预览报告（新增/更新/异常/无变化），在执行前确认。无需参数。",
+        description=(
+            "Generate a change preview report (new/update/no-change). "
+            "Prefer prepare_upload which includes this step. Only call "
+            "directly for re-preview without re-running validation."
+        ),
         parameters={},
         group="data_upload",
     )
@@ -877,7 +1548,7 @@ def create_data_upload_tools(registry, ctx):
             return "Error: 没有可预览的数据（所有行都无效）"
 
         # Group by action
-        groups: dict[str, list] = {"new": [], "update": [], "no_change": [], "anomaly": []}
+        groups: dict[str, list] = {"new": [], "update": [], "no_change": []}
         for sp in staging_rows:
             mr = sp.match_result or {}
             action = mr.get("action", "new")
@@ -896,7 +1567,6 @@ def create_data_upload_tools(registry, ctx):
             f"### 统计",
             f"- 新增: {len(groups['new'])} 个",
             f"- 更新: {len(groups['update'])} 个",
-            f"- 价格异常: {len(groups['anomaly'])} 个",
             f"- 无变化: {len(groups['no_change'])} 个",
         ]
 
@@ -911,17 +1581,6 @@ def create_data_upload_tools(registry, ctx):
             lines.append("")
             lines.append(f"### 价格更新 (前10/{len(groups['update'])})")
             for sp in groups["update"][:10]:
-                mr = sp.match_result or {}
-                old = mr.get("old_price", "?")
-                new = sp.price
-                pct = mr.get("price_change_pct")
-                pct_str = f" ({pct:+.1f}%)" if pct is not None else ""
-                lines.append(f"  行{sp.row_number}: {sp.product_name} ${old} → ${new}{pct_str}")
-
-        if groups["anomaly"]:
-            lines.append("")
-            lines.append(f"### 价格异常明细 (全部 {len(groups['anomaly'])})")
-            for sp in groups["anomaly"]:
                 mr = sp.match_result or {}
                 old = mr.get("old_price", "?")
                 new = sp.price
@@ -945,19 +1604,8 @@ def create_data_upload_tools(registry, ctx):
             "stats": {
                 "new": len(groups["new"]),
                 "update": len(groups["update"]),
-                "anomaly": len(groups["anomaly"]),
                 "no_change": len(groups["no_change"]),
             },
-            "anomalies": [
-                {
-                    "row": sp.row_number,
-                    "name": sp.product_name,
-                    "old_price": (sp.match_result or {}).get("old_price"),
-                    "new_price": float(sp.price) if sp.price is not None else None,
-                    "change_pct": (sp.match_result or {}).get("price_change_pct"),
-                }
-                for sp in groups["anomaly"]
-            ],
             "new_items": [
                 {"row": sp.row_number, "name": sp.product_name, "code": sp.product_code, "price": float(sp.price) if sp.price is not None else None}
                 for sp in groups["new"][:15]
@@ -979,7 +1627,12 @@ def create_data_upload_tools(registry, ctx):
     # ── Tool 5: execute_upload ────────────────────────────────
 
     @registry.tool(
-        description="确认后原子执行产品导入：新增/更新产品 + 写入变更日志。支持排除指定行号。",
+        description=(
+            "Execute product import atomically: insert new products, update "
+            "existing ones, write change logs. Only call AFTER user explicitly "
+            "confirms the preview. Pass exclude_rows to skip rows. Use "
+            "rollback_batch to undo if import was wrong."
+        ),
         parameters={
             "exclude_rows": {
                 "type": "STRING",
@@ -1035,12 +1688,15 @@ def create_data_upload_tools(registry, ctx):
 
                 mr = sp.match_result or {}
                 action = mr.get("action", "new")
+                matched_id = mr.get("matched_product_id")
 
-                if action == "no_change":
-                    skipped += 1
-                    continue
+                # Route by whether a DB match exists, not by action label.
+                # This ensures products with action="no_change" (set by price-only
+                # check in resolve_and_validate) still go through full field
+                # comparison for dates, unit, pack_size, brand, currency.
+                # _NoChangeSignal handles truly unchanged items.
 
-                if action == "new":
+                if action == "new" and not matched_id:
                     # INSERT new product — use savepoint so one failure doesn't kill the session
                     try:
                         with ctx.db.begin_nested():
@@ -1092,13 +1748,9 @@ def create_data_upload_tools(registry, ctx):
                     except Exception as e:
                         failed.append(f"行{sp.row_number} {sp.product_name}: {str(e)}")
 
-                elif action in ("update", "anomaly"):
-                    # UPDATE existing product
-                    matched_id = mr.get("matched_product_id")
-                    if not matched_id:
-                        failed.append(f"行{sp.row_number} {sp.product_name}: 无匹配产品ID")
-                        continue
-
+                elif matched_id:
+                    # UPDATE existing product — all matched products go through
+                    # full field comparison regardless of action label.
                     try:
                         with ctx.db.begin_nested():
                             db_product = ctx.db.query(Product).filter(Product.id == matched_id).first()
@@ -1199,6 +1851,10 @@ def create_data_upload_tools(registry, ctx):
                     except Exception as e:
                         failed.append(f"行{sp.row_number} {sp.product_name}: {str(e)}")
 
+                else:
+                    # No match and not new — safe fallback
+                    skipped += 1
+
             # Commit all
             batch.status = "completed"
             batch.completed_at = datetime.utcnow()
@@ -1255,7 +1911,12 @@ def create_data_upload_tools(registry, ctx):
     # ── Tool 6: audit_data ────────────────────────────────────
 
     @registry.tool(
-        description="数据质量审计：代码级结构检查（列缺失/格式/重复/空值）+ LLM 语义审计（单位/价格/名称合理性）。无需参数。",
+        description=(
+            "Run data quality audit: structural checks (missing columns, format, "
+            "duplicates) plus LLM semantic audit (price/unit/name reasonableness). "
+            "Prefer prepare_upload which includes this. Call directly only for "
+            "standalone audit."
+        ),
         parameters={},
         group="data_upload",
     )
@@ -1353,6 +2014,474 @@ def create_data_upload_tools(registry, ctx):
         }
         text_report = "\n".join(lines)
         return text_report + "\n__STRUCTURED__\n" + json.dumps(structured, ensure_ascii=False)
+
+    # ── Tool 7: prepare_upload ────────────────────────────────
+
+    @registry.tool(
+        description=(
+            "One-step upload preparation: validation + audit + preview in a "
+            "single unified review card. Recommended tool for the validation "
+            "step — replaces separate resolve_and_validate + audit_data + "
+            "preview_changes. Pass supplier_name/supplier_id, country_name/country_id, "
+            "port_name/port_id, effective_from, effective_to. ID params take priority over names."
+        ),
+        parameters={
+            "supplier_name": {"type": "STRING", "description": "供应商名称", "required": False},
+            "supplier_id": {"type": "NUMBER", "description": "供应商ID（优先于 supplier_name）", "required": False},
+            "country_name": {"type": "STRING", "description": "国家名称", "required": False},
+            "country_id": {"type": "NUMBER", "description": "国家ID（优先于 country_name）", "required": False},
+            "port_name": {"type": "STRING", "description": "目标港口名称", "required": False},
+            "port_id": {"type": "NUMBER", "description": "港口ID（优先于 port_name）", "required": False},
+            "effective_from": {"type": "STRING", "description": "生效开始日期 YYYY-MM-DD", "required": False},
+            "effective_to": {"type": "STRING", "description": "生效结束日期 YYYY-MM-DD", "required": False},
+        },
+        group="data_upload",
+    )
+    def prepare_upload(supplier_name: str = "", supplier_id: int = 0, country_name: str = "", country_id: int = 0, port_name: str = "", port_id: int = 0, effective_from: str = "", effective_to: str = "") -> str:
+        from sqlalchemy import text as sa_text
+        from models import UploadBatch, StagingProduct, Product
+
+        batch, err = _load_batch(ctx)
+        if err:
+            return err
+
+        # ── Required field validation ──
+        has_country = batch.country_id or country_id or country_name.strip()
+        has_port = batch.port_id or port_id or port_name.strip()
+        if has_country and not has_port:
+            return "Error: 请提供目标港口名称（port_name 参数）。例如：横浜、Bangkok 等。"
+        if not batch.effective_from and not effective_from.strip():
+            return "Error: 请提供价格生效开始日期（effective_from 参数）。格式：YYYY-MM-DD。"
+        if not batch.effective_to and not effective_to.strip():
+            return "Error: 请提供价格生效结束日期（effective_to 参数）。格式：YYYY-MM-DD。"
+
+        staging_rows = (
+            ctx.db.query(StagingProduct)
+            .filter(StagingProduct.batch_id == batch.id)
+            .order_by(StagingProduct.row_number)
+            .all()
+        )
+        if not staging_rows:
+            return "Error: 暂存表中没有数据"
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase A: Resolve supplier / country / port / dates
+        #          (ID params take priority over name params)
+        # ═══════════════════════════════════════════════════════════
+        if supplier_id and not batch.supplier_id:
+            supplier_id = int(supplier_id)
+            try:
+                with ctx.db.begin_nested():
+                    row = ctx.db.execute(
+                        sa_text("SELECT id, name FROM suppliers WHERE id = :id"),
+                        {"id": supplier_id},
+                    ).fetchone()
+                if row:
+                    batch.supplier_id = row[0]
+                    batch.supplier_name = row[1]
+            except Exception as e:
+                logger.warning("Supplier ID lookup failed: %s", e)
+        elif supplier_name.strip() and not batch.supplier_id:
+            try:
+                sp_sv = ctx.db.begin_nested()
+                rows = ctx.db.execute(
+                    sa_text("SELECT id, name FROM suppliers WHERE name ILIKE :p LIMIT 5"),
+                    {"p": f"%{supplier_name.strip()}%"},
+                ).fetchall()
+                if rows:
+                    batch.supplier_id = rows[0][0]
+                    batch.supplier_name = rows[0][1]
+                sp_sv.commit()
+            except Exception as e:
+                sp_sv.rollback()
+                logger.warning("Supplier lookup failed: %s", e)
+
+        if country_id and not batch.country_id:
+            country_id = int(country_id)
+            try:
+                with ctx.db.begin_nested():
+                    row = ctx.db.execute(
+                        sa_text("SELECT id, name FROM countries WHERE id = :id"),
+                        {"id": country_id},
+                    ).fetchone()
+                if row:
+                    batch.country_id = row[0]
+                    batch.country_name = row[1]
+            except Exception as e:
+                logger.warning("Country ID lookup failed: %s", e)
+        elif country_name.strip() and not batch.country_id:
+            try:
+                ct_sv = ctx.db.begin_nested()
+                rows = ctx.db.execute(
+                    sa_text("SELECT id, name FROM countries WHERE name ILIKE :p OR code ILIKE :p LIMIT 5"),
+                    {"p": f"%{country_name.strip()}%"},
+                ).fetchall()
+                if rows:
+                    batch.country_id = rows[0][0]
+                    batch.country_name = rows[0][1]
+                ct_sv.commit()
+            except Exception as e:
+                ct_sv.rollback()
+                logger.warning("Country lookup failed: %s", e)
+
+        if port_id and not batch.port_id:
+            port_id = int(port_id)
+            try:
+                with ctx.db.begin_nested():
+                    row = ctx.db.execute(
+                        sa_text("SELECT id, name FROM ports WHERE id = :id"),
+                        {"id": port_id},
+                    ).fetchone()
+                if row:
+                    batch.port_id = row[0]
+                    batch.port_name = row[1]
+            except Exception as e:
+                logger.warning("Port ID lookup failed: %s", e)
+        elif port_name.strip() and not batch.port_id:
+            try:
+                pt_sv = ctx.db.begin_nested()
+                rows = ctx.db.execute(
+                    sa_text("SELECT id, name FROM ports WHERE name ILIKE :p LIMIT 5"),
+                    {"p": f"%{port_name.strip()}%"},
+                ).fetchall()
+                if rows:
+                    batch.port_id = rows[0][0]
+                    batch.port_name = rows[0][1]
+                pt_sv.commit()
+            except Exception as e:
+                pt_sv.rollback()
+                logger.warning("Port lookup failed: %s", e)
+
+        if effective_from.strip() and not batch.effective_from:
+            try:
+                batch.effective_from = datetime.strptime(effective_from.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        if effective_to.strip() and not batch.effective_to:
+            try:
+                batch.effective_to = datetime.strptime(effective_to.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        # ── Load DB products for matching ──
+        query = ctx.db.query(Product).filter(Product.status == True)
+        if batch.supplier_id:
+            query = query.filter(Product.supplier_id == batch.supplier_id)
+        if batch.country_id:
+            query = query.filter(Product.country_id == batch.country_id)
+        if batch.port_id:
+            query = query.filter(Product.port_id == batch.port_id)
+        db_products = query.all()
+
+        by_code: dict[str, Product] = {}
+        by_name: dict[str, Product] = {}
+        db_product_by_id: dict[int, Product] = {}
+        for dbp in db_products:
+            db_product_by_id[dbp.id] = dbp
+            if dbp.code:
+                by_code[dbp.code.upper()] = dbp
+            if dbp.product_name_en:
+                by_name[dbp.product_name_en.upper()] = dbp
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase A-2: Code + LLM matching (same logic as resolve_and_validate)
+        # ═══════════════════════════════════════════════════════════
+        unmatched_rows = []
+        match_stats = {"new": 0, "update": 0, "no_change": 0}
+
+        for sp in staging_rows:
+            code = (sp.product_code or "").upper()
+            name = (sp.product_name or "").upper()
+            new_price = float(sp.price) if sp.price is not None else None
+
+            matched_db = None
+            confidence = 0.0
+            match_method = ""
+
+            if code and code in by_code:
+                matched_db = by_code[code]
+                confidence = 1.0
+                match_method = "code_exact"
+            elif name and name in by_name:
+                matched_db = by_name[name]
+                confidence = 0.95
+                match_method = "name_exact"
+            else:
+                best_score = 0.0
+                for dbp in db_products:
+                    if not dbp.product_name_en:
+                        continue
+                    sim = SequenceMatcher(None, name, dbp.product_name_en.upper()).ratio()
+                    if sim > best_score and sim >= 0.6:
+                        best_score = sim
+                        matched_db = dbp
+                        match_method = "name_fuzzy"
+                confidence = best_score
+
+            if matched_db and confidence >= 0.6:
+                old_price = float(matched_db.price) if matched_db.price is not None else None
+                price_change_pct = None
+                action = "update"
+
+                if new_price is not None and old_price is not None and old_price > 0:
+                    price_change_pct = round((new_price - old_price) / old_price * 100, 1)
+                    if abs(price_change_pct) < 0.01:
+                        action = "no_change"
+                elif new_price is None and old_price is not None:
+                    action = "no_change"
+
+                sp.match_result = {
+                    "action": action,
+                    "confidence": round(confidence, 3),
+                    "matched_product_id": matched_db.id,
+                    "match_method": match_method,
+                    "old_price": old_price,
+                    "price_change_pct": price_change_pct,
+                    "db_product_name": matched_db.product_name_en,
+                }
+                sp.validation_status = "quarantined" if confidence < 0.7 else "valid"
+                match_stats[action] += 1
+            else:
+                if confidence < 0.6:
+                    matched_db = None
+                unmatched_rows.append(sp)
+
+        # LLM fuzzy matching for unmatched items
+        if unmatched_rows and db_products:
+            try:
+                llm_results = _llm_fuzzy_match(unmatched_rows, db_products, batch, ctx)
+                for sp in unmatched_rows:
+                    row_key = str(sp.row_number)
+                    if row_key in llm_results:
+                        lr = llm_results[row_key]
+                        matched_id = lr.get("matched_product_id")
+                        llm_conf = lr.get("confidence", 0)
+
+                        if matched_id and llm_conf >= 0.5:
+                            matched_product = db_product_by_id.get(matched_id)
+                            if matched_product:
+                                old_price = float(matched_product.price) if matched_product.price is not None else None
+                                new_price = float(sp.price) if sp.price is not None else None
+                                price_change_pct = None
+                                action = "update"
+
+                                if new_price is not None and old_price is not None and old_price > 0:
+                                    price_change_pct = round((new_price - old_price) / old_price * 100, 1)
+                                    if abs(price_change_pct) < 0.01:
+                                        action = "no_change"
+
+                                sp.match_result = {
+                                    "action": action,
+                                    "confidence": round(llm_conf, 3),
+                                    "matched_product_id": matched_product.id,
+                                    "match_method": "llm_fuzzy",
+                                    "old_price": old_price,
+                                    "price_change_pct": price_change_pct,
+                                    "db_product_name": matched_product.product_name_en,
+                                }
+                                sp.validation_status = "quarantined" if llm_conf < 0.7 else "valid"
+                                match_stats[action] += 1
+                                continue
+
+                    if not sp.match_result:
+                        sp.match_result = _make_new_match_result(sp, batch, ctx)
+                        sp.validation_status = "valid"
+                        match_stats["new"] += 1
+            except Exception as e:
+                logger.warning("LLM fuzzy match failed in prepare_upload: %s", e)
+                for sp in unmatched_rows:
+                    if not sp.match_result:
+                        sp.match_result = _make_new_match_result(sp, batch, ctx)
+                        sp.validation_status = "valid"
+                        match_stats["new"] += 1
+        else:
+            for sp in unmatched_rows:
+                sp.match_result = _make_new_match_result(sp, batch, ctx)
+                sp.validation_status = "valid"
+                match_stats["new"] += 1
+
+        # Update resolved IDs
+        for sp in staging_rows:
+            sp.resolved_supplier_id = batch.supplier_id
+            sp.resolved_country_id = batch.country_id
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase B: Audit
+        # ═══════════════════════════════════════════════════════════
+        audit_findings_raw = _code_audit(batch, staging_rows)
+        llm_audit = _llm_semantic_audit(batch, staging_rows, ctx)
+        if llm_audit is not None:
+            existing_keys = {(f["category"], tuple(f["rows"][:5])) for f in audit_findings_raw}
+            for lf in llm_audit:
+                if not isinstance(lf, dict) or not lf.get("message"):
+                    continue
+                lf.setdefault("severity", "info")
+                lf.setdefault("category", "other")
+                if not isinstance(lf.get("rows"), list):
+                    lf["rows"] = []
+                lf["rows"] = [r for r in lf["rows"] if isinstance(r, (int, float))]
+                lf.setdefault("suggestion", "")
+                if lf["severity"] not in ("error", "warning", "info"):
+                    lf["severity"] = "info"
+                key = (lf["category"], tuple(lf["rows"][:5]))
+                if key not in existing_keys:
+                    audit_findings_raw.append(lf)
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase C: Build unified review data
+        # ═══════════════════════════════════════════════════════════
+        new_items = []
+        updates = []
+        no_change_count = 0
+
+        # Collect audit error rows for cross-referencing
+        audit_error_rows: set[int] = set()
+        for af in audit_findings_raw:
+            if af.get("severity") == "error":
+                for r in af.get("rows", []):
+                    audit_error_rows.add(int(r))
+
+        for sp in staging_rows:
+            mr = sp.match_result or {}
+            action = mr.get("action", "new")
+            confidence = mr.get("confidence", 0)
+            matched_id = mr.get("matched_product_id")
+            db_name = mr.get("db_product_name", "")
+
+            # Build field diffs for matched items
+            diffs = []
+            if matched_id and action in ("update", "no_change"):
+                db_prod = db_product_by_id.get(matched_id)
+                if db_prod:
+                    # Price diff (round to 2dp to avoid float imprecision)
+                    if sp.price is not None:
+                        old_p = round(float(db_prod.price), 2) if db_prod.price is not None else None
+                        new_p = round(float(sp.price), 2)
+                        if old_p != new_p:
+                            diffs.append({"field": "price", "old": old_p, "new": new_p})
+                    # Unit diff
+                    if sp.unit and sp.unit != (db_prod.unit or ""):
+                        diffs.append({"field": "unit", "old": db_prod.unit, "new": sp.unit})
+                    # Pack size diff
+                    if sp.pack_size and sp.pack_size != (db_prod.pack_size or ""):
+                        diffs.append({"field": "pack_size", "old": db_prod.pack_size, "new": sp.pack_size})
+                    # Brand diff
+                    if sp.brand and sp.brand != (db_prod.brand or ""):
+                        diffs.append({"field": "brand", "old": db_prod.brand, "new": sp.brand})
+                    # Currency diff
+                    if sp.currency and sp.currency != (db_prod.currency or ""):
+                        diffs.append({"field": "currency", "old": db_prod.currency, "new": sp.currency})
+                    # Country of origin diff
+                    if sp.country_of_origin and sp.country_of_origin != (db_prod.country_of_origin if hasattr(db_prod, 'country_of_origin') else ""):
+                        diffs.append({"field": "country_of_origin", "old": getattr(db_prod, 'country_of_origin', None), "new": sp.country_of_origin})
+                    # Effective date diffs
+                    if batch.effective_from:
+                        old_from = db_prod.effective_from
+                        old_from_date = old_from.date() if hasattr(old_from, 'date') and old_from else old_from
+                        if old_from_date != batch.effective_from:
+                            diffs.append({"field": "effective_from", "old": str(old_from) if old_from else None, "new": str(batch.effective_from)})
+                    if batch.effective_to:
+                        old_to = db_prod.effective_to
+                        old_to_date = old_to.date() if hasattr(old_to, 'date') and old_to else old_to
+                        if old_to_date != batch.effective_to:
+                            diffs.append({"field": "effective_to", "old": str(old_to) if old_to else None, "new": str(batch.effective_to)})
+
+            # Build warning string for items needing attention
+            warnings = []
+            if action in ("update",) and confidence < 0.7:
+                warnings.append(f"低置信度({confidence:.0%})")
+            if sp.row_number in audit_error_rows:
+                for af in audit_findings_raw:
+                    if af.get("severity") == "error" and sp.row_number in af.get("rows", []):
+                        warnings.append(af.get("message", "审计错误"))
+                        break
+            warning = " | ".join(warnings) if warnings else None
+
+            # Classify — no more "problematic" group
+            effective_action = action
+            if action == "no_change" and diffs:
+                effective_action = "update"
+
+            if effective_action == "new":
+                new_items.append({
+                    "row": sp.row_number,
+                    "name": sp.product_name,
+                    "code": sp.product_code,
+                    "price": float(sp.price) if sp.price is not None else None,
+                    "unit": sp.unit,
+                    "pack_size": sp.pack_size,
+                    "brand": sp.brand,
+                })
+            elif effective_action == "update" and diffs:
+                updates.append({
+                    "row": sp.row_number,
+                    "name": sp.product_name,
+                    "code": sp.product_code,
+                    "confidence": confidence,
+                    "match_method": mr.get("match_method", ""),
+                    "db_name": db_name,
+                    "diffs": diffs,
+                    "warning": warning,
+                })
+            else:
+                no_change_count += 1
+
+        # Set batch status
+        batch.status = "previewing"
+        ctx.db.commit()
+
+        # ── Build text report ──
+        total = len(staging_rows)
+        lines = [
+            f"## 上传审查（批次 #{batch.id}）",
+            f"- 总数: {total} | 新增: {len(new_items)} | 更新: {len(updates)} | 无变化: {no_change_count}",
+        ]
+        if batch.supplier_name:
+            lines.append(f"- 供应商: {batch.supplier_name}")
+        elif supplier_name:
+            lines.append(f"- 未找到供应商 '{supplier_name}'")
+        if batch.country_name:
+            lines.append(f"- 国家: {batch.country_name}")
+        if batch.port_name:
+            lines.append(f"- 港口: {batch.port_name}")
+        if batch.effective_from or batch.effective_to:
+            lines.append(f"- 有效期: {batch.effective_from or '?'} ~ {batch.effective_to or '?'}")
+
+        lines.append("\n请审查后执行导入。")
+
+        # ── Build audit_findings for card (non-row-level) ──
+        card_audit_findings = []
+        for af in audit_findings_raw:
+            if not af.get("rows"):
+                card_audit_findings.append({
+                    "severity": af.get("severity", "info"),
+                    "message": af.get("message", ""),
+                    "suggestion": af.get("suggestion", ""),
+                })
+
+        # ── Build structured data ──
+        structured = {
+            "card_type": "upload_review",
+            "batch_id": batch.id,
+            "supplier": {"name": batch.supplier_name, "id": batch.supplier_id},
+            "country": {"name": batch.country_name, "id": batch.country_id},
+            "port": {"name": batch.port_name, "id": batch.port_id},
+            "effective_from": str(batch.effective_from) if batch.effective_from else None,
+            "effective_to": str(batch.effective_to) if batch.effective_to else None,
+            "stats": {
+                "new": len(new_items),
+                "update": len(updates),
+                "no_change": no_change_count,
+                "total": total,
+            },
+            "new_items": new_items[:50],
+            "updates": updates[:50],
+            "audit_findings": card_audit_findings,
+            "missing_supplier": bool(supplier_name and not batch.supplier_id),
+            "missing_country": bool(country_name and not batch.country_id),
+        }
+        text_report = "\n".join(lines)
+        return text_report + "\n__STRUCTURED__\n" + json.dumps(structured, ensure_ascii=False, default=str)
 
 
 # ── Audit Helpers ──────────────────────────────────────────────

@@ -317,6 +317,7 @@ export interface Order {
   status: OrderStatus;
   processing_error: string | null;
   country_id: number | null;
+  country_name: string | null;
   port_id: number | null;
   delivery_date: string | null;
   extraction_data: Record<string, unknown> | null;
@@ -742,6 +743,138 @@ export function streamInquiryProgressWithKey(
   })();
 
   return () => controller.abort();
+}
+
+// ─── Inquiry Readiness ────────────────────────────────────
+
+export interface FieldGap {
+  key: string;
+  cell: string;
+  label: string;
+  type: "text" | "date" | "number";
+  category: "order" | "supplier" | "company" | "delivery";
+  severity: "blocking" | "warning";
+  current_value: string | null;
+}
+
+export interface SupplierReadiness {
+  status: "ready" | "needs_input" | "completed" | "blocked";
+  gen_status: "pending" | "generating" | "completed" | "error";
+  supplier_name: string;
+  product_count: number;
+  subtotal: number;
+  currency: string;
+  template: {
+    id: number | null;
+    name: string | null;
+    method: string;
+    has_zone_config: boolean;
+  };
+  gaps: FieldGap[];
+  gap_summary: {
+    total: number;
+    resolved: number;
+    warnings: number;
+    blocking: number;
+  };
+  file?: {
+    filename: string;
+    file_url: string;
+    preview_url?: string;
+    product_count: number;
+  } | null;
+  verify_results?: VerifyResult[];
+  elapsed_seconds?: number;
+  error?: string;
+}
+
+export interface InquiryReadiness {
+  suppliers: Record<string, SupplierReadiness>;
+  summary: {
+    ready: number;
+    needs_input: number;
+    blocked: number;
+    total: number;
+  };
+}
+
+export async function getInquiryReadiness(orderId: number): Promise<InquiryReadiness> {
+  const res = await fetchWithAuth(`${API_BASE}/api/orders/${orderId}/inquiry-readiness`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "加载失败" }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ─── Inquiry Data Preview ──────────────────────────────────
+
+export interface InquiryDataPreviewField {
+  cell: string;
+  path: string;
+  label: string;
+  value: string | null;
+  source: "order" | "supplier" | "company" | "delivery";
+}
+
+export interface InquiryDataPreview {
+  supplier_id: number;
+  supplier_name: string;
+  template: {
+    id: number | null;
+    name: string | null;
+    method: string;
+    has_zone_config: boolean;
+  };
+  header_fields: InquiryDataPreviewField[];
+  field_overrides: Record<string, string>;
+  product_columns: [string, string][] | null;
+  formula_columns: string[] | null;
+  summary_formulas: { cell: string; type: string; label: string }[] | null;
+  products: Record<string, unknown>[];
+  total_products: number;
+  warnings: string[];
+  order_metadata: {
+    po_number: string;
+    ship_name: string;
+    delivery_date: string;
+    currency: string;
+  };
+}
+
+export async function getInquiryDataPreview(
+  orderId: number,
+  supplierId: number,
+  templateId?: number | null,
+): Promise<InquiryDataPreview> {
+  const params = templateId ? `?template_id=${templateId}` : "";
+  const res = await fetchWithAuth(
+    `${API_BASE}/api/orders/${orderId}/inquiry-data-preview/${supplierId}${params}`
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "预览失败" }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function saveInquiryFieldOverrides(
+  orderId: number,
+  supplierId: number,
+  overrides: Record<string, string>,
+): Promise<void> {
+  const res = await fetchWithAuth(
+    `${API_BASE}/api/orders/${orderId}/inquiry-field-overrides/${supplierId}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ overrides }),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "保存失败" }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
 }
 
 export async function getInquiryPreview(

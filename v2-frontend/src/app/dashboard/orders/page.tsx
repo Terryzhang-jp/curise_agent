@@ -254,6 +254,7 @@ export default function OrdersPage() {
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState("all");
   const [fulfillmentFilter, setFulfillmentFilter] = useState("all");
+  const [countryFilter, setCountryFilter] = useState("all");
   const [showUpload, setShowUpload] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadOrderId, setUploadOrderId] = useState<number | null>(null);
@@ -448,9 +449,15 @@ export default function OrdersPage() {
     }
   };
 
-  const filteredOrders = fulfillmentFilter === "all"
-    ? orders
-    : orders.filter((o) => o.fulfillment_status === fulfillmentFilter);
+  const countryOptions = Array.from(
+    new Set(orders.map((o) => o.country_name).filter(Boolean) as string[])
+  ).sort();
+
+  const filteredOrders = orders.filter((o) => {
+    if (fulfillmentFilter !== "all" && o.fulfillment_status !== fulfillmentFilter) return false;
+    if (countryFilter !== "all" && (o.country_name || "") !== countryFilter) return false;
+    return true;
+  });
 
   const columns: ColumnDef<OrderListItem>[] = [
     {
@@ -477,6 +484,11 @@ export default function OrdersPage() {
       accessorKey: "order_metadata.ship_name",
       header: "船名",
       cell: ({ row }) => row.original.order_metadata?.ship_name || "-",
+    },
+    {
+      accessorKey: "country_name",
+      header: "国家",
+      cell: ({ row }) => row.original.country_name || "-",
     },
     {
       accessorKey: "status",
@@ -605,6 +617,17 @@ export default function OrdersPage() {
               <SelectItem value="all">全部履约</SelectItem>
               {Object.entries(FULFILLMENT_LABELS).map(([k, v]) => (
                 <SelectItem key={k} value={k}>{v}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={countryFilter} onValueChange={setCountryFilter}>
+            <SelectTrigger className="w-32 h-8 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部国家</SelectItem>
+              {countryOptions.map((c) => (
+                <SelectItem key={c} value={c}>{c}</SelectItem>
               ))}
             </SelectContent>
           </Select>

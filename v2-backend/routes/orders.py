@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session as DBSession
 
 from config import settings
 from database import get_db, SessionLocal
-from models import Order, User
+from models import Order, User, Country
 from routes.auth import get_current_user
 from security import require_role
 from schemas import OrderListItem, OrderDetail, OrderReviewRequest, OrderUpdateRequest, OrderRematchRequest
@@ -129,7 +129,20 @@ def list_orders(
     total = query.count()
     orders = query.order_by(desc(Order.created_at)).offset(offset).limit(limit).all()
 
-    return {"total": total, "items": [OrderListItem.model_validate(o) for o in orders]}
+    # Batch-resolve country names
+    cids = {o.country_id for o in orders if o.country_id}
+    country_map: dict[int, str] = {}
+    if cids:
+        rows = db.query(Country.id, Country.name).filter(Country.id.in_(cids)).all()
+        country_map = {r.id: r.name for r in rows}
+
+    items = []
+    for o in orders:
+        item = OrderListItem.model_validate(o)
+        item.country_name = country_map.get(o.country_id) if o.country_id else None
+        items.append(item)
+
+    return {"total": total, "items": items}
 
 
 @router.get("/{order_id}", response_model=OrderDetail)
@@ -822,6 +835,373 @@ def download_order_file(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )
+
+
+# ─── Inquiry Readiness ─────────────────────────────────────────
+
+@router.get("/{order_id}/inquiry-readiness")
+def inquiry_readiness(
+    order_id: int,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """Check inquiry generation readiness for ALL suppliers in an order.
+
+    Returns per-supplier status (ready/needs_input/blocked), gaps that need
+    user attention, and an overall summary. This is the single source of truth
+    for the frontend's inquiry tab rendering.
+    """
+    from services.inquiry_agent import resolve_template, _build_order_data_for_engine
+    from services.field_schema import analyze_gaps, schema_from_zone_config
+    from models import SupplierTemplate
+    import sqlalchemy
+
+    order = _get_order(db, order_id, current_user)
+    if not order.match_results:
+        return {"suppliers": {}, "summary": {"ready": 0, "needs_input": 0, "blocked": 0, "total": 0}}
+
+    # Group products by supplier
+    products_by_supplier: dict[int, list] = {}
+    for p in order.match_results:
+        sid = (p.get("matched_product") or {}).get("supplier_id")
+        if sid:
+            products_by_supplier.setdefault(sid, []).append(p)
+
+    # Load all templates + supplier info
+    all_templates = db.query(SupplierTemplate).all()
+    supplier_ids = list(products_by_supplier.keys())
+    supplier_rows = {}
+    if supplier_ids:
+        rows = db.execute(
+            sqlalchemy.text("SELECT id, name, contact, email, phone FROM suppliers WHERE id = ANY(:ids)"),
+            {"ids": supplier_ids},
+        ).fetchall()
+        for row in rows:
+            supplier_rows[row[0]] = {"name": row[1], "contact": row[2], "email": row[3], "phone": row[4]}
+
+    order_meta = order.order_metadata or {}
+    inquiry_data = order.inquiry_data or {}
+    existing_suppliers = inquiry_data.get("suppliers", {})
+
+    result_suppliers: dict[str, Any] = {}
+    total_ready = 0
+    total_needs_input = 0
+    total_blocked = 0
+
+    for sid, products in products_by_supplier.items():
+        sid_str = str(sid)
+        info = supplier_rows.get(sid, {"name": f"供应商 #{sid}", "contact": "", "email": "", "phone": ""})
+
+        # Template resolution
+        template, method, candidates = resolve_template(sid, all_templates)
+
+        # Check for user template override in inquiry_data
+        existing_entry = existing_suppliers.get(sid_str, {})
+        field_overrides = existing_entry.get("field_overrides", {})
+
+        # Build order_data for gap analysis
+        order_data = _build_order_data_for_engine(
+            order.id, order_meta, sid, products, info, _db=db,
+        )
+
+        # Get field_schema
+        field_schema = None
+        template_name = None
+        has_zone_config = False
+
+        if template:
+            template_name = template.template_name
+            ts = template.template_styles or {}
+            if "zones" in ts:
+                has_zone_config = True
+                # Prefer new field_schema, fall back to building from header_fields
+                field_schema = ts.get("field_schema")
+                if not field_schema:
+                    field_schema = schema_from_zone_config(ts)
+
+        # Gap analysis
+        if field_schema:
+            gap_report = analyze_gaps(field_schema, order_data, sid, field_overrides)
+            if gap_report["ready"]:
+                status = "ready"
+                total_ready += 1
+            elif gap_report["summary"]["blocking"] > 0:
+                status = "needs_input"
+                total_needs_input += 1
+            else:
+                status = "ready"  # only warnings, can still generate
+                total_ready += 1
+        else:
+            # No field_schema — can still generate via LLM path, but flag it
+            gap_report = {"gaps": [], "summary": {"total": 0, "resolved": 0, "warnings": 0, "blocking": 0}, "ready": True}
+            status = "ready"
+            total_ready += 1
+
+        # Compute subtotal
+        subtotal = 0.0
+        for p in products:
+            mp = p.get("matched_product") or {}
+            qty = p.get("quantity") or 0
+            price = p.get("unit_price") or mp.get("price") or 0
+            try:
+                subtotal += float(qty) * float(price)
+            except (TypeError, ValueError):
+                pass
+
+        # Check generation status from existing inquiry_data
+        gen_status = existing_entry.get("status", "pending")
+        if gen_status == "completed":
+            status = "completed"
+
+        result_suppliers[sid_str] = {
+            "status": status,
+            "gen_status": gen_status,
+            "supplier_name": info.get("name", ""),
+            "product_count": len(products),
+            "subtotal": round(subtotal, 2),
+            "currency": order_meta.get("currency", ""),
+            "template": {
+                "id": template.id if template else None,
+                "name": template_name,
+                "method": method,
+                "has_zone_config": has_zone_config,
+            },
+            "gaps": gap_report["gaps"],
+            "gap_summary": gap_report["summary"],
+            "file": existing_entry.get("file"),
+            "verify_results": existing_entry.get("verify_results"),
+            "elapsed_seconds": existing_entry.get("elapsed_seconds"),
+            "error": existing_entry.get("error"),
+        }
+
+    return {
+        "suppliers": result_suppliers,
+        "summary": {
+            "ready": total_ready,
+            "needs_input": total_needs_input,
+            "blocked": total_blocked,
+            "total": len(products_by_supplier),
+        },
+    }
+
+
+# ─── Inquiry Data Preview ─────────────────────────────────────
+
+@router.get("/{order_id}/inquiry-data-preview/{supplier_id}")
+def inquiry_data_preview(
+    order_id: int,
+    supplier_id: int,
+    template_id: int | None = Query(None, description="Override template ID"),
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """Preview what order data will fill into a supplier's inquiry template.
+
+    Returns structured preview of header fields (with resolved values),
+    product data summary, and any warnings — without generating the actual Excel.
+    """
+    from services.inquiry_agent import resolve_template, _build_order_data_for_engine
+    from services.template_engine import _resolve_path, _resolve_product_field
+    from models import SupplierTemplate
+    import sqlalchemy
+
+    order = _get_order(db, order_id, current_user)
+    if not order.match_results:
+        raise HTTPException(400, "没有匹配结果")
+
+    # Gather products for this supplier
+    products = [
+        p for p in order.match_results
+        if (p.get("matched_product") or {}).get("supplier_id") == supplier_id
+    ]
+    if not products:
+        raise HTTPException(404, f"供应商 {supplier_id} 不在此订单中")
+
+    # Load supplier info
+    row = db.execute(
+        sqlalchemy.text("SELECT id, name, contact, email, phone FROM suppliers WHERE id = :sid"),
+        {"sid": supplier_id},
+    ).fetchone()
+    supplier_info = {
+        "name": row[1] if row else "",
+        "contact": row[2] if row else "",
+        "email": row[3] if row else "",
+        "phone": row[4] if row else "",
+    } if row else {"name": f"供应商 #{supplier_id}", "contact": "", "email": "", "phone": ""}
+
+    # Resolve template
+    all_templates = db.query(SupplierTemplate).all()
+    if template_id:
+        template = db.query(SupplierTemplate).filter(SupplierTemplate.id == template_id).first()
+        method = "user_selected"
+    else:
+        template, method, _ = resolve_template(supplier_id, all_templates)
+
+    # Build order_data (same as generation pipeline)
+    order_meta = order.order_metadata or {}
+    order_data = _build_order_data_for_engine(
+        order.id, order_meta, supplier_id, products, supplier_info, _db=db,
+    )
+
+    sid = str(supplier_id)
+    warnings: list[str] = []
+    header_fields: list[dict] = []
+    product_preview: list[dict] = []
+
+    # Get zone_config from template
+    # zone_config fields (zones, header_fields, product_columns, etc.) are stored
+    # flat at the root of template_styles, not nested under a "zone_config" key.
+    zone_config = None
+    template_name = None
+    if template:
+        template_name = template.template_name
+        ts = template.template_styles or {}
+        if "zones" in ts:
+            zone_config = ts
+
+    if zone_config:
+        # Resolve header fields
+        for cell_ref, data_path in zone_config.get("header_fields", {}).items():
+            value = _resolve_path(order_data, data_path, sid)
+            # Determine field label from path
+            label = data_path.split(".")[-1]
+            label_map = {
+                "po_number": "PO 号", "ship_name": "船名", "delivery_date": "交付日期",
+                "order_date": "订单日期", "currency": "货币", "destination_port": "目的港",
+                "delivery_address": "交付地址", "voyage": "航次",
+                "supplier_name": "供应商名称", "name": "名称", "contact": "联系人",
+                "email": "邮箱", "phone": "电话", "address": "地址",
+                "contact_person": "联系人", "contact_phone": "联系电话",
+                "ship_name_label": "船名标签", "delivery_notes": "交付备注",
+                "fax": "传真", "company_name": "公司名称",
+            }
+            header_fields.append({
+                "cell": cell_ref,
+                "path": data_path,
+                "label": label_map.get(label, label),
+                "value": str(value) if value is not None else None,
+                "source": "order" if not data_path.startswith("suppliers.") and not data_path.startswith("company.") and not data_path.startswith("delivery_location.") else (
+                    "supplier" if "supplier" in data_path else (
+                        "company" if data_path.startswith("company.") else "delivery"
+                    )
+                ),
+            })
+            if value is None or (isinstance(value, str) and not value.strip()):
+                warnings.append(f"字段 {label_map.get(label, label)} ({cell_ref}) 无数据")
+
+        # Build product preview from zone_config column mapping
+        col_map = zone_config.get("product_columns", {})
+        po_number = order_data.get("po_number", "")
+        currency = order_data.get("currency") or "JPY"
+        engine_products = order_data.get("suppliers", {}).get(sid, {}).get("products", [])
+
+        # Flat order context for per-row order-level fields (flat-table templates)
+        _sup_data = order_data.get("suppliers", {}).get(sid, {})
+        _order_ctx = {
+            "ship_name": order_data.get("ship_name", ""),
+            "delivery_date": order_data.get("delivery_date", ""),
+            "order_date": order_data.get("order_date", ""),
+            "supplier_name": _sup_data.get("supplier_name", ""),
+        }
+
+        for i, p in enumerate(engine_products[:20]):  # cap at 20 for preview
+            row_data: dict = {"_index": i + 1}
+            for col_letter, field_name in col_map.items():
+                val = _resolve_product_field(field_name, p, i, po_number, currency, _order_ctx)
+                row_data[field_name] = val
+            product_preview.append(row_data)
+
+        # Check for formula columns
+        formula_cols = list(zone_config.get("product_row_formulas", {}).keys())
+        summary_formulas = zone_config.get("summary_formulas", [])
+    else:
+        # No zone_config — still show product data in generic format
+        formula_cols = []
+        summary_formulas = []
+        engine_products = order_data.get("suppliers", {}).get(sid, {}).get("products", [])
+        for i, p in enumerate(engine_products[:20]):
+            product_preview.append({
+                "_index": i + 1,
+                "product_code": p.get("product_code", ""),
+                "product_name": p.get("product_name", ""),
+                "quantity": p.get("quantity"),
+                "unit": p.get("unit", ""),
+                "unit_price": p.get("unit_price"),
+                "pack_size": p.get("pack_size", ""),
+            })
+        warnings.append("该供应商没有绑定的模板配置，将使用 LLM 模式生成")
+
+    # Data completeness warnings
+    missing_vals = sum(1 for h in header_fields if h["value"] is None)
+    empty_prices = sum(1 for p in product_preview if p.get("unit_price") is None)
+    if empty_prices:
+        warnings.append(f"{empty_prices} 个产品缺少单价")
+
+    # Load existing field_overrides if any
+    inquiry_data = order.inquiry_data or {}
+    existing_overrides = (
+        inquiry_data.get("suppliers", {}).get(str(supplier_id), {}).get("field_overrides", {})
+    )
+
+    return {
+        "supplier_id": supplier_id,
+        "supplier_name": supplier_info.get("name", ""),
+        "template": {
+            "id": template.id if template else None,
+            "name": template_name,
+            "method": method,
+            "has_zone_config": zone_config is not None,
+        },
+        "header_fields": header_fields,
+        "field_overrides": existing_overrides,
+        "product_columns": list((zone_config or {}).get("product_columns", {}).items()) if zone_config else None,
+        "formula_columns": formula_cols if zone_config else None,
+        "summary_formulas": [{"cell": sf["cell"], "type": sf["type"], "label": sf.get("label", "")} for sf in summary_formulas] if zone_config else None,
+        "products": product_preview,
+        "total_products": len(engine_products),
+        "warnings": warnings,
+        "order_metadata": {
+            "po_number": order_meta.get("po_number", ""),
+            "ship_name": order_meta.get("ship_name", ""),
+            "delivery_date": order_meta.get("delivery_date", ""),
+            "currency": order_meta.get("currency", ""),
+        },
+    }
+
+
+class FieldOverridesRequest(BaseModel):
+    overrides: dict[str, str]
+
+@router.post("/{order_id}/inquiry-field-overrides/{supplier_id}")
+def save_inquiry_field_overrides(
+    order_id: int,
+    supplier_id: int,
+    body: FieldOverridesRequest,
+    current_user: User = Depends(require_writer),
+    db: DBSession = Depends(get_db),
+):
+    """Save user-edited field overrides for a supplier's inquiry generation.
+
+    Stored in order.inquiry_data.suppliers[sid].field_overrides = {cell_ref: value}.
+    These overrides are applied on top of resolved values during Excel generation.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    order = _get_order(db, order_id, current_user)
+    inquiry_data = order.inquiry_data or {"suppliers": {}}
+    suppliers = inquiry_data.setdefault("suppliers", {})
+    sid = str(supplier_id)
+    supplier_entry = suppliers.setdefault(sid, {})
+
+    # Only store non-empty overrides
+    cleaned = {k: v for k, v in body.overrides.items() if v and v.strip()}
+    supplier_entry["field_overrides"] = cleaned
+
+    order.inquiry_data = inquiry_data
+    flag_modified(order, "inquiry_data")
+    db.commit()
+
+    return {"status": "saved", "overrides_count": len(cleaned)}
 
 
 @router.post("/{order_id}/files/{filename}/download")

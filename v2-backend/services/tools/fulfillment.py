@@ -16,6 +16,43 @@ import uuid
 from datetime import datetime
 
 from config import settings
+from services.tools.registry_loader import ToolMetaInfo
+
+TOOL_META = {
+    "get_order_fulfillment": ToolMetaInfo(
+        display_name="查看履约状态",
+        group="business",
+        description="查看订单履约状态（交货、发票、付款）",
+        prompt_description="查看订单履约状态（交货、发票、付款）",
+        summary="查看履约状态",
+    ),
+    "update_order_fulfillment": ToolMetaInfo(
+        display_name="更新履约状态",
+        group="business",
+        description="更新订单履约状态和财务信息",
+        prompt_description="更新订单履约状态和财务信息",
+        summary="更新履约状态",
+    ),
+    "record_delivery_receipt": ToolMetaInfo(
+        display_name="记录交货验收",
+        group="business",
+        description="记录港口交货验收（逐产品接收/拒收）",
+        prompt_description="记录港口交货验收（逐产品接收/拒收）",
+        summary="记录交货验收",
+    ),
+    "attach_order_file": ToolMetaInfo(
+        display_name="附加订单文件",
+        group="business",
+        description="将上传的图片/文件附加到订单",
+        prompt_description="将上传的图片/文件附加到订单",
+        summary="附加订单文件",
+    ),
+}
+
+
+def register(registry, ctx=None):
+    """Auto-discovery compatible alias."""
+    create_fulfillment_tools(registry, ctx)
 
 
 VALID_TRANSITIONS = {

@@ -27,6 +27,9 @@ class Settings:
     # Google AI (Gemini)
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 
+    # Kimi K2.5 (Moonshot) — preferred for agent tool calling (93% accuracy)
+    MOONSHOT_API_KEY: str = os.getenv("MOONSHOT_API_KEY", "")
+
     # Google Document AI (optional — for OCR extraction)
     DOCUMENT_AI_PROJECT_ID: str = os.getenv("DOCUMENT_AI_PROJECT_ID", "")
     DOCUMENT_AI_PROCESSOR_ID: str = os.getenv("DOCUMENT_AI_PROCESSOR_ID", "")
@@ -48,6 +51,9 @@ class Settings:
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
     STORAGE_BUCKET: str = os.getenv("STORAGE_BUCKET", "v2-files")
+
+    # Agent workspace root (session-isolated working directories)
+    AGENT_WORKSPACE_ROOT: str = os.getenv("AGENT_WORKSPACE_ROOT", "/tmp/workspace")
 
 
 settings = Settings()

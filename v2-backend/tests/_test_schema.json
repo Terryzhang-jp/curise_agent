@@ -1,0 +1,266 @@
+{
+  "document_type": "Purchase Order",
+  "attribute_groups": [
+    {
+      "name": "订单基本信息",
+      "name_en": "Order Basic Information",
+      "type": "single",
+      "description": "Contains core identification and timing details for the purchase order.",
+      "attributes": [
+        {
+          "key": "purchase_order_number",
+          "label": "Purchase Order Number",
+          "type": "text",
+          "sample_value": "PO102292CCI",
+          "required": true
+        },
+        {
+          "key": "date_of_order",
+          "label": "Date Of Order",
+          "type": "date",
+          "sample_value": "12-Feb-2026",
+          "required": true
+        },
+        {
+          "key": "vessel_name",
+          "label": "Vessel",
+          "type": "text",
+          "sample_value": "CELEBRITY SOLSTICE",
+          "required": true
+        },
+        {
+          "key": "department",
+          "label": "Department",
+          "type": "text",
+          "sample_value": "FAB",
+          "required": false
+        },
+        {
+          "key": "total_amount",
+          "label": "Total",
+          "type": "currency",
+          "sample_value": "45,648.18",
+          "required": true
+        },
+        {
+          "key": "currency",
+          "label": "Currency",
+          "type": "text",
+          "sample_value": "USD",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "参与方信息",
+      "name_en": "Parties Information",
+      "type": "single",
+      "description": "Details regarding the supplier, delivery destination, and billing entities.",
+      "attributes": [
+        {
+          "key": "supplier_address",
+          "label": "Supplier Address",
+          "type": "text",
+          "sample_value": "Three Win Co Ltd, JAPAN, 901-0306 Itoman-Shi, 5 Chome-12-10 Nishizakicho",
+          "required": true
+        },
+        {
+          "key": "delivery_address",
+          "label": "Delivery Address",
+          "type": "text",
+          "sample_value": "1050 Caribbean Way, MIAMI, FL 33331, UNITED STATES",
+          "required": true
+        },
+        {
+          "key": "bill_to_address",
+          "label": "Bill To / Ship To Address",
+          "type": "text",
+          "sample_value": "Celebrity Cruises Inc. ATTN: Accounts Payable PO Box 025545 Miami, Florida 33102-5545 U.S.A.",
+          "required": true
+        },
+        {
+          "key": "contact_person",
+          "label": "Contact Person",
+          "type": "text",
+          "sample_value": "JHOMEL HERRERA, PH: 954-517-3564",
+          "required": false
+        },
+        {
+          "key": "purchasing_agent_email",
+          "label": "Purchasing Agent Email",
+          "type": "text",
+          "sample_value": "fleetservicesSL@rccl.com",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "物流与支付条款",
+      "name_en": "Logistics & Payment Terms",
+      "type": "single",
+      "description": "Shipping schedules and financial terms.",
+      "attributes": [
+        {
+          "key": "payment_terms",
+          "label": "Payment Terms",
+          "type": "text",
+          "sample_value": "Net 75",
+          "required": true
+        },
+        {
+          "key": "final_destination",
+          "label": "Final Destination",
+          "type": "text",
+          "sample_value": "HO CHI MINH",
+          "required": false
+        },
+        {
+          "key": "port_code",
+          "label": "Port Code",
+          "type": "text",
+          "sample_value": "PHU",
+          "required": false
+        },
+        {
+          "key": "loading_date",
+          "label": "Loading Date",
+          "type": "date",
+          "sample_value": "MARCH 08 2026",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "产品列表",
+      "name_en": "Product List",
+      "type": "repeating",
+      "description": "Detailed list of items ordered including quantities and pricing.",
+      "columns": [
+        {
+          "key": "line_number",
+          "label": "L No",
+          "type": "number",
+          "sample_value": "1"
+        },
+        {
+          "key": "product_code",
+          "label": "Item Number",
+          "type": "text",
+          "sample_value": "99PRD010588"
+        },
+        {
+          "key": "product_description",
+          "label": "Description",
+          "type": "text",
+          "sample_value": "APPLE GRANNY SMITH US EXTRA FANCY"
+        },
+        {
+          "key": "quantity",
+          "label": "Quantity",
+          "type": "number",
+          "sample_value": "182.00"
+        },
+        {
+          "key": "unit",
+          "label": "Unit",
+          "type": "text",
+          "sample_value": "KG2.2"
+        },
+        {
+          "key": "unit_price",
+          "label": "Unit Price",
+          "type": "currency",
+          "sample_value": "1.95"
+        },
+        {
+          "key": "extended_price",
+          "label": "Extended Price",
+          "type": "currency",
+          "sample_value": "2659.80"
+        }
+      ],
+      "estimated_row_count": 104
+    },
+    {
+      "name": "条款与条件",
+      "name_en": "Terms & Conditions",
+      "type": "text_block",
+      "description": "Legal clauses and standard operating procedures for vendors.",
+      "attributes": [
+        {
+          "key": "vendor_receipt_confirmation",
+          "label": "VENDOR RECEIPT OF ORDER CONFIRMATION",
+          "type": "text"
+        },
+        {
+          "key": "instructions_and_conditions",
+          "label": "INSTRUCTIONS AND CONDITIONS",
+          "type": "text"
+        },
+        {
+          "key": "legal_terms",
+          "label": "PURCHASE ORDER TERMS AND CONDITIONS",
+          "type": "text"
+        }
+      ]
+    }
+  ],
+  "page_layout": {
+    "total_pages": 38,
+    "cover_pages": [
+      1
+    ],
+    "metadata_pages": [
+      1,
+      2,
+      34
+    ],
+    "data_pages": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33
+    ],
+    "terms_pages": [
+      35,
+      36,
+      37,
+      38
+    ]
+  },
+  "notes": "The document is a multi-page Purchase Order for Celebrity Cruises. Product descriptions and item numbers are often combined in the raw text but have been split into separate columns in the schema. Page headers repeat key metadata like PO Number and Vessel across most data pages.",
+  "_timing": {
+    "total": 34.19,
+    "pages": 38,
+    "batch_success_rate": "8/8",
+    "pages_observed": 38
+  }
+}

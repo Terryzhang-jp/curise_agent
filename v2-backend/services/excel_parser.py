@@ -32,6 +32,8 @@ def parse_excel_file(file_bytes: bytes) -> dict:
         header_columns = []
 
         for cell in ws[header_row_idx]:
+            if not hasattr(cell, 'column') or cell.column is None:
+                continue
             val = cell.value
             col_letter = get_column_letter(cell.column)
             if val is not None:

@@ -46,6 +46,7 @@ class LLMResponse:
     function_calls: list[FunctionCall] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    thinking_tokens: int = 0
     raw: Any = None  # Original provider response for history round-trip
 
 
@@ -91,3 +92,12 @@ class LLMProvider(ABC):
     def build_system_injection(self, text: str) -> Any:
         """Build a transient system injection message (e.g. warnings, todo state)."""
         ...
+
+    def update_tools(self, tools: list[ToolDeclaration]) -> None:
+        """Update the tool declarations mid-session (e.g. after deferred tool activation).
+
+        Default implementation re-calls configure() with the same system prompt
+        and thinking budget. Providers may override for a lighter-weight update.
+        """
+        # Subclasses should override if they can do a targeted update
+        pass

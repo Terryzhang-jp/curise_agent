@@ -58,6 +58,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { EmptyState } from "@/components/empty-state";
+import { ZoneConfigBadge } from "@/components/zone-config-panel";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ArrowLeft, Plus, Trash2, FileText, Loader2, Sparkles, Link2, ZoomIn, ZoomOut, CircleCheck, CircleAlert, MousePointerClick, Upload, CheckCircle2 } from "lucide-react";
@@ -160,6 +161,7 @@ export default function SupplierTemplateTab() {
   const [selectedCellRef, setSelectedCellRef] = useState<string | null>(null);
   const [highlightedFieldKey, setHighlightedFieldKey] = useState<string | null>(null);
   const [cellAnnotations, setCellAnnotations] = useState<Record<string, string>>({});
+  const [templateStyles, setTemplateStyles] = useState<Record<string, unknown> | null>(null);
   const excelPreviewRef = useRef<HTMLDivElement>(null);
   const excelContainerRef = useRef<HTMLDivElement>(null);
   const [previewScale, setPreviewScale] = useState(1);
@@ -464,6 +466,11 @@ export default function SupplierTemplateTab() {
         setCellMap(result.cell_map);
       }
 
+      // Store template_styles (includes zone_config for deterministic engine)
+      if (result.template_styles) {
+        setTemplateStyles(result.template_styles);
+      }
+
       if (applySection === "all") {
         // Update file_url from analysis result (saved copy)
         if (result.file_url) {
@@ -575,6 +582,7 @@ export default function SupplierTemplateTab() {
         product_table_config: tableConfig || undefined,
         order_format_template_id: orderTemplateId ? parseInt(orderTemplateId) : undefined,
         field_mapping_metadata: mappingMeta,
+        template_styles: templateStyles || undefined,
       });
       await refresh();
       setView("list");
@@ -760,7 +768,10 @@ export default function SupplierTemplateTab() {
                 <CardContent className="pt-4 pb-4">
                   <div className="flex items-start justify-between">
                     <div className="flex-1 min-w-0">
-                      <span className="font-medium text-sm">{tpl.template_name}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-sm">{tpl.template_name}</span>
+                        <ZoneConfigBadge config={tpl.template_styles as Record<string, unknown> | null} templateName={tpl.template_name} />
+                      </div>
                       <div className="text-muted-foreground text-xs mt-1">
                         {(tpl.supplier_ids && tpl.supplier_ids.length > 0)
                           ? `供应商: ${tpl.supplier_ids.map((sid) => suppliers.find((s) => s.id === sid)?.name || `#${sid}`).join(", ")}`

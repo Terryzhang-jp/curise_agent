@@ -117,6 +117,18 @@ class GeminiProvider(LLMProvider):
         """Build a placeholder model message for error recovery."""
         return types.Content(role="model", parts=[types.Part(text=text)])
 
+    def update_tools(self, tools: list) -> None:
+        """Update tool declarations mid-session without changing system prompt or thinking config."""
+        if self._gen_config is None:
+            return
+        gemini_tools = self._convert_tools(tools)
+        self._gen_config = types.GenerateContentConfig(
+            tools=gemini_tools or None,
+            system_instruction=self._gen_config.system_instruction,
+            thinking_config=self._gen_config.thinking_config,
+            max_output_tokens=self._gen_config.max_output_tokens,
+        )
+
     # ----------------------------------------------------------
     # Internal helpers
     # ----------------------------------------------------------
@@ -193,9 +205,11 @@ class GeminiProvider(LLMProvider):
 
         prompt_tokens = 0
         completion_tokens = 0
+        thinking_tokens = 0
         if resp.usage_metadata:
             prompt_tokens = resp.usage_metadata.prompt_token_count or 0
             completion_tokens = resp.usage_metadata.candidates_token_count or 0
+            thinking_tokens = getattr(resp.usage_metadata, 'thinking_token_count', 0) or 0
 
         return LLMResponse(
             text_parts=text_parts,
@@ -203,5 +217,6 @@ class GeminiProvider(LLMProvider):
             function_calls=function_calls,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            thinking_tokens=thinking_tokens,
             raw=content,  # The types.Content for history append
         )

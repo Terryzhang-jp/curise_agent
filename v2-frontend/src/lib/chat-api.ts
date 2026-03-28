@@ -157,11 +157,64 @@ export interface DataAuditCardData {
   stats: { error: number; warning: number; info: number };
 }
 
+export interface GeneratedFileCardData {
+  card_type: "generated_file";
+  filename: string;
+  session_id: string;
+}
+
+export function getFileDownloadUrl(sessionId: string, filename: string): string {
+  return `${API_BASE}/api/chat/sessions/${sessionId}/files/${filename}`;
+}
+
+export interface WorkspaceFile {
+  filename: string;
+  size: number;
+  version: number;
+  synced: boolean;
+  is_output: boolean;
+  modified_at: number;
+}
+
+export async function listWorkspaceFiles(sessionId: string): Promise<WorkspaceFile[]> {
+  const res = await fetchWithAuth(
+    `${API_BASE}/api/chat/sessions/${sessionId}/files`,
+    { headers: { "Content-Type": "application/json" } }
+  );
+  return handleResponse<WorkspaceFile[]>(res);
+}
+
+// ─── Unified Artifacts ──────────────────────────────────────────
+
+export interface Artifact {
+  id: string;
+  filename: string;
+  source: "workspace" | "order_inquiry";
+  size: number;
+  modified_at: number;
+  order_id: number | null;
+  supplier_name: string | null;
+  product_count: number | null;
+}
+
+export async function listArtifacts(sessionId: string): Promise<Artifact[]> {
+  const res = await fetchWithAuth(
+    `${API_BASE}/api/chat/sessions/${sessionId}/artifacts`,
+    { headers: { "Content-Type": "application/json" } }
+  );
+  return handleResponse<Artifact[]>(res);
+}
+
+export function getArtifactDownloadUrl(sessionId: string, artifactId: string): string {
+  return `${API_BASE}/api/chat/sessions/${sessionId}/artifacts/download?artifact_id=${encodeURIComponent(artifactId)}`;
+}
+
 export type StructuredCard =
   | UploadValidationData | UploadPreviewData | UploadResultData
   | UploadReviewData
   | ConfirmationCardData | QueryTableCardData
-  | DataAuditCardData;
+  | DataAuditCardData
+  | GeneratedFileCardData;
 
 export type UploadData = UploadValidationData | UploadPreviewData | UploadResultData;
 
@@ -361,4 +414,56 @@ export function streamChatMessages(
   })();
 
   return () => controller.abort();
+}
+
+// ─── Agent Memory Management ──────────────────────────────────
+
+export interface AgentMemory {
+  id: number;
+  memory_type: string;
+  key: string;
+  value: string;
+  source_session_id: string | null;
+  access_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function listMemories(): Promise<AgentMemory[]> {
+  return fetchWithAuth(`${API_BASE}/chat/memories`);
+}
+
+export async function createMemory(data: {
+  memory_type: string;
+  key: string;
+  value: string;
+}): Promise<{ id: number; action: string }> {
+  return fetchWithAuth(`${API_BASE}/chat/memories`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateMemory(
+  id: number,
+  data: { memory_type?: string; key?: string; value?: string }
+): Promise<{ detail: string }> {
+  return fetchWithAuth(`${API_BASE}/chat/memories/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteMemory(id: number): Promise<{ detail: string }> {
+  return fetchWithAuth(`${API_BASE}/chat/memories/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export async function clearAllMemories(): Promise<{ detail: string }> {
+  return fetchWithAuth(`${API_BASE}/chat/memories`, {
+    method: "DELETE",
+  });
 }

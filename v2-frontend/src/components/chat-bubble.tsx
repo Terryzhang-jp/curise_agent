@@ -1,15 +1,17 @@
 "use client";
 
-import { useState, useEffect, useRef, memo } from "react";
+import { useState, useEffect, useRef, useCallback, memo } from "react";
 import { cn } from "@/lib/utils";
 import { MarkdownContent } from "./markdown-content";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   ChevronDown, BrainCircuit, Wrench, Terminal, AlertTriangle,
-  OctagonX, RotateCw, Loader2, Clock, Sparkles,
+  OctagonX, RotateCw, Loader2, Clock, Sparkles, FileSpreadsheet, Download,
 } from "lucide-react";
-import type { ChatMessage } from "@/lib/chat-api";
+import type { ChatMessage, GeneratedFileCardData } from "@/lib/chat-api";
+import { getFileDownloadUrl } from "@/lib/chat-api";
+import { SpreadsheetViewer } from "./spreadsheet-viewer";
 import { UploadValidationCard } from "./upload/UploadValidationCard";
 import { UploadPreviewCard } from "./upload/UploadPreviewCard";
 import { UploadResultCard } from "./upload/UploadResultCard";
@@ -21,7 +23,7 @@ import { UploadReviewCard } from "./upload/UploadReviewCard";
 // ─── Card Registry ──────────────────────────────────────────
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const CARD_REGISTRY: Record<string, React.ComponentType<{ data: any; onQuickAction?: (text: string) => void }>> = {
+const CARD_REGISTRY: Record<string, React.ComponentType<{ data: any; onQuickAction?: (text: string) => void; onOpenArtifact?: (filename: string) => void }>> = {
   upload_validation: UploadValidationCard,
   upload_preview: UploadPreviewCard,
   upload_result: UploadResultCard,
@@ -29,6 +31,7 @@ const CARD_REGISTRY: Record<string, React.ComponentType<{ data: any; onQuickActi
   query_table: QueryTableCard,
   data_audit: DataAuditCard,
   upload_review: UploadReviewCard,
+  generated_file: GeneratedFileBubble,
 };
 
 const LEGACY_TOOL_TO_CARD: Record<string, string> = {
@@ -97,10 +100,11 @@ interface ChatBubbleProps {
   metadata?: Record<string, unknown>;
   onRetry?: (toolName: string) => void;
   onQuickAction?: (text: string) => void;
+  onOpenArtifact?: (filename: string) => void;
 }
 
 export const ChatBubble = memo(function ChatBubble({
-  role, content, msgType, createdAt, streaming, metadata, onRetry, onQuickAction,
+  role, content, msgType, createdAt, streaming, metadata, onRetry, onQuickAction, onOpenArtifact,
 }: ChatBubbleProps) {
   const type = msgType || "text";
 
@@ -121,7 +125,7 @@ export const ChatBubble = memo(function ChatBubble({
   if (type === "action") return <ToolCallPill content={content} metadata={metadata} />;
   if (type === "error_observation") return <ErrorObservationBubble content={content} metadata={metadata} onRetry={onRetry} />;
   if (type === "error") return <SystemErrorBubble content={content} />;
-  if (type === "observation" || role === "tool") return <ObservationBubble content={content} metadata={metadata} onQuickAction={onQuickAction} />;
+  if (type === "observation" || role === "tool") return <ObservationBubble content={content} metadata={metadata} onQuickAction={onQuickAction} onOpenArtifact={onOpenArtifact} />;
 
   // Assistant final answer
   return (
@@ -199,11 +203,12 @@ function ToolCallPill({ content, metadata }: { content: string; metadata?: Recor
 // ─── ObservationBubble ──────────────────────────────────────
 
 function ObservationBubble({
-  content, metadata, onQuickAction,
+  content, metadata, onQuickAction, onOpenArtifact,
 }: {
   content: string;
   metadata?: Record<string, unknown>;
   onQuickAction?: (text: string) => void;
+  onOpenArtifact?: (filename: string) => void;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -215,7 +220,7 @@ function ObservationBubble({
     if (Card) {
       return (
         <div className="flex justify-start animate-in fade-in-0 slide-in-from-bottom-1 duration-300">
-          <Card data={cardData} onQuickAction={onQuickAction} />
+          <Card data={cardData} onQuickAction={onQuickAction} onOpenArtifact={onOpenArtifact} />
         </div>
       );
     }
@@ -327,6 +332,81 @@ function ErrorObservationBubble({
   );
 }
 
+// ─── GeneratedFileBubble ─────────────────────────────────────
+
+function GeneratedFileBubble({ data, onOpenArtifact }: { data: GeneratedFileCardData; onOpenArtifact?: (filename: string) => void }) {
+  const [downloading, setDownloading] = useState(false);
+  const isSpreadsheet = /\.xlsx?$/i.test(data.filename);
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    try {
+      const { fetchWithAuth } = await import("@/lib/fetch-with-auth");
+      const url = getFileDownloadUrl(data.session_id, data.filename);
+      const res = await fetchWithAuth(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = data.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      console.error("Download failed:", err);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const fetchFile = useCallback(async (): Promise<ArrayBuffer> => {
+    const { fetchWithAuth } = await import("@/lib/fetch-with-auth");
+    const url = getFileDownloadUrl(data.session_id, data.filename);
+    const res = await fetchWithAuth(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.arrayBuffer();
+  }, [data.session_id, data.filename]);
+
+  return (
+    <div className="max-w-[85%]">
+      <div className="inline-flex items-center gap-3 px-4 py-3 rounded-xl bg-emerald-500/5 border border-emerald-500/20 w-full">
+        <FileSpreadsheet className="h-5 w-5 text-emerald-600 shrink-0" />
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-foreground truncate">{data.filename}</p>
+          <p className="text-[11px] text-muted-foreground">Excel 文件已生成</p>
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {onOpenArtifact && (
+            <button
+              onClick={() => onOpenArtifact(data.filename)}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-emerald-600/30 text-emerald-700 hover:bg-emerald-500/10 transition-colors"
+            >
+              查看
+            </button>
+          )}
+          <button
+            onClick={handleDownload}
+            disabled={downloading}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-600 text-white hover:bg-emerald-700 transition-colors disabled:opacity-50"
+          >
+            {downloading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Download className="h-3.5 w-3.5" />
+            )}
+            下载
+          </button>
+        </div>
+      </div>
+      {!onOpenArtifact && isSpreadsheet && (
+        <SpreadsheetViewer filename={data.filename} fetchFile={fetchFile} />
+      )}
+    </div>
+  );
+}
+
 // ─── SystemErrorBubble ──────────────────────────────────────
 
 function SystemErrorBubble({ content }: { content: string }) {
@@ -372,10 +452,11 @@ interface ReasoningBlockProps {
   isActive: boolean;
   onRetry?: (toolName: string) => void;
   onQuickAction?: (text: string) => void;
+  onOpenArtifact?: (filename: string) => void;
 }
 
 export const ReasoningBlock = memo(function ReasoningBlock({
-  messages, isActive, onRetry, onQuickAction,
+  messages, isActive, onRetry, onQuickAction, onOpenArtifact,
 }: ReasoningBlockProps) {
   const [open, setOpen] = useState(isActive);
   const wasActiveRef = useRef(isActive);
@@ -448,6 +529,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
                 isLast={idx === messages.length - 1 && isActive}
                 onRetry={onRetry}
                 onQuickAction={onQuickAction}
+                onOpenArtifact={onOpenArtifact}
               />
             ))}
           </div>
@@ -460,21 +542,22 @@ export const ReasoningBlock = memo(function ReasoningBlock({
 // ─── ReasoningStepInline ────────────────────────────────────
 
 function ReasoningStepInline({
-  msg, isLast, onRetry, onQuickAction,
+  msg, isLast, onRetry, onQuickAction, onOpenArtifact,
 }: {
   msg: ChatMessage;
   isLast?: boolean;
   onRetry?: (toolName: string) => void;
   onQuickAction?: (text: string) => void;
+  onOpenArtifact?: (filename: string) => void;
 }) {
   const type = msg.msg_type || "text";
 
   if (type === "thinking") {
     return (
-      <div className="reasoning-step py-1.5 animate-in fade-in-0 duration-200" data-type="thinking" data-active={isLast}>
-        <div className="flex items-start gap-1.5">
-          <BrainCircuit className="h-3 w-3 text-violet-400/70 shrink-0 mt-0.5" />
-          <p className="text-[11px] text-muted-foreground/60 italic leading-relaxed line-clamp-3">
+      <div className="reasoning-step py-2 animate-in fade-in-0 duration-200" data-type="thinking" data-active={isLast}>
+        <div className="flex items-start gap-2">
+          <BrainCircuit className="h-4 w-4 text-violet-500 shrink-0 mt-0.5" />
+          <p className="text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap">
             {msg.content}
           </p>
         </div>
@@ -519,7 +602,7 @@ function ReasoningStepInline({
       if (Card) {
         return (
           <div className="reasoning-step py-1.5 animate-in fade-in-0 duration-300" data-type="observation">
-            <Card data={cardData} onQuickAction={onQuickAction} />
+            <Card data={cardData} onQuickAction={onQuickAction} onOpenArtifact={onOpenArtifact} />
           </div>
         );
       }

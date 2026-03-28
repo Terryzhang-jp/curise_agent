@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import type { ChatSession } from "@/lib/chat-api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -38,6 +38,7 @@ interface SessionSidebarProps {
   onSelect: (id: string) => void;
   onNewSession: () => void;
   onDelete: (id: string) => void;
+  deletingId?: string | null;
   loading: boolean;
 }
 
@@ -47,9 +48,17 @@ export default function SessionSidebar({
   onSelect,
   onNewSession,
   onDelete,
+  deletingId,
   loading,
 }: SessionSidebarProps) {
   const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
+
+  // Auto-close delete dialog when the session is removed from list (delete succeeded)
+  useEffect(() => {
+    if (deleteTarget && !sessions.find((s) => s.id === deleteTarget.id)) {
+      setDeleteTarget(null);
+    }
+  }, [sessions, deleteTarget]);
 
   return (
     <div className="w-[260px] shrink-0 border-r border-border/50 bg-card/20 flex flex-col h-full overflow-hidden">
@@ -150,7 +159,9 @@ export default function SessionSidebar({
       {/* Delete confirmation dialog */}
       <AlertDialog
         open={!!deleteTarget}
-        onOpenChange={(open) => !open && setDeleteTarget(null)}
+        onOpenChange={(open) => {
+          if (!open && !deletingId) setDeleteTarget(null);
+        }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -162,15 +173,15 @@ export default function SessionSidebar({
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={!!deletingId}>取消</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
                 if (deleteTarget) onDelete(deleteTarget.id);
-                setDeleteTarget(null);
               }}
+              disabled={!!deletingId}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              删除
+              {deletingId ? "删除中..." : "删除"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

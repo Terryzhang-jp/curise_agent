@@ -37,7 +37,7 @@ def fill_template(
     Args:
         template_bytes: Raw bytes of the template .xlsx file
         zone_config: Complete zone configuration from zone_config_builder
-        order_data: Full order data dict (from prepare_inquiry_workspace or equivalent)
+        order_data: Full order data dict (from inquiry_agent or equivalent)
         supplier_id: Supplier ID (string or int) for data path resolution
         field_overrides: Optional {cell_ref: value} overrides from user edits,
                          applied on top of resolved header field values
@@ -96,6 +96,7 @@ def fill_template(
     # ── Step 0c: Capture product-row merge pattern from template ──
     # Before row manipulation, detect which columns are merged per product
     # row (e.g. F:G merged for "description"). We'll re-apply after filling.
+    col_map = zone_config.get("product_columns", {})
     row_merges = _detect_row_merge_pattern(ws, prod_zone["start"], col_map)
 
     # ── Step 1: Resize product zone ──────────────────────────────
@@ -158,6 +159,17 @@ def fill_template(
     currency = order_data.get("currency") or "JPY"
     po_number = order_data.get("po_number", "")
 
+    # Build flat order context for fields repeated per row (flat-table templates)
+    supplier_data = order_data.get("suppliers", {}).get(sid, {})
+    order_context = {
+        "ship_name": order_data.get("ship_name", ""),
+        "delivery_date": order_data.get("delivery_date", ""),
+        "order_date": order_data.get("order_date", ""),
+        "destination_port": order_data.get("destination_port", ""),
+        "voyage": order_data.get("voyage", ""),
+        "supplier_name": supplier_data.get("supplier_name", ""),
+    }
+
     for i, product in enumerate(products):
         row = prod_zone["start"] + i
         for col_letter, field_name in col_map.items():
@@ -166,7 +178,7 @@ def fill_template(
             if isinstance(cell, MergedCell):
                 continue
             cell.value = _resolve_product_field(
-                field_name, product, i, po_number, currency,
+                field_name, product, i, po_number, currency, order_context,
             )
 
     # ── Step 5: Product row formulas ─────────────────────────────
@@ -319,6 +331,17 @@ def verify_output(
     po_number = order_data.get("po_number", "")
     currency = order_data.get("currency") or "JPY"
 
+    # Build flat order context for verify (same as fill_template Step 4)
+    supplier_data = order_data.get("suppliers", {}).get(sid, {})
+    verify_order_ctx = {
+        "ship_name": order_data.get("ship_name", ""),
+        "delivery_date": order_data.get("delivery_date", ""),
+        "order_date": order_data.get("order_date", ""),
+        "destination_port": order_data.get("destination_port", ""),
+        "voyage": order_data.get("voyage", ""),
+        "supplier_name": supplier_data.get("supplier_name", ""),
+    }
+
     for i, product in enumerate(products):
         row = prod_start + i
         for col_letter, field_name in col_map.items():
@@ -327,7 +350,7 @@ def verify_output(
             if isinstance(cell, MergedCell):
                 continue
 
-            expected = _resolve_product_field(field_name, product, i, po_number, currency)
+            expected = _resolve_product_field(field_name, product, i, po_number, currency, verify_order_ctx)
             actual = cell.value
             checks += 1
 
@@ -470,8 +493,14 @@ def _resolve_product_field(
     index: int,
     po_number: str,
     currency: str,
+    order_data: dict | None = None,
 ) -> Any:
-    """Resolve a product column value from the product dict."""
+    """Resolve a product column value from the product dict.
+
+    For flat-table templates (Korean-style), order-level fields like ship_name,
+    delivery_date, supplier_name are repeated on every product row. These are
+    resolved from order_data when the product dict doesn't have them.
+    """
     if field_name == "line_number" or field_name == "__line_number__":
         return index + 1
     if field_name == "po_number" or field_name == "__po_number__":
@@ -497,8 +526,19 @@ def _resolve_product_field(
     if field_name == "unit":
         return product.get("unit", "CT")
 
-    # Generic fallback
-    return product.get(field_name, "")
+    # Try product dict first
+    val = product.get(field_name)
+    if val is not None and val != "":
+        return val
+
+    # Fallback to order_data for order-level fields repeated per row
+    # (e.g., ship_name, delivery_date, supplier_name in flat-table templates)
+    if order_data:
+        val = order_data.get(field_name)
+        if val is not None:
+            return val
+
+    return ""
 
 
 def _to_number(val: Any) -> int | float | None:

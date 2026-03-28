@@ -14,7 +14,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ─── Role Levels ─────────────────────────────────────────────
 
-ROLE_LEVELS = {"superadmin": 100, "admin": 50, "finance": 30, "employee": 20}
+ROLE_LEVELS = {"superadmin": 100, "super_admin": 100, "admin": 50, "finance": 30, "employee": 20, "user": 20}
 
 
 # ─── Password ────────────────────────────────────────────────

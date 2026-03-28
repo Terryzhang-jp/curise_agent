@@ -12,8 +12,10 @@ import {
   cancelChatAgent,
 } from "@/lib/chat-api";
 import { toast } from "sonner";
+import { Group as PanelGroup, Panel, Separator as PanelResizeHandle } from "react-resizable-panels";
 import SessionSidebar from "./SessionSidebar";
 import ChatPanel from "./ChatPanel";
+import ArtifactPanel from "@/components/artifact-panel";
 
 export default function WorkspacePage() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -26,6 +28,10 @@ export default function WorkspacePage() {
   const [error, setError] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [activeScenario, setActiveScenario] = useState<string | null>(null);
+
+  // Artifact panel state
+  const [artifactOpen, setArtifactOpen] = useState(false);
+  const [artifactFile, setArtifactFile] = useState<string | null>(null);
 
   const streamAbortRef = useRef<(() => void) | null>(null);
   // Stable ref for doSend — allows useCallback handlers to avoid stale closures
@@ -153,6 +159,17 @@ export default function WorkspacePage() {
     refreshSessions();
   }, [refreshSessions]);
 
+  // Detect generated_file cards in messages → auto-open artifact panel
+  useEffect(() => {
+    const latestMsg = messages[messages.length - 1];
+    if (!latestMsg) return;
+    const card = latestMsg.metadata?.structured_card as Record<string, unknown> | undefined;
+    if (card?.card_type === "generated_file" && card.filename) {
+      setArtifactOpen(true);
+      setArtifactFile(card.filename as string);
+    }
+  }, [messages]);
+
   // Select session
   async function handleSelectSession(id: string) {
     if (id === activeSessionId) return;
@@ -163,6 +180,8 @@ export default function WorkspacePage() {
     setInput("");
     setError("");
     setActiveScenario(null);
+    setArtifactOpen(false);
+    setArtifactFile(null);
 
     const session = sessions.find((s) => s.id === id);
     setActiveSession(session || null);
@@ -170,6 +189,14 @@ export default function WorkspacePage() {
     try {
       const msgs = await getChatMessages(id);
       setMessages(msgs);
+      // Check if session has generated files → open artifact panel
+      const hasFiles = msgs.some((m) => {
+        const c = m.metadata?.structured_card as Record<string, unknown> | undefined;
+        return c?.card_type === "generated_file";
+      });
+      if (hasFiles) {
+        setArtifactOpen(true);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载消息失败");
     }
@@ -180,6 +207,8 @@ export default function WorkspacePage() {
     stopStream();
     setError("");
     setActiveScenario(null);
+    setArtifactOpen(false);
+    setArtifactFile(null);
     try {
       const session = await createChatSession();
       setSessions((prev) => [session, ...prev]);
@@ -194,7 +223,10 @@ export default function WorkspacePage() {
   }
 
   // Delete session
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
   async function handleDeleteSession(id: string) {
+    setDeletingId(id);
     try {
       await deleteChatSession(id);
       if (id === activeSessionId) {
@@ -204,12 +236,22 @@ export default function WorkspacePage() {
         setMessages([]);
         setSending(false);
         setActiveScenario(null);
+        setArtifactOpen(false);
+        setArtifactFile(null);
       }
       setSessions((prev) => prev.filter((s) => s.id !== id));
     } catch (e) {
       setError(e instanceof Error ? e.message : "删除失败");
+    } finally {
+      setDeletingId(null);
     }
   }
+
+  // Open file in artifact panel (called from GeneratedFileBubble)
+  const handleOpenArtifact = useCallback((filename: string) => {
+    setArtifactOpen(true);
+    setArtifactFile(filename);
+  }, []);
 
   // Core send logic — used by both handleSend and handleRetry
   async function doSend(text: string, currentFile: File | null = null, scenario?: string | null) {
@@ -373,24 +415,59 @@ export default function WorkspacePage() {
         onSelect={handleSelectSession}
         onNewSession={handleNewSession}
         onDelete={handleDeleteSession}
+        deletingId={deletingId}
         loading={sessionsLoading}
       />
-      <ChatPanel
-        session={activeSession}
-        messages={messages}
-        input={input}
-        onInputChange={setInput}
-        onSend={handleSend}
-        onStop={handleStop}
-        sending={sending}
-        error={error}
-        file={file}
-        onFileChange={setFile}
-        onRetry={handleRetry}
-        onQuickAction={handleQuickAction}
-        activeScenario={activeScenario}
-        onClearScenario={() => setActiveScenario(null)}
-      />
+      {artifactOpen && activeSessionId ? (
+        <PanelGroup className="flex-1">
+          <Panel defaultSize={55} minSize={35}>
+            <ChatPanel
+              session={activeSession}
+              messages={messages}
+              input={input}
+              onInputChange={setInput}
+              onSend={handleSend}
+              onStop={handleStop}
+              sending={sending}
+              error={error}
+              file={file}
+              onFileChange={setFile}
+              onRetry={handleRetry}
+              onQuickAction={handleQuickAction}
+              activeScenario={activeScenario}
+              onClearScenario={() => setActiveScenario(null)}
+              onOpenArtifact={handleOpenArtifact}
+            />
+          </Panel>
+          <PanelResizeHandle className="w-1 bg-border/30 hover:bg-primary/30 transition-colors cursor-col-resize" />
+          <Panel defaultSize={45} minSize={25}>
+            <ArtifactPanel
+              sessionId={activeSessionId}
+              selectedFile={artifactFile}
+              onSelectFile={setArtifactFile}
+              onClose={() => setArtifactOpen(false)}
+            />
+          </Panel>
+        </PanelGroup>
+      ) : (
+        <ChatPanel
+          session={activeSession}
+          messages={messages}
+          input={input}
+          onInputChange={setInput}
+          onSend={handleSend}
+          onStop={handleStop}
+          sending={sending}
+          error={error}
+          file={file}
+          onFileChange={setFile}
+          onRetry={handleRetry}
+          onQuickAction={handleQuickAction}
+          activeScenario={activeScenario}
+          onClearScenario={() => setActiveScenario(null)}
+          onOpenArtifact={handleOpenArtifact}
+        />
+      )}
     </div>
   );
 }

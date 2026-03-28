@@ -197,6 +197,11 @@ class Supplier(Base):
     contact = Column(String(100), nullable=True)
     email = Column(String(100), nullable=True)
     phone = Column(String(20), nullable=True)
+    address = Column(Text, nullable=True)
+    zip_code = Column(String(20), nullable=True)
+    fax = Column(String(50), nullable=True)
+    default_payment_method = Column(String(100), nullable=True)
+    default_payment_terms = Column(String(100), nullable=True)
     status = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -260,8 +265,42 @@ class SupplierTemplate(Base):
     product_table_config = Column(JSON, nullable=True)  # {"start_row": 12, "columns": {"A": "product_code", ...}}
     order_format_template_id = Column(Integer, nullable=True)  # 绑定的订单模板 ID
     field_mapping_metadata = Column(JSON, nullable=True)  # AI 匹配元数据 (provenance)
+    template_styles = Column(JSON, nullable=True)  # 样式层: product_row_styles, column_widths, row_height
     created_by = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DeliveryLocation(Base):
+    """仓库/配送点 — 按港口管理的本地收货信息"""
+
+    __tablename__ = "v2_delivery_locations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    port_id = Column(Integer, ForeignKey("ports.id"), nullable=True)
+    name = Column(String(200), nullable=False)
+    address = Column(Text, nullable=True)
+    contact_person = Column(String(100), nullable=True)
+    contact_phone = Column(String(50), nullable=True)
+    delivery_notes = Column(String(200), nullable=True)
+    ship_name_label = Column(String(200), nullable=True)  # "船名【{ship_name}】"
+    is_default = Column(Boolean, default=True)
+    created_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CompanyConfig(Base):
+    """公司配置 — Merit Trading 的固定信息，admin 可编辑"""
+
+    __tablename__ = "v2_company_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(100), unique=True, nullable=False)
+    value = Column(Text, nullable=False, default="")
+    label = Column(String(100), nullable=True)
+    sort_order = Column(Integer, default=0)
+    updated_by = Column(Integer, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -340,6 +379,8 @@ class AgentSession(Base):
     title = Column(String(500), default="新对话")
     status = Column(String(20), default="active")
     summary_message_id = Column(Integer, nullable=True)
+    token_usage = Column(JSON, nullable=True)
+    context_data = Column(JSON, nullable=True)       # referenced_order_ids, etc.
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -362,6 +403,27 @@ class AgentMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("AgentSession", back_populates="messages")
+
+
+class AgentTrace(Base):
+    """Agent 执行轨迹 — LLM 调用和工具调用的记录"""
+
+    __tablename__ = "v2_agent_traces"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(36), ForeignKey("v2_agent_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    turn_number = Column(Integer, nullable=False)
+    event_type = Column(String(20), nullable=False)  # 'llm_call' | 'tool_call'
+    model_name = Column(String(100), nullable=True)
+    tool_name = Column(String(100), nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    thinking_tokens = Column(Integer, default=0)
+    tool_duration_ms = Column(Integer, nullable=True)
+    tool_success = Column(Boolean, nullable=True)
+    error_message = Column(Text, nullable=True)
+    estimated_cost_usd = Column(Numeric(10, 6), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ToolConfig(Base):
@@ -483,6 +545,84 @@ class SkillConfig(Base):
     is_builtin = Column(Boolean, default=True)
     is_enabled = Column(Boolean, default=True)
     created_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AgentMemory(Base):
+    """Agent 长期记忆 — 跨会话知识存储（DeerFlow MemoryMiddleware 对齐）"""
+
+    __tablename__ = "v2_agent_memories"
+    __table_args__ = (
+        UniqueConstraint("user_id", "memory_type", "key",
+                         name="uq_agent_memories_user_key"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    memory_type = Column(String(30), nullable=False)  # user_preference, supplier_knowledge, workflow_pattern, fact
+    key = Column(String(200), nullable=False)
+    value = Column(Text, nullable=False)
+    source_session_id = Column(String(36), nullable=True)
+    access_count = Column(Integer, default=0)
+    last_accessed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SubAgentTask(Base):
+    """子Agent任务追踪 — 记录委派执行的状态和结果"""
+
+    __tablename__ = "v2_sub_agent_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed', 'timeout')",
+            name="ck_sub_agent_tasks_status",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    parent_session_id = Column(String(36), ForeignKey("v2_agent_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    parent_turn = Column(Integer, nullable=True)
+    sub_agent_name = Column(String(100), nullable=False)
+    task_description = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default="pending")
+    result_preview = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class AgentFeedback(Base):
+    """Agent 反馈 — 用户对 agent 回复的评分和反馈"""
+
+    __tablename__ = "v2_agent_feedback"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(36), ForeignKey("v2_agent_sessions.id", ondelete="CASCADE"), nullable=True, index=True)
+    message_id = Column(Integer, nullable=True)
+    rating = Column(Integer, nullable=True)
+    feedback_text = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ExchangeRate(Base):
+    """汇率 — 货币对汇率记录，支持手动录入和 API 获取"""
+
+    __tablename__ = "v2_exchange_rates"
+    __table_args__ = (
+        UniqueConstraint("from_currency", "to_currency", "effective_date",
+                         name="uq_exchange_rate_pair_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    from_currency = Column(String(3), nullable=False, index=True)
+    to_currency = Column(String(3), nullable=False, index=True)
+    rate = Column(Numeric(18, 8), nullable=False)  # 1 from = rate to
+    effective_date = Column(Date, nullable=False, index=True)
+    source = Column(String(50), default="manual")  # "manual" | "api"
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

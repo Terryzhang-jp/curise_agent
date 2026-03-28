@@ -6,4 +6,5 @@ venv/
 .git/
 tests/
 *.md
+!skills/**/SKILL.md
 agent_design/

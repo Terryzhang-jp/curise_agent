@@ -6,7 +6,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import User, FieldSchema, FieldDefinition, OrderFormatTemplate, SupplierTemplate
+from models import (
+    User, FieldSchema, FieldDefinition, OrderFormatTemplate, SupplierTemplate,
+    Supplier, DeliveryLocation, CompanyConfig,
+)
 from routes.auth import get_current_user
 from security import require_role
 from services.file_storage import storage
@@ -17,6 +20,9 @@ from schemas import (
     FieldDefinitionCreate, FieldDefinitionUpdate, FieldDefinitionResponse,
     OrderFormatTemplateCreate, OrderFormatTemplateUpdate, OrderFormatTemplateResponse,
     SupplierTemplateCreate, SupplierTemplateUpdate, SupplierTemplateResponse,
+    SupplierInfoUpdate, SupplierInfoResponse,
+    DeliveryLocationCreate, DeliveryLocationUpdate, DeliveryLocationResponse,
+    CompanyConfigUpdate, CompanyConfigResponse,
 )
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -534,6 +540,39 @@ async def analyze_supplier_template(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI 分析失败: {str(e)}")
 
+    # Extract styles (code-based, not AI) and merge with semantic analysis
+    template_styles = None
+    try:
+        from services.template_style_extractor import extract_template_styles, merge_semantic_and_styles
+        styles = extract_template_styles(file_bytes)
+        template_styles = merge_semantic_and_styles(
+            result.get("cell_map", {}), styles, result.get("product_table_config"),
+        )
+    except Exception as style_err:
+        import logging as _log
+        _log.getLogger(__name__).warning("Style extraction failed: %s", style_err)
+
+    # Build zone config for deterministic template engine
+    zone_config = None
+    try:
+        from services.zone_config_builder import build_zone_config
+        ptc = result.get("product_table_config", {})
+        fp = result.get("field_positions", {})
+        if ptc.get("start_row") and (fp or ptc.get("columns")):
+            zone_config = build_zone_config(
+                file_bytes=file_bytes,
+                field_positions=fp,
+                product_table_config=ptc,
+                cell_map=result.get("cell_map"),
+            )
+            # Merge zone_config into template_styles (engine reads from template_styles)
+            if template_styles is None:
+                template_styles = {}
+            template_styles.update(zone_config)
+    except Exception as zc_err:
+        import logging as _log
+        _log.getLogger(__name__).warning("Zone config build failed: %s", zc_err)
+
     # Generate HTML preview (non-critical — failure does not block analysis)
     template_html = None
     try:
@@ -547,6 +586,7 @@ async def analyze_supplier_template(
         "field_positions": result.get("field_positions", {}),
         "product_table_config": result.get("product_table_config", {}),
         "cell_map": result.get("cell_map", {}),
+        "template_styles": template_styles,
         "notes": result.get("notes", ""),
         "file_url": file_url,
         "template_html": template_html,
@@ -605,3 +645,148 @@ def list_countries(
     """List all countries from the shared countries table."""
     rows = db.execute(text("SELECT id, name, code FROM countries ORDER BY name")).fetchall()
     return [{"id": r[0], "name": r[1], "code": r[2]} for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Supplier Info (extended fields for inquiry templates)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@router.get("/suppliers", response_model=list[SupplierInfoResponse])
+def list_suppliers_info(
+    search: str = "",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    q = db.query(Supplier).filter(Supplier.status == True)
+    if search:
+        q = q.filter(Supplier.name.ilike(f"%{search}%"))
+    return q.order_by(Supplier.name).all()
+
+
+@router.patch("/suppliers/{supplier_id}", response_model=SupplierInfoResponse)
+def update_supplier_info(
+    supplier_id: int,
+    body: SupplierInfoUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    supplier = db.query(Supplier).filter(Supplier.id == supplier_id).first()
+    if not supplier:
+        raise HTTPException(status_code=404, detail="供应商不存在")
+    for key, val in body.model_dump(exclude_unset=True).items():
+        setattr(supplier, key, val)
+    db.commit()
+    db.refresh(supplier)
+    return supplier
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Delivery Locations (仓库/配送点)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@router.get("/delivery-locations", response_model=list[DeliveryLocationResponse])
+def list_delivery_locations(
+    port_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    q = db.query(DeliveryLocation)
+    if port_id is not None:
+        q = q.filter(DeliveryLocation.port_id == port_id)
+    rows = q.order_by(DeliveryLocation.id).all()
+    # Attach port_name
+    result = []
+    for loc in rows:
+        data = DeliveryLocationResponse.model_validate(loc)
+        if loc.port_id:
+            port_row = db.execute(
+                text("SELECT name FROM ports WHERE id = :pid"), {"pid": loc.port_id}
+            ).fetchone()
+            if port_row:
+                data.port_name = port_row[0]
+        result.append(data)
+    return result
+
+
+@router.post("/delivery-locations", response_model=DeliveryLocationResponse, status_code=201)
+def create_delivery_location(
+    body: DeliveryLocationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    loc = DeliveryLocation(**body.model_dump(), created_by=current_user.id)
+    db.add(loc)
+    db.commit()
+    db.refresh(loc)
+    return loc
+
+
+@router.put("/delivery-locations/{loc_id}", response_model=DeliveryLocationResponse)
+def update_delivery_location(
+    loc_id: int,
+    body: DeliveryLocationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    loc = db.query(DeliveryLocation).filter(DeliveryLocation.id == loc_id).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="配送点不存在")
+    for key, val in body.model_dump(exclude_unset=True).items():
+        setattr(loc, key, val)
+    db.commit()
+    db.refresh(loc)
+    return loc
+
+
+@router.delete("/delivery-locations/{loc_id}")
+def delete_delivery_location(
+    loc_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    loc = db.query(DeliveryLocation).filter(DeliveryLocation.id == loc_id).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="配送点不存在")
+    db.delete(loc)
+    db.commit()
+    return {"detail": "已删除"}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Company Config (公司配置)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@router.get("/company-config", response_model=list[CompanyConfigResponse])
+def get_company_config(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    return db.query(CompanyConfig).order_by(CompanyConfig.sort_order).all()
+
+
+@router.put("/company-config")
+def update_company_config(
+    body: CompanyConfigUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    for item in body.items:
+        row = db.query(CompanyConfig).filter(CompanyConfig.key == item.key).first()
+        if row:
+            row.value = item.value
+            if item.label is not None:
+                row.label = item.label
+            row.updated_by = current_user.id
+        else:
+            row = CompanyConfig(
+                key=item.key,
+                value=item.value,
+                label=item.label,
+                updated_by=current_user.id,
+            )
+            db.add(row)
+    db.commit()
+    return {"detail": "已更新"}

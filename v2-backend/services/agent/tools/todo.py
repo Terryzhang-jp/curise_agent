@@ -3,6 +3,25 @@
 State is held in ToolContext, not module globals.
 """
 
+from services.tools.registry_loader import ToolMetaInfo
+
+TOOL_META = {
+    "todo_write": ToolMetaInfo(
+        display_name="任务写入",
+        group="todo",
+        description="创建/更新任务清单项",
+        prompt_description="创建/更新任务清单",
+        summary="更新任务清单",
+    ),
+    "todo_read": ToolMetaInfo(
+        display_name="任务读取",
+        group="todo",
+        description="读取当前任务清单",
+        prompt_description="读取任务清单",
+        summary="读取任务清单",
+    ),
+}
+
 
 def register(registry, ctx=None):
     """注册 todo 组工具"""
@@ -12,28 +31,27 @@ def register(registry, ctx=None):
 
     @registry.tool(
         description=(
-            "Create, update, or clear a task checklist. "
-            "Use this for multi-step tasks to track progress. "
-            "Actions: 'add' (requires task), 'update' (requires task_id + status), 'clear'."
+            "创建/更新/清空任务清单，用于多步骤任务的进度追踪。"
+            "操作：add（添加任务）、update（更新状态）、clear（清空全部）。"
         ),
         parameters={
             "action": {
                 "type": "STRING",
-                "description": "Action to perform: 'add', 'update', or 'clear'",
+                "description": "操作类型：add / update / clear",
             },
             "task": {
                 "type": "STRING",
-                "description": "Task description (required for 'add')",
+                "description": "任务描述（add 时必填）",
                 "required": False,
             },
             "task_id": {
                 "type": "INTEGER",
-                "description": "Task ID to update (required for 'update')",
+                "description": "要更新的任务 ID（update 时必填）",
                 "required": False,
             },
             "status": {
                 "type": "STRING",
-                "description": "New status for 'update': 'pending', 'in_progress', or 'done'",
+                "description": "新状态：pending / in_progress / done（update 时必填）",
                 "required": False,
             },
         },
@@ -69,7 +87,7 @@ def register(registry, ctx=None):
             return f"Error: unknown action '{action}'. Supported: 'add', 'update', 'clear'"
 
     @registry.tool(
-        description="Read the current task checklist to see progress on multi-step tasks.",
+        description="读取当前任务清单，查看多步骤任务的执行进度。",
         parameters={},
         group="todo",
     )

@@ -1,8 +1,29 @@
-"""web 组工具 — web_fetch HTTP 获取"""
+"""web 组工具 — web_fetch HTTP 获取 + web_search 搜索"""
 
 import re
 
 import httpx
+
+from services.tools.registry_loader import ToolMetaInfo
+
+TOOL_META = {
+    "web_fetch": ToolMetaInfo(
+        display_name="网页抓取",
+        group="web",
+        description="获取网页内容（HTTP GET）",
+        prompt_description="获取网页内容",
+        summary="获取网页内容",
+        is_enabled_default=False,
+        auto_register=False,
+    ),
+    "web_search": ToolMetaInfo(
+        display_name="网络搜索",
+        group="web",
+        description="使用搜索引擎查询最新信息（天气、新闻等），免费无需API Key",
+        prompt_description="搜索网络获取最新信息（天气、新闻、实时数据等）",
+        summary="搜索网络",
+    ),
+}
 
 _DEFAULT_MAX_LENGTH = 8000
 _REQUEST_TIMEOUT = 15

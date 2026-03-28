@@ -4,6 +4,18 @@ import os
 import signal
 import subprocess
 
+from services.tools.registry_loader import ToolMetaInfo
+
+TOOL_META = {
+    "bash": ToolMetaInfo(
+        display_name="命令执行",
+        group="shell",
+        description="执行 bash/Python 命令（生成 Excel、数据处理等）",
+        prompt_description="执行 bash/Python 命令（可用于生成 Excel、数据处理、代码执行等）",
+        summary="执行命令",  # Note: chat_storage uses callable _extract_bash_summary for richer summaries
+    ),
+}
+
 # 危险命令模式
 _BLOCKED_PATTERNS = [
     "rm -rf /",
@@ -35,19 +47,18 @@ def register(registry, ctx=None):
 
     @registry.tool(
         description=(
-            "Execute a bash command and return its output (stdout + stderr). "
-            "Use this for: running scripts, installing packages, git operations, "
-            "file manipulation, and any shell task. "
-            "Commands have a 30-second timeout. Output is truncated to 10000 chars."
+            "执行 bash 命令并返回输出。用于：修改 Excel 文件（openpyxl）、运行 Python 脚本、"
+            "文件操作、数据处理等。工作目录已设为 workspace，生成的文件可直接访问。"
+            "超时 30 秒，输出截断到 10000 字符。"
         ),
         parameters={
             "command": {
                 "type": "STRING",
-                "description": "The bash command to execute",
+                "description": "要执行的 bash 命令（支持 Python: python3 -c '...'）",
             },
             "timeout": {
                 "type": "NUMBER",
-                "description": "Timeout in seconds (default: 30, max: 120)",
+                "description": "超时秒数（默认30，最大120）",
                 "required": False,
             },
             "working_directory": {
@@ -67,9 +78,12 @@ def register(registry, ctx=None):
 
         timeout = min(max(int(timeout), 1), 120)
 
+        # Resolve working directory: explicit arg > workspace_dir > None (OS default)
         cwd = working_directory.strip() if working_directory else None
-        if cwd and not os.path.isdir(cwd):
-            return f"Error: working directory not found: {cwd}"
+        if not cwd and ctx and ctx.workspace_dir:
+            cwd = ctx.workspace_dir
+        if cwd:
+            os.makedirs(cwd, exist_ok=True)
 
         env = os.environ.copy()
         for key in _SENSITIVE_ENV_KEYS:

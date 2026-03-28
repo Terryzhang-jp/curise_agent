@@ -1,10 +1,15 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, DataError
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, date
+import logging
+
+logger = logging.getLogger(__name__)
 
 from database import get_db
-from models import User, Country, Port, Category, Supplier, SupplierCategory, Product
+from models import User, Country, Port, Category, Supplier, SupplierCategory, Product, ExchangeRate
 from security import require_role
 from schemas import (
     CountryCreate, CountryUpdate, CountryResponse,
@@ -12,10 +17,23 @@ from schemas import (
     PortCreate, PortUpdate, PortResponse,
     SupplierCreate, SupplierUpdate, SupplierResponse,
     ProductCreate, ProductUpdate, ProductResponse,
+    ExchangeRateCreate, ExchangeRateUpdate, ExchangeRateResponse,
 )
 
 require_data_reader = require_role("superadmin", "admin", "employee")
 require_data_writer = require_role("superadmin", "admin")
+
+
+def _parse_date(value: str | None) -> datetime | None:
+    """Parse date string to datetime, return None if empty/invalid."""
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    raise HTTPException(400, f"日期格式无效: '{value}'，请使用 YYYY-MM-DD")
 
 router = APIRouter(prefix="/data", tags=["data"])
 
@@ -90,7 +108,6 @@ def _product_to_dict(r, db: Session) -> dict:
         "effective_from": str(r.effective_from) if r.effective_from else None,
         "effective_to": str(r.effective_to) if r.effective_to else None,
         "status": r.status,
-        "created_at": r.created_at, "updated_at": r.updated_at,
     }
 
 
@@ -570,6 +587,10 @@ def create_product(
     if body.port_id and not db.query(Port).filter(Port.id == body.port_id).first():
         raise HTTPException(400, "港口不存在")
 
+    # Parse dates (str → datetime) before passing to ORM
+    eff_from = _parse_date(body.effective_from)
+    eff_to = _parse_date(body.effective_to)
+
     obj = Product(
         product_name_en=body.product_name_en,
         product_name_jp=body.product_name_jp,
@@ -585,12 +606,24 @@ def create_product(
         country_of_origin=body.country_of_origin,
         brand=body.brand,
         currency=body.currency,
-        effective_from=body.effective_from,
-        effective_to=body.effective_to,
+        effective_from=eff_from,
+        effective_to=eff_to,
         status=body.status,
     )
     db.add(obj)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该产品在同一国家和港口下已存在（同名+同国家+同港口）")
+    except DataError as e:
+        db.rollback()
+        logger.warning("create_product DataError: %s", e)
+        raise HTTPException(400, "数据格式错误，请检查字段长度和类型")
+    except Exception as e:
+        db.rollback()
+        logger.exception("create_product unexpected error")
+        raise HTTPException(500, f"创建失败: {str(e)[:200]}")
     db.refresh(obj)
     return _product_to_dict(obj, db)
 
@@ -615,10 +648,25 @@ def update_product(
         raise HTTPException(400, "供应商不存在")
     if "port_id" in data and data["port_id"] and not db.query(Port).filter(Port.id == data["port_id"]).first():
         raise HTTPException(400, "港口不存在")
+    # Parse date strings before setattr
+    for date_field in ("effective_from", "effective_to"):
+        if date_field in data:
+            data[date_field] = _parse_date(data[date_field])
     for k, v in data.items():
         setattr(obj, k, v)
-    obj.updated_at = datetime.utcnow()
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该产品在同一国家和港口下已存在（同名+同国家+同港口）")
+    except DataError as e:
+        db.rollback()
+        logger.warning("update_product DataError: %s", e)
+        raise HTTPException(400, "数据格式错误，请检查字段长度和类型")
+    except Exception as e:
+        db.rollback()
+        logger.exception("update_product unexpected error")
+        raise HTTPException(500, f"更新失败: {str(e)[:200]}")
     db.refresh(obj)
     return _product_to_dict(obj, db)
 
@@ -634,3 +682,266 @@ def delete_product(
         raise HTTPException(404, "产品不存在")
     db.delete(obj)
     db.commit()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Exchange Rates
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _db_rate_lookup(db: Session, from_curr: str, to_curr: str, target_date: date) -> tuple[float, date] | None:
+    """DB-only lookup: direct match, then reverse match."""
+    # Direct
+    row = (
+        db.query(ExchangeRate)
+        .filter(ExchangeRate.from_currency == from_curr, ExchangeRate.to_currency == to_curr,
+                ExchangeRate.effective_date <= target_date)
+        .order_by(ExchangeRate.effective_date.desc()).first()
+    )
+    if row:
+        return (float(row.rate), row.effective_date)
+    # Reverse
+    row = (
+        db.query(ExchangeRate)
+        .filter(ExchangeRate.from_currency == to_curr, ExchangeRate.to_currency == from_curr,
+                ExchangeRate.effective_date <= target_date)
+        .order_by(ExchangeRate.effective_date.desc()).first()
+    )
+    if row and float(row.rate) != 0:
+        return (round(1.0 / float(row.rate), 8), row.effective_date)
+    return None
+
+
+def _fetch_and_store_rates(db: Session, base: str) -> bool:
+    """Fetch latest rates from API for a base currency, store in DB. Returns True on success."""
+    import httpx
+    try:
+        resp = httpx.get(f"https://open.er-api.com/v6/latest/{base}", timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return False
+    if data.get("result") != "success":
+        return False
+    rates = data.get("rates", {})
+    today = date.today()
+    for code, rate_value in rates.items():
+        if code == base:
+            continue
+        existing = (
+            db.query(ExchangeRate)
+            .filter(ExchangeRate.from_currency == base, ExchangeRate.to_currency == code,
+                    ExchangeRate.effective_date == today)
+            .first()
+        )
+        if existing:
+            existing.rate = rate_value
+            existing.source = "api"
+            existing.updated_at = datetime.utcnow()
+        else:
+            db.add(ExchangeRate(from_currency=base, to_currency=code,
+                                rate=rate_value, effective_date=today, source="api"))
+    db.commit()
+    return True
+
+
+def get_exchange_rate(db: Session, from_curr: str, to_curr: str, target_date: date | None = None) -> tuple[float, date] | None:
+    """Look up exchange rate with 3-tier fallback. Returns (rate, effective_date) or None.
+
+    1. Same currency → 1.0
+    2. DB direct/reverse match
+    3. DB cross-rate via USD bridge (from→USD × USD→to)
+    4. Auto-fetch from API → store → retry
+    """
+    from_curr = from_curr.strip().upper()
+    to_curr = to_curr.strip().upper()
+    if from_curr == to_curr:
+        return (1.0, target_date or date.today())
+    if target_date is None:
+        target_date = date.today()
+
+    # Tier 1: DB direct/reverse
+    result = _db_rate_lookup(db, from_curr, to_curr, target_date)
+    if result:
+        return result
+
+    # Tier 2: cross-rate via USD bridge
+    if from_curr != "USD" and to_curr != "USD":
+        r1 = _db_rate_lookup(db, from_curr, "USD", target_date)
+        r2 = _db_rate_lookup(db, "USD", to_curr, target_date)
+        if r1 and r2:
+            cross_rate = round(r1[0] * r2[0], 8)
+            older_date = min(r1[1], r2[1])
+            return (cross_rate, older_date)
+
+    # Tier 3: auto-fetch from API, then retry
+    if _fetch_and_store_rates(db, from_curr):
+        result = _db_rate_lookup(db, from_curr, to_curr, target_date)
+        if result:
+            return result
+
+    return None
+
+
+@router.get("/exchange-rates")
+def list_exchange_rates(
+    from_currency: str | None = Query(None),
+    to_currency: str | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_data_reader),
+):
+    q = db.query(ExchangeRate)
+    if from_currency:
+        q = q.filter(ExchangeRate.from_currency == from_currency.upper())
+    if to_currency:
+        q = q.filter(ExchangeRate.to_currency == to_currency.upper())
+    rows = q.order_by(ExchangeRate.from_currency, ExchangeRate.to_currency, ExchangeRate.effective_date.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "from_currency": r.from_currency,
+            "to_currency": r.to_currency,
+            "rate": float(r.rate),
+            "effective_date": str(r.effective_date),
+            "source": r.source,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/exchange-rates", status_code=201)
+def create_exchange_rate(
+    body: ExchangeRateCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_data_writer),
+):
+    obj = ExchangeRate(
+        from_currency=body.from_currency.upper(),
+        to_currency=body.to_currency.upper(),
+        rate=body.rate,
+        effective_date=body.effective_date,
+        source="manual",
+    )
+    db.add(obj)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该币种对在该日期已有汇率记录")
+    db.refresh(obj)
+    return {
+        "id": obj.id,
+        "from_currency": obj.from_currency,
+        "to_currency": obj.to_currency,
+        "rate": float(obj.rate),
+        "effective_date": str(obj.effective_date),
+        "source": obj.source,
+    }
+
+
+@router.patch("/exchange-rates/{rate_id}")
+def update_exchange_rate(
+    rate_id: int,
+    body: ExchangeRateUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_data_writer),
+):
+    obj = db.query(ExchangeRate).filter(ExchangeRate.id == rate_id).first()
+    if not obj:
+        raise HTTPException(404, "汇率记录不存在")
+    data = body.model_dump(exclude_unset=True)
+    for k, v in data.items():
+        setattr(obj, k, v)
+    obj.updated_at = datetime.utcnow()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该币种对在该日期已有汇率记录")
+    db.refresh(obj)
+    return {
+        "id": obj.id,
+        "from_currency": obj.from_currency,
+        "to_currency": obj.to_currency,
+        "rate": float(obj.rate),
+        "effective_date": str(obj.effective_date),
+        "source": obj.source,
+    }
+
+
+@router.delete("/exchange-rates/{rate_id}", status_code=204)
+def delete_exchange_rate(
+    rate_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_data_writer),
+):
+    obj = db.query(ExchangeRate).filter(ExchangeRate.id == rate_id).first()
+    if not obj:
+        raise HTTPException(404, "汇率记录不存在")
+    db.delete(obj)
+    db.commit()
+
+
+class FetchRatesRequest(BaseModel):
+    base_currency: str = "USD"
+    target_currencies: list[str] = []
+
+
+@router.post("/exchange-rates/fetch")
+def fetch_exchange_rates(
+    body: FetchRatesRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_data_writer),
+):
+    """Fetch latest exchange rates from free API and save to DB."""
+    import httpx
+
+    base = body.base_currency.upper()
+    try:
+        resp = httpx.get(f"https://open.er-api.com/v6/latest/{base}", timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"获取汇率失败: {e}")
+
+    if data.get("result") != "success":
+        raise HTTPException(502, f"API 返回错误: {data.get('error-type', 'unknown')}")
+
+    rates = data.get("rates", {})
+    today = date.today()
+    targets = [c.upper() for c in body.target_currencies] if body.target_currencies else list(rates.keys())
+
+    created = 0
+    updated = 0
+    for currency_code in targets:
+        if currency_code == base or currency_code not in rates:
+            continue
+        rate_value = rates[currency_code]
+        existing = (
+            db.query(ExchangeRate)
+            .filter(
+                ExchangeRate.from_currency == base,
+                ExchangeRate.to_currency == currency_code,
+                ExchangeRate.effective_date == today,
+            )
+            .first()
+        )
+        if existing:
+            existing.rate = rate_value
+            existing.source = "api"
+            existing.updated_at = datetime.utcnow()
+            updated += 1
+        else:
+            db.add(ExchangeRate(
+                from_currency=base,
+                to_currency=currency_code,
+                rate=rate_value,
+                effective_date=today,
+                source="api",
+            ))
+            created += 1
+
+    db.commit()
+    return {"created": created, "updated": updated, "base": base, "date": str(today)}

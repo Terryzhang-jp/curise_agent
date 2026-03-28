@@ -318,6 +318,16 @@ class InquiryWorkbook:
                         cell = self._ws[f"{col_letter}{row}"]
                         if not isinstance(cell, MergedCell):
                             cell.value = value
+                            # Apply 2-decimal format to price/amount columns
+                            if field_key in ("unit_price", "total_price", "amount"):
+                                cell.number_format = '0.00'
+
+                # Also format formula columns (e.g. L = H*J total) with 2 decimals
+                for fc in skip:
+                    cell = self._ws[f"{fc}{row}"]
+                    if not isinstance(cell, MergedCell) and cell.value is not None:
+                        cell.number_format = '0.00'
+
             return len(products)
 
     def safe_set_cell(self, ref: str, value, number_format: str | None = None) -> bool:
