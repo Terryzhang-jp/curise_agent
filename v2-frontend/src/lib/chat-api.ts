@@ -430,7 +430,8 @@ export interface AgentMemory {
 }
 
 export async function listMemories(): Promise<AgentMemory[]> {
-  return fetchWithAuth(`${API_BASE}/chat/memories`);
+  const res = await fetchWithAuth(`${API_BASE}/api/chat/memories`);
+  return handleResponse<AgentMemory[]>(res);
 }
 
 export async function createMemory(data: {
@@ -438,32 +439,36 @@ export async function createMemory(data: {
   key: string;
   value: string;
 }): Promise<{ id: number; action: string }> {
-  return fetchWithAuth(`${API_BASE}/chat/memories`, {
+  const res = await fetchWithAuth(`${API_BASE}/api/chat/memories`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
+  return handleResponse<{ id: number; action: string }>(res);
 }
 
 export async function updateMemory(
   id: number,
   data: { memory_type?: string; key?: string; value?: string }
 ): Promise<{ detail: string }> {
-  return fetchWithAuth(`${API_BASE}/chat/memories/${id}`, {
+  const res = await fetchWithAuth(`${API_BASE}/api/chat/memories/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
+  return handleResponse<{ detail: string }>(res);
 }
 
 export async function deleteMemory(id: number): Promise<{ detail: string }> {
-  return fetchWithAuth(`${API_BASE}/chat/memories/${id}`, {
+  const res = await fetchWithAuth(`${API_BASE}/api/chat/memories/${id}`, {
     method: "DELETE",
   });
+  return handleResponse<{ detail: string }>(res);
 }
 
 export async function clearAllMemories(): Promise<{ detail: string }> {
-  return fetchWithAuth(`${API_BASE}/chat/memories`, {
+  const res = await fetchWithAuth(`${API_BASE}/api/chat/memories`, {
     method: "DELETE",
   });
+  return handleResponse<{ detail: string }>(res);
 }
