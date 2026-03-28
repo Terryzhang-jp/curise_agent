@@ -262,9 +262,7 @@ def register(registry, ctx=None):
             "Can generate for all suppliers (default) or a single supplier. "
             "This runs the full inquiry orchestrator: template resolution, "
             "data filling, format enforcement, and file upload. "
-            "生成完成后，Excel 文件会同时保存到工作目录，你可以用 bash + openpyxl 进一步修改格式。\n"
-            "单价和合计列默认保留2位小数（0.00）。如果用户要求不同的小数位数，生成后用 bash 修改即可。\n"
-            "返回生成结果摘要，包含文件名和产品数。"
+            "生成供应商询价单 Excel 文件。返回文件名和产品数。文件保存到工作目录，可用 modify_excel 修改。"
         ),
         parameters={
             "order_id": {

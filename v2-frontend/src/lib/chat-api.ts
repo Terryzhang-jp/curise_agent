@@ -472,3 +472,15 @@ export async function clearAllMemories(): Promise<{ detail: string }> {
   });
   return handleResponse<{ detail: string }>(res);
 }
+
+// ─── Skills ───────────────────────────────────────────────────
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+}
+
+export async function listSkills(): Promise<SkillInfo[]> {
+  const res = await fetchWithAuth(`${API_BASE}/api/chat/skills`);
+  return handleResponse<SkillInfo[]>(res);
+}

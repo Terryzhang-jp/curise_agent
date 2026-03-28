@@ -195,41 +195,12 @@ _INQUIRY_WORKFLOW = """## 询价单生成
 - 用户上传模板时，传 template_id 参数即可"""
 
 def domain_knowledge(ctx: PromptContext) -> str:
-    """Business rules, data schemas, workflow instructions."""
+    """Minimal domain context — workflow details are in Skills (DeerFlow pattern)."""
     parts = []
 
-    # Scenario-specific domain blocks
-    if ctx.scenario == "data_upload":
-        parts.append(_DATA_UPLOAD_RULES)
-        return "\n\n".join(parts)
-
-    if ctx.scenario == "query":
-        parts.append(_DATA_TABLES)
-        parts.append(_QUERY_RULES)
-        return "\n\n".join(parts)
-
-    if ctx.scenario == "order_management":
-        parts.append("## 重要数据表\n- v2_orders: 订单表（order_metadata, products, match_results 是 JSON 字段）\n- products: 产品匹配参考")
-        parts.append(_QUERY_RULES)
-        return "\n\n".join(parts)
-
-    if ctx.scenario == "fulfillment":
-        parts.append(_FULFILLMENT_RULES)
-        return "\n\n".join(parts)
-
-    # Default scenario: inject only what's relevant based on registered tools
-    registered = ctx.registered_tool_names or set()
-
-    parts.append("## 记忆\n你拥有完整的对话记忆。你可以回忆本次会话中用户之前说过的所有内容。\n如果系统 prompt 中包含长期记忆块，那是跨会话的知识，包含用户偏好和业务知识，请参考但不要盲信。")
+    # Core data reference (always needed for SQL queries)
     parts.append(_DATA_TABLES)
     parts.append(_QUERY_RULES)
-
-    # Conditional: only inject domain blocks for tools that are actually registered
-    if "get_order_fulfillment" in registered:
-        parts.append(_FULFILLMENT_RULES)
-
-    if "generate_inquiries" in registered:
-        parts.append(_INQUIRY_WORKFLOW)
 
     return "\n\n".join(parts)
 

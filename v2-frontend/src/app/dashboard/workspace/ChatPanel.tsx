@@ -1,13 +1,55 @@
 "use client";
 
-import { useRef, useEffect, useCallback } from "react";
-import type { ChatSession, ChatMessage } from "@/lib/chat-api";
+import { useRef, useEffect, useCallback, useState } from "react";
+import type { ChatSession, ChatMessage, SkillInfo } from "@/lib/chat-api";
+import { listSkills } from "@/lib/chat-api";
 import { ChatBubble, ReasoningBlock } from "@/components/chat-bubble";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { SendHorizontal, MessageSquare, Loader2, Paperclip, X, Upload, Search, ClipboardList, Package, Square } from "lucide-react";
+import { SendHorizontal, MessageSquare, Loader2, Paperclip, X, Upload, Search, ClipboardList, Package, Square, Zap } from "lucide-react";
 import { toast } from "sonner";
+
+// ─── Slash Command Menu ─────────────────────────────────────
+function SlashCommandMenu({ query, onSelect }: { query: string; onSelect: (name: string) => void }) {
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!loaded) {
+      listSkills().then((s) => { setSkills(Array.isArray(s) ? s : []); setLoaded(true); }).catch(() => setLoaded(true));
+    }
+  }, [loaded]);
+
+  const filtered = skills.filter(
+    (s) => !query || s.name.includes(query.toLowerCase()) || s.description.includes(query)
+  );
+
+  if (!loaded || filtered.length === 0) return null;
+
+  return (
+    <div className="absolute bottom-full left-0 w-full mb-1 bg-popover border rounded-lg shadow-lg z-50 overflow-hidden">
+      <div className="p-1.5 text-[10px] text-muted-foreground font-medium px-3 border-b">
+        技能 Skills
+      </div>
+      <div className="max-h-48 overflow-y-auto p-1">
+        {filtered.map((s) => (
+          <button
+            key={s.name}
+            onClick={() => onSelect(s.name)}
+            className="flex items-start gap-2 w-full px-3 py-2 rounded-md text-left hover:bg-accent transition-colors"
+          >
+            <Zap className="h-4 w-4 text-amber-500 shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium">/{s.name}</p>
+              <p className="text-xs text-muted-foreground truncate">{s.description}</p>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 interface ChatPanelProps {
   session: ChatSession | null;
@@ -365,6 +407,13 @@ export default function ChatPanel({
                   <Paperclip className="h-4 w-4" />
                 </Button>
                 <div className="flex-1 relative">
+                  {/* Slash command skill menu */}
+                  {input.startsWith("/") && !sending && (
+                    <SlashCommandMenu
+                      query={input.slice(1)}
+                      onSelect={(name) => onInputChange(`/${name} `)}
+                    />
+                  )}
                   <Textarea
                     value={input}
                     onChange={(e) => onInputChange(e.target.value)}

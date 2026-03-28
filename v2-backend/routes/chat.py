@@ -653,6 +653,29 @@ def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None
                                    user_id=user_id)
         if cancel_event:
             agent.ctx.cancel_event = cancel_event
+
+        # DeerFlow skill auto-loading: scenario → inject skill as system context
+        # Skill content is injected as a transient system message (not in user message)
+        # so the user's message stays clean in the UI
+        _SCENARIO_SKILL_MAP = {
+            "inquiry": "generate-inquiry",
+            "data_upload": "data-upload",
+            "fulfillment": "fulfillment",
+            "query": "query-data",
+        }
+        if scenario and scenario in _SCENARIO_SKILL_MAP:
+            skill_name = _SCENARIO_SKILL_MAP[scenario]
+            if hasattr(agent.ctx, 'skills') and skill_name in agent.ctx.skills:
+                from services.agent.tool_context import _expand_template
+                skill = agent.ctx.skills[skill_name]
+                agent.ctx._skill_injection = _expand_template(skill.body, user_message)
+
+        # Handle explicit /slash-command from user (still modifies message)
+        if user_message.strip().startswith("/") and hasattr(agent.ctx, 'resolve_slash_command'):
+            was_skill, expanded = agent.ctx.resolve_slash_command(user_message)
+            if was_skill:
+                user_message = expanded
+
         agent.run(user_message)
     except Exception as e:
         logger.error("Chat agent error: %s", str(e), exc_info=True)
@@ -1224,3 +1247,24 @@ def clear_all_memories(
     ).delete()
     db.commit()
     return {"detail": f"已清除 {count} 条记忆"}
+
+
+# ─── Skills ──────────────────────────────────────────────────
+
+@router.get("/skills")
+def list_skills(
+    current_user: User = Depends(require_chat_user),
+):
+    """List available skills for the slash command menu."""
+    from services.agent.tool_context import ToolContext
+    import os
+
+    ctx = ToolContext()
+    app_dir = os.path.dirname(os.path.dirname(__file__))
+    skills_dir = os.path.join(app_dir, "skills")
+    ctx.scan_skills([skills_dir] if os.path.isdir(skills_dir) else None)
+
+    return [
+        {"name": s.name, "description": s.description}
+        for s in ctx.skills.values()
+    ]

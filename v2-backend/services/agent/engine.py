@@ -439,8 +439,8 @@ class ReActAgent:
         self.step_log = []
         self._conversation_parts: list[str] = []  # For MemoryMiddleware extraction
 
-        # Handle /skill-name slash commands
-        if hasattr(self.ctx, 'resolve_slash_command') and self.ctx.skills:
+        # Handle /skill-name slash commands (fallback — chat.py handles this first)
+        if user_message.strip().startswith("/") and hasattr(self.ctx, 'resolve_slash_command') and self.ctx.skills:
             was_skill, user_message = self.ctx.resolve_slash_command(user_message)
             if was_skill:
                 self._log("user_input", f"[Skill invoked] {user_message[:200]}...")
@@ -535,6 +535,16 @@ class ReActAgent:
                 workspace_injection = self.provider.build_system_injection(ws_summary)
                 history.append(workspace_injection)
 
+            # --- Skill injection (transient, first turn only) ---
+            skill_injection = None
+            if turn == 0:
+                skill_text = getattr(self.ctx, '_skill_injection', '')
+                if skill_text:
+                    skill_injection = self.provider.build_system_injection(
+                        f"[工作流指引]\n{skill_text}"
+                    )
+                    history.append(skill_injection)
+
             # --- Middleware: before_model ---
             if self._middleware:
                 history = self._middleware.run_before_model(history, self.ctx)
@@ -564,6 +574,8 @@ class ReActAgent:
                     history.remove(todo_injection)
                 if workspace_injection is not None and workspace_injection in history:
                     history.remove(workspace_injection)
+                if skill_injection is not None and skill_injection in history:
+                    history.remove(skill_injection)
                 if midpoint_injection is not None and midpoint_injection in history:
                     history.remove(midpoint_injection)
                 if last_turn_injection is not None and last_turn_injection in history:
