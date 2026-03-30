@@ -148,6 +148,9 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     # Provider — Kimi K2.5 (93% tool calling accuracy, OpenAI-compatible)
     # Fallback to Gemini if no MOONSHOT_API_KEY configured
     moonshot_key = getattr(settings, 'MOONSHOT_API_KEY', '') or os.getenv('MOONSHOT_API_KEY', '')
+    logger.info("Provider: MOONSHOT_KEY=%s len=%d → %s",
+                "SET" if moonshot_key else "EMPTY", len(moonshot_key),
+                "Kimi" if moonshot_key else "Gemini")
     if moonshot_key:
         from services.agent.llm.kimi_provider import KimiProvider
         llm_config = LLMConfig(provider="kimi", model_name="kimi-k2.5", api_key=moonshot_key)
