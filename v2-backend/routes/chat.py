@@ -148,9 +148,6 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     # Provider — Kimi K2.5 (93% tool calling accuracy, OpenAI-compatible)
     # Fallback to Gemini if no MOONSHOT_API_KEY configured
     moonshot_key = getattr(settings, 'MOONSHOT_API_KEY', '') or os.getenv('MOONSHOT_API_KEY', '')
-    logger.info("Provider: MOONSHOT_KEY=%s len=%d → %s",
-                "SET" if moonshot_key else "EMPTY", len(moonshot_key),
-                "Kimi" if moonshot_key else "Gemini")
     if moonshot_key:
         from services.agent.llm.kimi_provider import KimiProvider
         llm_config = LLMConfig(provider="kimi", model_name="kimi-k2.5", api_key=moonshot_key)
@@ -232,7 +229,10 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
         else:
             _cfg = _LC(model_name="gemini-2.0-flash", api_key=settings.GOOGLE_API_KEY,
                         thinking_budget=0)
-        return _cp(_cfg)
+        p = _cp(_cfg)
+        # Must configure with a non-empty system prompt (Kimi rejects empty system messages)
+        p.configure("Extract memories from conversation.", [], 0)
+        return p
 
     hooks = MiddlewareChain([
         # 0. Workspace state: inject file listing before every LLM call
