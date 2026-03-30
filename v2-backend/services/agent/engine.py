@@ -468,8 +468,9 @@ class ReActAgent:
         # Load history for LLM
         history = self._load_history()
 
-        total_prompt_tokens = 0
+        total_prompt_tokens = 0      # Accumulated (for billing)
         total_completion_tokens = 0
+        current_prompt_tokens = 0    # Latest call's context size (for compact check)
         _tool_calls_since_think = 0  # Track tool calls without think for enforcement
 
         final_answer = None
@@ -586,6 +587,9 @@ class ReActAgent:
                 resp = self._middleware.run_after_model(resp, self.ctx)
 
             # Token accounting
+            # prompt_tokens is the FULL context size for this call (not incremental)
+            # So we track the latest value for compact check, and accumulate for billing
+            current_prompt_tokens = resp.prompt_tokens
             total_prompt_tokens += resp.prompt_tokens
             total_completion_tokens += resp.completion_tokens
 
@@ -743,9 +747,11 @@ class ReActAgent:
                 _tool_calls_since_think = 0  # Reset after reminder
 
             # === Auto-compact check (supports SummarizationMiddleware flag) ===
+            # Use current_prompt_tokens (this call's full context size), NOT total
+            # prompt_tokens is the full context each call, not incremental
             should_compact_mw = getattr(self.ctx, '_should_compact', False)
-            if not self._compact_done and (total_prompt_tokens >= self._compact_threshold or should_compact_mw):
-                self._log("auto_compact", f"Token count ({total_prompt_tokens}) exceeds threshold ({self._compact_threshold}), compacting...")
+            if not self._compact_done and (current_prompt_tokens >= self._compact_threshold or should_compact_mw):
+                self._log("auto_compact", f"Context size ({current_prompt_tokens}) exceeds threshold ({self._compact_threshold}), compacting...")
                 try:
                     self.compact()
                     history = self._load_history()
@@ -758,8 +764,8 @@ class ReActAgent:
             # === Tool Result Clearing (Anthropic pattern) ===
             # Old tool results are no longer needed once the agent processed them.
             # Aggressively clear results older than 6 messages to save context.
-            if turn >= 3 and len(history) > 8:
-                clear_boundary = max(0, len(history) - 8)
+            if turn >= 8 and len(history) > 30:
+                clear_boundary = max(0, len(history) - 30)
                 for hi in range(clear_boundary):
                     item = history[hi]
                     # Gemini format: Content with parts containing function_response

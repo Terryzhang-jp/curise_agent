@@ -31,8 +31,8 @@ class SummarizationMiddleware(Middleware):
 
     def __init__(
         self,
-        token_threshold: int = 80000,
-        message_threshold: int = 40,
+        token_threshold: int = 100000,
+        message_threshold: int = 200,
     ):
         self._token_threshold = token_threshold
         self._message_threshold = message_threshold
