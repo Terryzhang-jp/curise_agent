@@ -21,11 +21,11 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
 
-from config import settings
-from database import get_db, SessionLocal
-from models import AgentSession, AgentMessage, User
+from core.config import settings
+from core.database import get_db, SessionLocal
+from core.models import AgentSession, AgentMessage, User
 from routes.auth import get_current_user
-from security import require_role
+from core.security import require_role
 from services.agent.scenarios import resolve_tools_for_scenario
 from services.agent.stream_queue import (
     get_or_create_queue, get_queue, remove_queue, push_event,
@@ -60,7 +60,7 @@ class ChatSessionCreate(BaseModel):
 
 def _load_enabled_tools(db: DBSession) -> set[str] | None:
     """Load enabled tool names from DB. Returns None if no config rows exist (backward compat)."""
-    from models import ToolConfig
+    from core.models import ToolConfig
     count = db.query(ToolConfig).count()
     if count == 0:
         return None  # No config yet — register all defaults
@@ -78,7 +78,7 @@ def _load_skills_into_ctx(db: DBSession, ctx):
     Finally, remove any filesystem skill that has a DB entry with is_enabled=False.
     """
     import os
-    from models import SkillConfig
+    from core.models import SkillConfig
     from services.agent.tool_context import SkillDef
 
     # 1. Filesystem skills first (scan_skills clears then populates)
@@ -146,7 +146,7 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     from services.agent.tool_context import ToolContext
     from services.agent.engine import ReActAgent
     from services.tools import create_chat_registry
-    from config import settings
+    from core.config import settings
 
     # Provider — Kimi K2.5 (93% tool calling accuracy, OpenAI-compatible)
     # Fallback to Gemini if no MOONSHOT_API_KEY configured
@@ -483,7 +483,7 @@ async def send_message(
         file_bytes = file_content
 
         # Bridge: save uploaded file to workspace so Agent's bash can access it
-        from config import settings
+        from core.config import settings
         ws_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
         os.makedirs(ws_dir, exist_ok=True)
         ws_path = os.path.join(ws_dir, file.filename)
@@ -957,7 +957,7 @@ def list_session_artifacts(
     order_ids = ctx_data.get("referenced_order_ids", [])
 
     if order_ids:
-        from models import Order
+        from core.models import Order
         orders = db.query(Order).filter(Order.id.in_(order_ids)).all()
 
         # Load supplier names in bulk
@@ -1051,7 +1051,7 @@ def download_artifact(
         if order_id not in (ctx_data.get("referenced_order_ids") or []):
             raise HTTPException(403, "该订单未在此会话中引用")
 
-        from models import Order
+        from core.models import Order
         order = db.query(Order).filter(Order.id == order_id).first()
         if not order:
             raise HTTPException(404, "订单不存在")
@@ -1156,7 +1156,7 @@ def list_memories(
     db: DBSession = Depends(get_db),
 ):
     """List all memories for the current user."""
-    from models import AgentMemory
+    from core.models import AgentMemory
     memories = (
         db.query(AgentMemory)
         .filter(AgentMemory.user_id == current_user.id)
@@ -1185,7 +1185,7 @@ def create_memory(
     db: DBSession = Depends(get_db),
 ):
     """Manually create a memory entry."""
-    from models import AgentMemory
+    from core.models import AgentMemory
 
     valid_types = {"user_preference", "supplier_knowledge", "workflow_pattern", "fact"}
     if body.memory_type not in valid_types:
@@ -1225,7 +1225,7 @@ def update_memory(
     db: DBSession = Depends(get_db),
 ):
     """Update an existing memory entry."""
-    from models import AgentMemory
+    from core.models import AgentMemory
     mem = db.query(AgentMemory).filter(
         AgentMemory.id == memory_id,
         AgentMemory.user_id == current_user.id,
@@ -1255,7 +1255,7 @@ def delete_memory(
     db: DBSession = Depends(get_db),
 ):
     """Delete a memory entry."""
-    from models import AgentMemory
+    from core.models import AgentMemory
     mem = db.query(AgentMemory).filter(
         AgentMemory.id == memory_id,
         AgentMemory.user_id == current_user.id,
@@ -1273,7 +1273,7 @@ def clear_all_memories(
     db: DBSession = Depends(get_db),
 ):
     """Clear all memories for the current user."""
-    from models import AgentMemory
+    from core.models import AgentMemory
     count = db.query(AgentMemory).filter(
         AgentMemory.user_id == current_user.id
     ).delete()

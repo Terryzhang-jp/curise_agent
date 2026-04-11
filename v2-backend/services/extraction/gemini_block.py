@@ -185,7 +185,7 @@ class GeminiBlockExtractor(BaseExtractor):
     def __init__(self, api_key: str | None = None, model: str = GEMINI_MODEL):
         if not api_key:
             try:
-                from config import settings
+                from core.config import settings
                 api_key = settings.GOOGLE_API_KEY
             except Exception:
                 api_key = None

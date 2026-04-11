@@ -64,7 +64,7 @@ class WorkspaceStateMiddleware(Middleware):
             db = getattr(ctx, 'db', None)
             session_id = getattr(ctx, 'session_id', None) or getattr(ctx, 'pipeline_session_id', None)
             if db and session_id:
-                from models import AgentSession
+                from core.models import AgentSession
                 session = db.query(AgentSession).filter(AgentSession.id == session_id).first()
                 if session and session.context_data:
                     op_state = session.context_data.get("operation_state")

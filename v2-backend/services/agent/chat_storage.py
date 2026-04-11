@@ -110,7 +110,7 @@ def _detect_xlsx_in_workspace(tool_name: str, output_text: str, session_id: str)
     Returns filename or None.
     """
     import os
-    from config import settings
+    from core.config import settings
 
     ws_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
     if not os.path.isdir(ws_dir):
@@ -149,7 +149,7 @@ class ChatStorage:
         self._db = db
 
     def _next_sequence(self, session_id: str) -> int:
-        from models import AgentMessage
+        from core.models import AgentMessage
         result = self._db.query(AgentMessage.sequence).filter(
             AgentMessage.session_id == session_id,
         ).order_by(AgentMessage.sequence.desc()).first()
@@ -160,7 +160,7 @@ class ChatStorage:
         metadata: dict | None = None,
     ) -> int:
         """Write a display message for frontend rendering and push to SSE queue."""
-        from models import AgentMessage
+        from core.models import AgentMessage
         seq = self._next_sequence(session_id)
         msg = AgentMessage(
             session_id=session_id,
@@ -192,7 +192,7 @@ class ChatStorage:
     # ----------------------------------------------------------
 
     def get_session(self, session_id: str) -> Session | None:
-        from models import AgentSession
+        from core.models import AgentSession
         s = self._db.query(AgentSession).filter(AgentSession.id == session_id).first()
         if s is None:
             return None
@@ -205,7 +205,7 @@ class ChatStorage:
         )
 
     def update_session(self, session_id: str, **fields):
-        from models import AgentSession
+        from core.models import AgentSession
         s = self._db.query(AgentSession).filter(AgentSession.id == session_id).first()
         if not s:
             return
@@ -227,7 +227,7 @@ class ChatStorage:
         parts: list[dict],
         model: str | None = None,
     ) -> Message:
-        from models import AgentMessage
+        from core.models import AgentMessage
 
         now = datetime.utcnow()
 
@@ -373,7 +373,7 @@ class ChatStorage:
 
     def list_messages(self, session_id: str, after_id: int | None = None) -> list[Message]:
         """List canonical agent_parts messages (for engine history)."""
-        from models import AgentMessage
+        from core.models import AgentMessage
 
         query = self._db.query(AgentMessage).filter(
             AgentMessage.session_id == session_id,
@@ -428,7 +428,7 @@ class ChatStorage:
         - Pushes token events through SSE queue (streaming)
         - Pushes token_done event (finality)
         """
-        from models import AgentMessage
+        from core.models import AgentMessage
 
         now = datetime.utcnow()
 
@@ -511,7 +511,7 @@ class ChatStorage:
     def update_token_usage(self, session_id: str, prompt_tokens: int, completion_tokens: int):
         """Accumulate token usage on the session record."""
         try:
-            from models import AgentSession
+            from core.models import AgentSession
             s = self._db.query(AgentSession).filter(AgentSession.id == session_id).first()
             if s:
                 usage = dict(s.token_usage or {})

@@ -34,8 +34,8 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import models  # noqa: E402
-from models import Document, Order  # noqa: E402
+import core.models as models  # noqa: E402
+from core.models import Document, Order  # noqa: E402
 
 
 @pytest.fixture

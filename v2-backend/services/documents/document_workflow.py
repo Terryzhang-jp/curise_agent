@@ -4,8 +4,8 @@ import logging
 import uuid
 from datetime import datetime
 
-from database import SessionLocal
-from models import Document, Order
+from core.database import SessionLocal
+from core.models import Document, Order
 from services.documents.document_order_projection import create_or_update_order_from_document
 from services.documents.document_processor import process_document
 from services.common.file_storage import storage

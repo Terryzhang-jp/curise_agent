@@ -9,10 +9,10 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from database import get_db
-from models import User
-from security import require_role, hash_password, ROLE_LEVELS, revoke_user_tokens
-from schemas import UserCreateRequest, UserUpdateRequest, UserListResponse
+from core.database import get_db
+from core.models import User
+from core.security import require_role, hash_password, ROLE_LEVELS, revoke_user_tokens
+from core.schemas import UserCreateRequest, UserUpdateRequest, UserListResponse
 
 require_superadmin = require_role("superadmin")
 

@@ -19,7 +19,7 @@ import logging
 from collections import Counter
 from typing import Optional
 
-from models import OrderFormatTemplate
+from core.models import OrderFormatTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +252,7 @@ def _pdf_vision_scannable(file_bytes: bytes) -> str:
     from pdf2image import convert_from_bytes
     from google import genai
     from google.genai import types
-    from config import settings
+    from core.config import settings
 
     images = convert_from_bytes(file_bytes, dpi=150, first_page=1, last_page=1)
     if not images:

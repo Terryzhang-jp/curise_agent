@@ -25,12 +25,12 @@ from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session as DBSession
 
-from config import settings
-from database import get_db, SessionLocal
-from models import Order, User, Country
+from core.config import settings
+from core.database import get_db, SessionLocal
+from core.models import Order, User, Country
 from routes.auth import get_current_user
-from security import require_role
-from schemas import OrderListItem, OrderDetail, OrderReviewRequest, OrderUpdateRequest, OrderRematchRequest
+from core.security import require_role
+from core.schemas import OrderListItem, OrderDetail, OrderReviewRequest, OrderUpdateRequest, OrderRematchRequest
 from services.agent.stream_queue import (
     get_or_create_cancel_event,
     get_or_create_queue,
@@ -115,8 +115,8 @@ def _run_extract_only(order_id: int, file_bytes: bytes):
     Old flow: extract → match → analyze (all automatic)
     New flow: extract only → status="extracted" → Agent decides next steps
     """
-    from database import SessionLocal
-    from models import Order
+    from core.database import SessionLocal
+    from core.models import Order
     from services.orders.order_processor import smart_extract, normalize_metadata, _validate_extraction
     from services.data.product_normalizer import normalize_products
     from sqlalchemy.orm.attributes import flag_modified
@@ -457,7 +457,7 @@ async def set_order_template(
         raise HTTPException(400, "订单不在等待选择模板状态")
 
     # Validate template exists
-    from models import OrderFormatTemplate
+    from core.models import OrderFormatTemplate
     template = db.query(OrderFormatTemplate).get(body.template_id)
     if not template:
         raise HTTPException(404, "模板不存在")
@@ -595,7 +595,7 @@ def delivery_environment(
         raise HTTPException(400, "缺少港口或交货日期信息")
 
     from services.integrations.weather_service import fetch_delivery_environment
-    from models import Port, Country
+    from core.models import Port, Country
     port = db.query(Port).get(order.port_id)
     country = db.query(Country).get(port.country_id) if port and port.country_id else None
     if not port or not country:
@@ -913,7 +913,7 @@ def _get_download_user(
     """Authenticate via ?token= query param for direct download links."""
     if not token:
         raise HTTPException(401, "Not authenticated")
-    from security import decode_token as _decode
+    from core.security import decode_token as _decode
     from jose import JWTError
     try:
         payload = _decode(token)
@@ -980,7 +980,7 @@ def inquiry_readiness(
     """
     from services.orders.inquiry_agent import select_template, _build_order_data_for_engine
     from services.data.field_schema import analyze_gaps, schema_from_zone_config
-    from models import SupplierTemplate
+    from core.models import SupplierTemplate
     import sqlalchemy
 
     order = _get_order(db, order_id, current_user)
@@ -1137,7 +1137,7 @@ def inquiry_data_preview(
     from services.orders.inquiry_agent import select_template, _build_order_data_for_engine
     from services.data.field_schema import _resolve_path
     from services.templates.template_engine_legacy import _resolve_product_field
-    from models import SupplierTemplate
+    from core.models import SupplierTemplate
     import sqlalchemy
 
     order = _get_order(db, order_id, current_user)

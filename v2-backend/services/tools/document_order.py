@@ -176,7 +176,7 @@ def register(registry, ctx=None):
         if not action or not document_id:
             return "Error: 需要 action 和 document_id"
 
-        from models import Document
+        from core.models import Document
         from services.tools._security import scope_to_owner
 
         # Row-level ownership check (shared helper): employees only see their
@@ -198,7 +198,7 @@ def register(registry, ctx=None):
             return summarize_order_payload(payload)
 
         if action == "create":
-            from models import Order
+            from core.models import Order
             force = bool(parsed_fields.get("force", False))
             existing = ctx.db.query(Order).filter(Order.document_id == document.id).first()
             try:

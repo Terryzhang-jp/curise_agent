@@ -73,7 +73,7 @@ def run_inquiry_pre_analysis(order, db) -> dict:
     Groups products by supplier, resolves templates, checks data completeness.
     Returns dict to be stored as order.inquiry_data.
     """
-    from models import SupplierTemplate
+    from core.models import SupplierTemplate
     import sqlalchemy
 
     match_results = order.match_results or []
@@ -615,8 +615,8 @@ def _generate_single_supplier(
 
     Returns {"file_info": {...}, "verify_results": [...], "error": str|None}
     """
-    from database import SessionLocal
-    from models import SupplierTemplate
+    from core.database import SessionLocal
+    from core.models import SupplierTemplate
     from services.excel.excel_writer import InquiryWorkbook
     from services.agent.stream_queue import push_event
     from sqlalchemy import text as sa_text
@@ -678,7 +678,7 @@ def _generate_single_supplier(
         _prefetched_company = {}
         _prefetched_delivery = {}
         try:
-            from models import CompanyConfig, DeliveryLocation
+            from core.models import CompanyConfig, DeliveryLocation
             for c in _db.query(CompanyConfig).order_by(CompanyConfig.sort_order).all():
                 _prefetched_company[c.key] = c.value
             loc = _db.query(DeliveryLocation).filter(DeliveryLocation.is_default == True).first()
@@ -748,7 +748,7 @@ def _generate_single_supplier(
             # Load user field overrides if any
             _fo_db = SessionLocal()
             try:
-                from models import Order as _OrderModel
+                from core.models import Order as _OrderModel
                 _fo_order = _fo_db.query(_OrderModel).get(order_id)
                 _fo_overrides = (
                     (_fo_order.inquiry_data or {})
@@ -1251,7 +1251,7 @@ def _save_workbook(
     if stream_key:
         try:
             import os
-            from config import settings
+            from core.config import settings
             ws_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, stream_key)
             os.makedirs(ws_dir, exist_ok=True)
             ws_path = os.path.join(ws_dir, filename)

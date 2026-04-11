@@ -4,17 +4,17 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from jose import JWTError
 
-from database import get_db
-from models import User
-from security import (
+from core.database import get_db
+from core.models import User
+from core.security import (
     verify_password, hash_password, create_access_token, decode_token,
     create_refresh_token, verify_refresh_token, revoke_refresh_token, revoke_user_tokens,
 )
-from schemas import (
+from core.schemas import (
     LoginRequest, TokenResponse, UserResponse,
     RefreshTokenRequest, ChangePasswordRequest,
 )
-from config import settings
+from core.config import settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 bearer_scheme = HTTPBearer()

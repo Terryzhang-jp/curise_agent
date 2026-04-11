@@ -41,7 +41,7 @@ def normalize_matched_product(mp: dict) -> dict:
 def _persist_session_data(ctx):
     """Write ctx.session_data back to PipelineSession.phase_results."""
     if ctx.db and ctx.pipeline_session_id:
-        from models import PipelineSession
+        from core.models import PipelineSession
         session = ctx.db.query(PipelineSession).filter(
             PipelineSession.id == ctx.pipeline_session_id
         ).first()
@@ -53,7 +53,7 @@ def _persist_session_data(ctx):
 
 def _match_products_against_db(products, db, country_id=None, port_id=None, delivery_date=None):
     """Core matching logic."""
-    from models import ProductReadOnly
+    from core.models import ProductReadOnly
     from sqlalchemy import or_
 
     query = db.query(ProductReadOnly).filter(ProductReadOnly.status == True)
@@ -259,7 +259,7 @@ def create_matching_tools(registry, ctx):
         if not keyword:
             return "Error: 请提供搜索关键词"
 
-        from models import ProductReadOnly
+        from core.models import ProductReadOnly
 
         results = (
             ctx.db.query(ProductReadOnly)

@@ -117,7 +117,7 @@ def register(registry, ctx=None):
         if product_index < 0 or not new_product_code:
             return "Error: fields 需要 product_index (int) 和 new_product_code (string)"
 
-        from models import Product
+        from core.models import Product
         from sqlalchemy.orm.attributes import flag_modified
 
         match_results = list(order.match_results or [])
@@ -215,7 +215,7 @@ def register(registry, ctx=None):
             return "Error: 需要 action 和 order_id"
         order_id = int(order_id)
 
-        from models import Order
+        from core.models import Order
         from services.tools._security import scope_to_owner
         query = ctx.db.query(Order).filter(Order.id == order_id)
         query = scope_to_owner(query, Order, ctx)

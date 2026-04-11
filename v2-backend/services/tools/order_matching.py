@@ -50,7 +50,7 @@ def register(registry, ctx=None):
             return "Error: 需要 order_id"
         order_id = int(order_id)
 
-        from models import Order
+        from core.models import Order
         from sqlalchemy.orm.attributes import flag_modified
         from services.tools._security import scope_to_owner
 

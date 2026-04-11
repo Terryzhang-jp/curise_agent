@@ -8,10 +8,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from database import get_db
-from models import User, Country, Port, Category, Supplier, SupplierCategory, Product, ExchangeRate
-from security import require_role
-from schemas import (
+from core.database import get_db
+from core.models import User, Country, Port, Category, Supplier, SupplierCategory, Product, ExchangeRate
+from core.security import require_role
+from core.schemas import (
     CountryCreate, CountryUpdate, CountryResponse,
     CategoryCreate, CategoryUpdate, CategoryResponse,
     PortCreate, PortUpdate, PortResponse,

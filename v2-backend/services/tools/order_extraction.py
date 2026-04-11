@@ -59,7 +59,7 @@ def register(registry, ctx=None):
         order_id = int(order_id)
         force_extract = force.lower().strip() in ("true", "1", "yes")
 
-        from models import Order
+        from core.models import Order
         from sqlalchemy.orm.attributes import flag_modified
         from services.tools._security import scope_to_owner
 

@@ -8,12 +8,12 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
 
-from config import settings
-from database import get_db
-from models import Document, Order, User
+from core.config import settings
+from core.database import get_db
+from core.models import Document, Order, User
 from routes.auth import get_current_user
-from schemas import OrderDetail
-from security import require_role
+from core.schemas import OrderDetail
+from core.security import require_role
 from services.documents.document_order_projection import (
     get_document_extracted_view,
     build_order_payload,

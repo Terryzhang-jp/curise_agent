@@ -14,8 +14,8 @@ import logging
 import time
 from datetime import datetime
 
-from database import SessionLocal
-from models import Order
+from core.database import SessionLocal
+from core.models import Order
 
 logger = logging.getLogger(__name__)
 
@@ -321,7 +321,7 @@ def _gemini_native_pdf_extract(file_bytes: bytes) -> dict:
     """Single Gemini call with native PDF input + JSON response mode."""
     from google import genai
     from google.genai import types
-    from config import settings
+    from core.config import settings
 
     api_key = settings.GOOGLE_API_KEY
     if not api_key:
@@ -658,7 +658,7 @@ def _batch_match(products: list[dict], db, country_id, port_id, delivery_date=No
 def _refine_with_llm(order_id: int, ambiguous: list[dict], db, country_id, port_id, delivery_date=None) -> list:
     """Step 3: Single Gemini call to refine ambiguous matches. No Agent loop."""
     import re
-    from models import ProductReadOnly
+    from core.models import ProductReadOnly
     from sqlalchemy import or_
     from services.documents.pdf_analyzer import _get_model
 
@@ -852,7 +852,7 @@ def _template_guided_extract(file_bytes: bytes, file_type: str, template, db) ->
         # PDF (or Excel without column_mapping) → LLM with enhanced prompt
         field_defs = None
         if template.field_schema_id:
-            from models import FieldDefinition
+            from core.models import FieldDefinition
             field_defs = db.query(FieldDefinition).filter(
                 FieldDefinition.schema_id == template.field_schema_id
             ).order_by(FieldDefinition.sort_order).all()
@@ -906,7 +906,7 @@ def _excel_to_text(file_bytes: bytes) -> str:
 
 def process_order(order_id: int, file_bytes: bytes, template_id_override: int | None = None) -> None:
     """Background task: template_match → extract → agent_matching."""
-    from models import OrderFormatTemplate
+    from core.models import OrderFormatTemplate
 
     db = SessionLocal()
     try:
@@ -1036,7 +1036,7 @@ def process_order(order_id: int, file_bytes: bytes, template_id_override: int | 
             if order.port_id and order.delivery_date:
                 try:
                     from services.integrations.weather_service import fetch_delivery_environment
-                    from models import Port, Country
+                    from core.models import Port, Country
                     port = db.query(Port).get(order.port_id)
                     country = db.query(Country).get(port.country_id) if port and port.country_id else None
                     if port and country:

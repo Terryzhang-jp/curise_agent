@@ -177,7 +177,7 @@ def _touch_memories(db, memory_ids: list[int]):
     if not memory_ids:
         return
     try:
-        from database import SessionLocal
+        from core.database import SessionLocal
         touch_db = SessionLocal()
         try:
             from sqlalchemy import text
@@ -202,7 +202,7 @@ def _cleanup_expired(db, user_id: int):
     """
     try:
         from sqlalchemy import text
-        from database import SessionLocal
+        from core.database import SessionLocal
         cleanup_db = SessionLocal()
         try:
             result = cleanup_db.execute(text("""
@@ -310,7 +310,7 @@ def _extract_and_save(provider_factory, user_id: int,
                       session_id: str | None, conversation_log: str):
     """Background thread: use LLM to extract memories, then save to DB."""
     try:
-        from database import SessionLocal
+        from core.database import SessionLocal
         thread_db = SessionLocal()
 
         try:

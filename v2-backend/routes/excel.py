@@ -3,8 +3,8 @@ import uuid
 import hashlib
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 
-from config import settings
-from models import User
+from core.config import settings
+from core.models import User
 from routes.auth import get_current_user
 from services.excel.excel_parser import parse_excel_file, parse_excel_cell_positions
 

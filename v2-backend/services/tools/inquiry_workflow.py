@@ -40,7 +40,7 @@ def register(registry, ctx=None):
             return "Error: no database session available"
 
         try:
-            from models import Order, SupplierTemplate
+            from core.models import Order, SupplierTemplate
             from services.orders.inquiry_agent import select_template, _build_order_data_for_engine
             from services.data.field_schema import analyze_gaps, schema_from_zone_config
             import sqlalchemy
@@ -177,7 +177,7 @@ def register(registry, ctx=None):
             return "Error: no database session available"
 
         try:
-            from models import Order
+            from core.models import Order
             from sqlalchemy.orm.attributes import flag_modified
 
             db = ctx.db
@@ -229,7 +229,7 @@ def register(registry, ctx=None):
             return "Error: no database session available"
 
         try:
-            from models import Order
+            from core.models import Order
 
             db = ctx.db
             from services.tools._security import scope_to_owner
@@ -312,7 +312,7 @@ def register(registry, ctx=None):
                     try:
                         key_cells = {}
                         try:
-                            from models import SupplierTemplate
+                            from core.models import SupplierTemplate
                             tmpl = db.query(SupplierTemplate).filter(
                                 SupplierTemplate.id == int(template_id) if template_id else False
                             ).first()
@@ -428,7 +428,7 @@ def _save_operation_state(ctx, state: dict):
     if not db or not session_id:
         return
     try:
-        from models import AgentSession
+        from core.models import AgentSession
         from sqlalchemy.orm.attributes import flag_modified
         session = db.query(AgentSession).filter(AgentSession.id == session_id).first()
         if session:

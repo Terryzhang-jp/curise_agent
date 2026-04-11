@@ -13,9 +13,9 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session as DBSession
 
-from config import settings
-from database import SessionLocal
-from models import AgentSession, LineUser, User
+from core.config import settings
+from core.database import SessionLocal
+from core.models import AgentSession, LineUser, User
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ def _get_or_create_line_user(db: DBSession, line_user_id: str) -> LineUser:
       2. Create a system User record (email=line_{id}@line.bot, role=employee)
       3. Create a LineUser record linking the two
     """
-    from security import hash_password
+    from core.security import hash_password
 
     line_user = db.query(LineUser).filter(LineUser.line_user_id == line_user_id).first()
 
@@ -341,7 +341,7 @@ def _process_message(event, received_at: float, user_text: str, file_bytes: byte
         session.updated_at = datetime.utcnow()
 
         # Auto-set title from first message
-        from models import AgentMessage
+        from core.models import AgentMessage
         msg_count = db.query(AgentMessage).filter(
             AgentMessage.session_id == session.id,
             AgentMessage.role == "user",

@@ -203,7 +203,7 @@ def _read_live_schema(db, table_name: str) -> str | None:
     Uses an isolated DB session to avoid polluting the shared ctx.db,
     especially when called in parallel or when a previous query failed.
     """
-    from database import SessionLocal
+    from core.database import SessionLocal
     schema_db = SessionLocal()
     try:
         result = schema_db.execute(text("""
@@ -328,7 +328,7 @@ v2_orders 的 products/match_results/order_metadata 列类型是 **JSON（不是
             sql = sql + " LIMIT 100"
 
         # Use an ISOLATED DB session per query (DeerFlow: Sandbox pattern).
-        from database import SessionLocal
+        from core.database import SessionLocal
         query_db_session = SessionLocal()
         try:
             return _execute_sql(query_db_session, sql)

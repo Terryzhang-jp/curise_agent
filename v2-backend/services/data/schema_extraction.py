@@ -55,7 +55,7 @@ _STANDARD_KEY_MAP = {
 
 def _get_client():
     from google import genai
-    from config import settings
+    from core.config import settings
     return genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 

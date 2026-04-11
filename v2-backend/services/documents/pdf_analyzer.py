@@ -17,7 +17,7 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from pdf2image import convert_from_bytes
 from PIL import Image
 
-from config import settings
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 

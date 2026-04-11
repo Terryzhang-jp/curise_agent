@@ -5,7 +5,7 @@ from typing import Any
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from models import Document, Order
+from core.models import Document, Order
 
 logger = logging.getLogger(__name__)
 

@@ -92,7 +92,7 @@ class Storage:
 
     def _next_sequence(self, session_id: str) -> int:
         """Get the next sequence number for a session."""
-        from models import PipelineMessage
+        from core.models import PipelineMessage
         result = self._db.query(PipelineMessage.sequence).filter(
             PipelineMessage.session_id == session_id,
         ).order_by(PipelineMessage.sequence.desc()).first()
@@ -108,7 +108,7 @@ class Storage:
         metadata: dict | None = None,
     ) -> int:
         """Write a single display message for frontend rendering. Returns the message ID."""
-        from models import PipelineMessage
+        from core.models import PipelineMessage
         seq = self._next_sequence(session_id)
         msg = PipelineMessage(
             session_id=session_id,
@@ -128,7 +128,7 @@ class Storage:
     # ----------------------------------------------------------
 
     def get_session(self, session_id: str) -> Session | None:
-        from models import PipelineSession
+        from core.models import PipelineSession
         ps = self._db.query(PipelineSession).filter(PipelineSession.id == session_id).first()
         if ps is None:
             return None
@@ -142,7 +142,7 @@ class Storage:
         )
 
     def update_session(self, session_id: str, **fields):
-        from models import PipelineSession
+        from core.models import PipelineSession
         ps = self._db.query(PipelineSession).filter(PipelineSession.id == session_id).first()
         if not ps:
             return
@@ -172,7 +172,7 @@ class Storage:
 
         This is the core dual-write method.
         """
-        from models import PipelineMessage
+        from core.models import PipelineMessage
 
         now = datetime.utcnow()
 
@@ -192,7 +192,7 @@ class Storage:
         # 2. Write display messages for frontend
         current_phase = None
         # Try to get current_phase from the session
-        from models import PipelineSession
+        from core.models import PipelineSession
         ps = self._db.query(PipelineSession).filter(PipelineSession.id == session_id).first()
         if ps:
             current_phase = ps.current_phase
@@ -255,7 +255,7 @@ class Storage:
 
         If after_id is given, returns messages with id >= after_id.
         """
-        from models import PipelineMessage
+        from core.models import PipelineMessage
 
         query = self._db.query(PipelineMessage).filter(
             PipelineMessage.session_id == session_id,
@@ -288,7 +288,7 @@ class Storage:
     def add_user_message(self, session_id: str, text: str) -> Message:
         """Write a user message (canonical + display)."""
         # Also write a user_input display message
-        from models import PipelineSession
+        from core.models import PipelineSession
         ps = self._db.query(PipelineSession).filter(PipelineSession.id == session_id).first()
         phase = ps.current_phase if ps else None
         self._write_display_message(session_id, "user", "user_input", text, phase=phase)
@@ -308,7 +308,7 @@ class Storage:
 
     def update_token_usage(self, session_id: str, prompt_tokens: int, completion_tokens: int):
         """Update token usage — stored in PipelineSession.phase_results for now."""
-        from models import PipelineSession
+        from core.models import PipelineSession
         ps = self._db.query(PipelineSession).filter(PipelineSession.id == session_id).first()
         if ps:
             results = dict(ps.phase_results or {})

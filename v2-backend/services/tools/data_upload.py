@@ -143,7 +143,7 @@ def _load_batch(ctx):
     if not batch_id:
         return None, "Error: 没有活跃的上传批次。请先调用 parse_file 解析文件。"
 
-    from models import UploadBatch
+    from core.models import UploadBatch
     batch = ctx.db.query(UploadBatch).filter(UploadBatch.id == batch_id).first()
     if not batch:
         return None, f"Error: 上传批次 {batch_id} 不存在"
@@ -155,7 +155,7 @@ def _recover_batch_id(ctx) -> int | None:
     session_id = ctx.pipeline_session_id
     if not session_id:
         return None
-    from models import UploadBatch
+    from core.models import UploadBatch
     batch = (
         ctx.db.query(UploadBatch)
         .filter(
@@ -176,7 +176,7 @@ def _recover_any_batch_id(ctx) -> int | None:
     session_id = ctx.pipeline_session_id
     if not session_id:
         return None
-    from models import UploadBatch
+    from core.models import UploadBatch
     batch = (
         ctx.db.query(UploadBatch)
         .filter(
@@ -203,7 +203,7 @@ def _make_new_match_result(sp, batch, ctx) -> dict:
         "match_method": "none",
     }
     if batch.port_id and sp.product_code:
-        from models import Product
+        from core.models import Product
         try:
             existing = (
                 ctx.db.query(Product)
@@ -345,7 +345,7 @@ def _register_rollback_tool(registry, ctx):
         group="data_upload",
     )
     def rollback_batch(batch_id: int = 0) -> str:
-        from models import UploadBatch, Product, ProductChangeLog
+        from core.models import UploadBatch, Product, ProductChangeLog
 
         if not batch_id:
             return "Error: 请提供 batch_id 参数。"
@@ -517,7 +517,7 @@ def _register_workflow_tools(registry, ctx):
 只返回 JSON，格式如: {{"product_name": "B", "product_code": "A", "price": "D", "country_id": "E", ...}}
 """
         try:
-            from config import settings
+            from core.config import settings
             import google.generativeai as genai
 
             genai.configure(api_key=settings.GOOGLE_API_KEY)
@@ -582,7 +582,7 @@ def _register_workflow_tools(registry, ctx):
             return "Error: 未能从文件中提取到任何产品数据"
 
         # 5. Create UploadBatch
-        from models import UploadBatch, StagingProduct
+        from core.models import UploadBatch, StagingProduct
 
         file_name = getattr(ctx, "file_name", None) or "uploaded.xlsx"
         user_id = getattr(ctx, "user_id", 0) or 0
@@ -670,7 +670,7 @@ def _register_workflow_tools(registry, ctx):
     )
     def analyze_columns() -> str:
         from sqlalchemy import text
-        from models import StagingProduct
+        from core.models import StagingProduct
 
         batch, err = _load_batch(ctx)
         if err:
@@ -974,7 +974,7 @@ def _register_workflow_tools(registry, ctx):
     )
     def resolve_and_validate(supplier_name: str = "", supplier_id: int = 0, country_name: str = "", country_id: int = 0, port_name: str = "", port_id: int = 0, effective_from: str = "", effective_to: str = "") -> str:
         from sqlalchemy import text
-        from models import UploadBatch, StagingProduct, Product
+        from core.models import UploadBatch, StagingProduct, Product
 
         batch, err = _load_batch(ctx)
         if err:
@@ -1366,7 +1366,7 @@ def _register_workflow_tools(registry, ctx):
         group="data_upload",
     )
     def create_references(entities: str = "") -> str:
-        from models import UploadBatch, StagingProduct, Country, Supplier
+        from core.models import UploadBatch, StagingProduct, Country, Supplier
         from sqlalchemy import text
 
         batch, err = _load_batch(ctx)
@@ -1472,7 +1472,7 @@ def _register_workflow_tools(registry, ctx):
         group="data_upload",
     )
     def preview_changes() -> str:
-        from models import StagingProduct
+        from core.models import StagingProduct
 
         batch, err = _load_batch(ctx)
         if err:
@@ -1587,7 +1587,7 @@ def _register_workflow_tools(registry, ctx):
         group="data_upload",
     )
     def execute_upload(exclude_rows: str = "") -> str:
-        from models import StagingProduct, Product, ProductChangeLog
+        from core.models import StagingProduct, Product, ProductChangeLog
 
         batch, err = _load_batch(ctx)
         if err:
@@ -1865,7 +1865,7 @@ def _register_workflow_tools(registry, ctx):
         group="data_upload",
     )
     def audit_data() -> str:
-        from models import StagingProduct
+        from core.models import StagingProduct
 
         batch, err = _load_batch(ctx)
         if err:
@@ -1983,7 +1983,7 @@ def _register_workflow_tools(registry, ctx):
     )
     def prepare_upload(supplier_name: str = "", supplier_id: int = 0, country_name: str = "", country_id: int = 0, port_name: str = "", port_id: int = 0, effective_from: str = "", effective_to: str = "") -> str:
         from sqlalchemy import text as sa_text
-        from models import UploadBatch, StagingProduct, Product
+        from core.models import UploadBatch, StagingProduct, Product
 
         batch, err = _load_batch(ctx)
         if err:
@@ -2540,7 +2540,7 @@ def _code_audit(batch, staging_rows) -> list[dict]:
 def _llm_semantic_audit(batch, staging_rows, ctx) -> list[dict] | None:
     """LLM-based semantic audit using world knowledge. Returns findings or None on failure."""
     try:
-        from config import settings
+        from core.config import settings
         from google import genai
         from google.genai import types
 
@@ -2670,7 +2670,7 @@ def _llm_fuzzy_match(
 """
 
     try:
-        from config import settings
+        from core.config import settings
         import google.generativeai as genai
 
         genai.configure(api_key=settings.GOOGLE_API_KEY)

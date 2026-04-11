@@ -61,7 +61,7 @@ _EXAMPLES = [
 
 def generate_product_upload_template(output_path: str) -> None:
     """Generate product upload template Excel with DB reference data."""
-    from database import SessionLocal
+    from core.database import SessionLocal
     from sqlalchemy import text
 
     db = SessionLocal()

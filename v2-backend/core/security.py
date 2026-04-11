@@ -8,7 +8,7 @@ from passlib.context import CryptContext
 from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from config import settings
+from core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -51,7 +51,7 @@ def _hash_token(token: str) -> str:
 
 
 def create_refresh_token(user_id: int, db: Session) -> str:
-    from models import RefreshToken
+    from core.models import RefreshToken
 
     token = str(uuid.uuid4())
     rt = RefreshToken(
@@ -65,7 +65,7 @@ def create_refresh_token(user_id: int, db: Session) -> str:
 
 
 def verify_refresh_token(token: str, db: Session):
-    from models import RefreshToken
+    from core.models import RefreshToken
 
     token_hash = _hash_token(token)
     rt = db.query(RefreshToken).filter(
@@ -77,7 +77,7 @@ def verify_refresh_token(token: str, db: Session):
 
 
 def revoke_refresh_token(token: str, db: Session):
-    from models import RefreshToken
+    from core.models import RefreshToken
 
     token_hash = _hash_token(token)
     rt = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
@@ -87,7 +87,7 @@ def revoke_refresh_token(token: str, db: Session):
 
 
 def revoke_user_tokens(user_id: int, db: Session):
-    from models import RefreshToken
+    from core.models import RefreshToken
 
     db.query(RefreshToken).filter(
         RefreshToken.user_id == user_id,
@@ -100,7 +100,7 @@ def revoke_user_tokens(user_id: int, db: Session):
 
 def require_role(*allowed_roles: str):
     """Dependency factory: restrict endpoint to specific roles."""
-    from models import User
+    from core.models import User
     from routes.auth import get_current_user
 
     def checker(user: User = Depends(get_current_user)):

@@ -11,13 +11,13 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session as DBSession
 
-from database import get_db
-from models import ToolConfig, SkillConfig, User
+from core.database import get_db
+from core.models import ToolConfig, SkillConfig, User
 from routes.auth import get_current_user
-from security import require_role
+from core.security import require_role
 
 require_admin = require_role("superadmin", "admin")
-from schemas import (
+from core.schemas import (
     ToolConfigResponse,
     ToolConfigUpdate,
     SkillConfigCreate,

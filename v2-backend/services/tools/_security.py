@@ -16,7 +16,7 @@ Usage
     from services.tools._security import scope_to_owner
 
     def some_tool(..., order_id: int):
-        from models import Order
+        from core.models import Order
         query = ctx.db.query(Order).filter(Order.id == order_id)
         query = scope_to_owner(query, Order, ctx)
         order = query.first()

@@ -11,7 +11,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from config import settings
+from core.config import settings
 from routes.auth import router as auth_router
 from routes.settings import router as settings_router
 from routes.excel import router as excel_router
@@ -22,8 +22,8 @@ from routes.users import router as users_router
 from routes.data import router as data_router
 from routes.line_webhook import router as line_router
 from routes.documents import router as documents_router
-from database import engine
-from models import Base
+from core.database import engine
+from core.models import Base
 
 app = FastAPI(
     title="Cruise Procurement Agent API",
@@ -83,8 +83,8 @@ def _ensure_storage_bucket():
 
 def _recover_stuck_orders():
     """Reset orders stuck in extracting/matching (from OOM kills or instance restarts)."""
-    from database import SessionLocal
-    from models import Order
+    from core.database import SessionLocal
+    from core.models import Order
     from datetime import datetime, timedelta
 
     db = SessionLocal()

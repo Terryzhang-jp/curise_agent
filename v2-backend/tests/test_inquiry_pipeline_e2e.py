@@ -38,8 +38,8 @@ from sqlalchemy.orm import sessionmaker
 # Make sure project root is on path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import models  # noqa: E402
-from models import (  # noqa: E402
+import core.models as models  # noqa: E402
+from core.models import (  # noqa: E402
     Base,
     CompanyConfig,
     DeliveryLocation,

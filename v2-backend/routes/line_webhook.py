@@ -11,7 +11,7 @@ import time
 
 from fastapi import APIRouter, Request, HTTPException
 
-from config import settings
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/line", tags=["line"])

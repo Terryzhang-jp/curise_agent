@@ -55,7 +55,7 @@ class AgentTracer:
     ):
         """Record an LLM API call. Best-effort — never raises."""
         try:
-            from models import AgentTrace
+            from core.models import AgentTrace
             cost = _estimate_cost(model, prompt_tokens, completion_tokens, thinking_tokens)
             trace = AgentTrace(
                 session_id=self._session_id,
@@ -82,7 +82,7 @@ class AgentTracer:
     ):
         """Record a tool execution. Best-effort — never raises."""
         try:
-            from models import AgentTrace
+            from core.models import AgentTrace
             trace = AgentTrace(
                 session_id=self._session_id,
                 turn_number=turn,
@@ -100,7 +100,7 @@ class AgentTracer:
     def get_session_stats(self) -> dict:
         """Aggregate stats for the session."""
         try:
-            from models import AgentTrace
+            from core.models import AgentTrace
             from sqlalchemy import func
 
             traces = self._db.query(AgentTrace).filter(

@@ -5,17 +5,17 @@ from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import get_db
-from models import (
+from core.database import get_db
+from core.models import (
     User, FieldSchema, FieldDefinition, OrderFormatTemplate, SupplierTemplate,
     Supplier, DeliveryLocation, CompanyConfig,
 )
 from routes.auth import get_current_user
-from security import require_role
+from core.security import require_role
 from services.common.file_storage import storage
 
 require_admin = require_role("superadmin", "admin")
-from schemas import (
+from core.schemas import (
     FieldSchemaCreate, FieldSchemaResponse,
     FieldDefinitionCreate, FieldDefinitionUpdate, FieldDefinitionResponse,
     OrderFormatTemplateCreate, OrderFormatTemplateUpdate, OrderFormatTemplateResponse,

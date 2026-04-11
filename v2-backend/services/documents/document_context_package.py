@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from models import Document, Order
+from core.models import Document, Order
 from services.documents.document_order_projection import build_order_payload, get_document_extracted_view
 
 

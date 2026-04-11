@@ -12,7 +12,7 @@ import os
 import uuid
 from datetime import datetime
 
-from config import settings
+from core.config import settings
 from services.tools.registry_loader import ToolMetaInfo
 
 TOOL_META = {
@@ -218,7 +218,7 @@ def create_fulfillment_tools(registry, ctx):
         if not action or not order_id:
             return "Error: 需要 action 和 order_id"
         order_id = int(order_id)
-        from models import Order
+        from core.models import Order
         from services.tools._security import scope_to_owner
         query = ctx.db.query(Order).filter(Order.id == order_id)
         query = scope_to_owner(query, Order, ctx)
