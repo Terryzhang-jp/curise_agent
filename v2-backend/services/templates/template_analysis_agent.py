@@ -24,7 +24,7 @@ from google import genai
 from google.genai import types
 
 from services.agent.config import load_api_key
-from services.template_analyzer import _build_cell_text
+from services.templates.template_analyzer import _build_cell_text
 
 logger = logging.getLogger(__name__)
 
@@ -327,10 +327,10 @@ def _fallback(
     logger.info("Falling back to legacy analysis (reason: %s)", reason)
     try:
         if order_context:
-            from services.template_analyzer import analyze_excel_template_with_order_context
+            from services.templates.template_analyzer import analyze_excel_template_with_order_context
             result = analyze_excel_template_with_order_context(file_bytes, order_context)
         else:
-            from services.template_analyzer import analyze_excel_template
+            from services.templates.template_analyzer import analyze_excel_template
             result = analyze_excel_template(file_bytes)
         # Legacy results don't have cell_map
         result.setdefault("cell_map", {})

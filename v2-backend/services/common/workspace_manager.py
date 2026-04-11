@@ -104,7 +104,7 @@ def _save_manifest(workspace_dir: str, manifest: WorkspaceManifest):
 
     # Also persist manifest to storage (for restore on server restart)
     try:
-        from services.file_storage import storage as file_storage
+        from services.common.file_storage import storage as file_storage
         if file_storage.enabled:
             content = json.dumps(manifest.to_dict(), indent=2).encode("utf-8")
             file_storage.upload(
@@ -127,7 +127,7 @@ def sync_file_to_storage(
 
     Returns storage path if uploaded, None if skipped/failed.
     """
-    from services.file_storage import storage as file_storage
+    from services.common.file_storage import storage as file_storage
 
     if not file_storage.enabled:
         return None
@@ -226,7 +226,7 @@ def restore_workspace(session_id: str, workspace_dir: str) -> list[str]:
 
     Returns list of restored filenames.
     """
-    from services.file_storage import storage as file_storage
+    from services.common.file_storage import storage as file_storage
 
     if not file_storage.enabled:
         return []

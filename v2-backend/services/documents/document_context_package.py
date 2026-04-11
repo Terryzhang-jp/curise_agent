@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from models import Document, Order
-from services.document_order_projection import build_order_payload, get_document_extracted_view
+from services.documents.document_order_projection import build_order_payload, get_document_extracted_view
 
 
 KEY_FIELD_LABELS = {

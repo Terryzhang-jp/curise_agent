@@ -206,7 +206,7 @@ def test_employee_cannot_clear_other_tenant_document_fields(db_session):
 
 def test_context_injection_refuses_other_tenant(db_session):
     """The chat prompt context injection must also respect ownership."""
-    from services.document_context_package import build_document_context_injection
+    from services.documents.document_context_package import build_document_context_injection
 
     # user_B asks about user_A's document
     result = build_document_context_injection(
@@ -221,7 +221,7 @@ def test_context_injection_refuses_other_tenant(db_session):
 
 def test_context_injection_allows_owner(db_session):
     """Owner can see their own document in context."""
-    from services.document_context_package import build_document_context_injection
+    from services.documents.document_context_package import build_document_context_injection
 
     result = build_document_context_injection(
         db_session,
@@ -235,7 +235,7 @@ def test_context_injection_allows_owner(db_session):
 
 
 def test_context_injection_allows_superadmin(db_session):
-    from services.document_context_package import build_document_context_injection
+    from services.documents.document_context_package import build_document_context_injection
 
     result = build_document_context_injection(
         db_session,
@@ -249,7 +249,7 @@ def test_context_injection_allows_superadmin(db_session):
 
 def test_context_injection_without_user_returns_empty(db_session):
     """Missing auth context → empty injection (fail closed)."""
-    from services.document_context_package import build_document_context_injection
+    from services.documents.document_context_package import build_document_context_injection
 
     result = build_document_context_injection(
         db_session,

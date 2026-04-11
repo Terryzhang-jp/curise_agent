@@ -176,7 +176,7 @@ def vision_extract(file_bytes: bytes, file_type: str) -> dict:
     if file_type != "pdf":
         return _extract_and_structure_excel(file_bytes)
 
-    from services.pdf_analyzer import _get_model, _pdf_bytes_to_images, _parse_json_response
+    from services.documents.pdf_analyzer import _get_model, _pdf_bytes_to_images, _parse_json_response
 
     start_time = time.time()
     images = _pdf_bytes_to_images(file_bytes)
@@ -391,7 +391,7 @@ def _extract_and_structure_excel(file_bytes: bytes) -> dict:
     """Extract from Excel: read with openpyxl, then structure with Gemini."""
     import io
     from openpyxl import load_workbook
-    from services.pdf_analyzer import _get_model, _parse_json_response
+    from services.documents.pdf_analyzer import _get_model, _parse_json_response
 
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
     text_parts = []
@@ -613,7 +613,7 @@ def _resolve_geo(order_id: int, metadata: dict, db) -> dict:
 
 def _geo_llm_fallback(order_id: int, metadata: dict, countries: list, ports: list) -> dict:
     """Single Gemini call to identify country/port when code matching fails."""
-    from services.pdf_analyzer import _get_model, _parse_json_response
+    from services.documents.pdf_analyzer import _get_model, _parse_json_response
 
     countries_str = ", ".join(f'{c["id"]}={c["name"]}({c["code"]})' for c in countries)
     ports_str = ", ".join(f'{p["id"]}={p["name"]}(country_id={p["country_id"]})' for p in ports)
@@ -660,7 +660,7 @@ def _refine_with_llm(order_id: int, ambiguous: list[dict], db, country_id, port_
     import re
     from models import ProductReadOnly
     from sqlalchemy import or_
-    from services.pdf_analyzer import _get_model
+    from services.documents.pdf_analyzer import _get_model
 
     # Pre-fetch candidate products from DB
     query = db.query(ProductReadOnly).filter(ProductReadOnly.status == True)
@@ -841,7 +841,7 @@ def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
 
 def _template_guided_extract(file_bytes: bytes, file_type: str, template, db) -> dict:
     """Template-guided extraction. Excel with full column_mapping skips LLM entirely."""
-    from services.template_matcher import build_guided_prompt, extract_excel_deterministic
+    from services.templates.template_matcher import build_guided_prompt, extract_excel_deterministic
 
     try:
         # Excel + complete column_mapping → 0 LLM deterministic extraction
@@ -860,7 +860,7 @@ def _template_guided_extract(file_bytes: bytes, file_type: str, template, db) ->
         prompt = build_guided_prompt(template, field_defs)
 
         if file_type == "pdf":
-            from services.pdf_analyzer import _get_model, _pdf_bytes_to_images, _parse_json_response
+            from services.documents.pdf_analyzer import _get_model, _pdf_bytes_to_images, _parse_json_response
 
             images = _pdf_bytes_to_images(file_bytes)
             model = _get_model()
@@ -868,7 +868,7 @@ def _template_guided_extract(file_bytes: bytes, file_type: str, template, db) ->
             result = _parse_json_response(response.text.strip())
         else:
             # Excel without column_mapping but with layout info
-            from services.pdf_analyzer import _get_model, _parse_json_response
+            from services.documents.pdf_analyzer import _get_model, _parse_json_response
 
             text = _excel_to_text(file_bytes)
             model = _get_model()
@@ -928,7 +928,7 @@ def process_order(order_id: int, file_bytes: bytes, template_id_override: int | 
                             order_id, template.name, template.id)
         else:
             try:
-                from services.template_matcher import find_matching_template, get_scannable_text
+                from services.templates.template_matcher import find_matching_template, get_scannable_text
 
                 scannable = get_scannable_text(file_bytes, order.file_type)
                 if scannable:
@@ -958,7 +958,7 @@ def process_order(order_id: int, file_bytes: bytes, template_id_override: int | 
                      order_id, order.file_type, template.name if template else "none")
 
         if template and template.document_schema:
-            from services.schema_extraction import extract_order_with_schema
+            from services.data.schema_extraction import extract_order_with_schema
             extracted = extract_order_with_schema(file_bytes, template.document_schema)
         elif template:
             extracted = _template_guided_extract(file_bytes, order.file_type, template, db)
@@ -972,7 +972,7 @@ def process_order(order_id: int, file_bytes: bytes, template_id_override: int | 
         # (e.g., "KG2.2" → "KG", "100CT" → 100, empty rows removed)
         # Deep copy so extraction_data retains original AI values for audit
         import copy
-        from services.product_normalizer import normalize_products
+        from services.data.product_normalizer import normalize_products
         raw_products = copy.deepcopy(extracted.get("products") or [])
         order.products = normalize_products(raw_products)
         order.product_count = len(order.products)
@@ -1027,7 +1027,7 @@ def process_order(order_id: int, file_bytes: bytes, template_id_override: int | 
 
                 # Auto-run inquiry pre-analysis
                 try:
-                    from services.inquiry_agent import run_inquiry_pre_analysis
+                    from services.orders.inquiry_agent import run_inquiry_pre_analysis
                     order.inquiry_data = run_inquiry_pre_analysis(order, db)
                 except Exception as e:
                     logger.warning("Order %d: inquiry pre-analysis failed: %s", order_id, str(e))
@@ -1035,7 +1035,7 @@ def process_order(order_id: int, file_bytes: bytes, template_id_override: int | 
             # Auto-run delivery environment (if port + delivery_date available)
             if order.port_id and order.delivery_date:
                 try:
-                    from services.weather_service import fetch_delivery_environment
+                    from services.integrations.weather_service import fetch_delivery_environment
                     from models import Port, Country
                     port = db.query(Port).get(order.port_id)
                     country = db.query(Country).get(port.country_id) if port and port.country_id else None

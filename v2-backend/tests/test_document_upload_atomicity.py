@@ -81,7 +81,7 @@ def fake_storage():
 
 
 def test_atomic_upload_happy_path(db_session, fake_storage):
-    from services.document_workflow import create_document_and_pending_order
+    from services.documents.document_workflow import create_document_and_pending_order
 
     document, order = create_document_and_pending_order(
         db_session,
@@ -108,7 +108,7 @@ def test_atomic_upload_happy_path(db_session, fake_storage):
 def test_atomic_upload_db_failure_compensates_blob(db_session, fake_storage):
     """If the DB transaction fails mid-way, the blob must be deleted and
     no Document/Order rows should remain."""
-    from services.document_workflow import create_document_and_pending_order
+    from services.documents.document_workflow import create_document_and_pending_order
 
     # Patch Order.__init__ to raise after Document is flushed
     original_order_init = Order.__init__
@@ -141,7 +141,7 @@ def test_atomic_upload_db_failure_compensates_blob(db_session, fake_storage):
 def test_atomic_upload_storage_failure_no_db_rows(db_session, fake_storage):
     """If the blob upload itself fails, no DB rows should be created and
     no compensating delete is needed."""
-    from services.document_workflow import create_document_and_pending_order
+    from services.documents.document_workflow import create_document_and_pending_order
 
     fake_storage.upload_should_fail = True
 
@@ -164,7 +164,7 @@ def test_atomic_upload_storage_failure_no_db_rows(db_session, fake_storage):
 def test_compensation_tolerates_delete_failure(db_session, fake_storage):
     """If the compensating blob delete itself fails, the original DB error
     must still propagate (not be masked)."""
-    from services.document_workflow import create_document_and_pending_order
+    from services.documents.document_workflow import create_document_and_pending_order
 
     # Make delete raise
     def failing_delete(path):

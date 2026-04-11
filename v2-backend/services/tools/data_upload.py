@@ -467,7 +467,7 @@ def _register_workflow_tools(registry, ctx):
 
         # 2. Parse Excel
         try:
-            from services.excel_parser import parse_excel_file
+            from services.excel.excel_parser import parse_excel_file
             parsed = parse_excel_file(ctx.file_bytes)
         except Exception as e:
             return f"Error: 解析 Excel 文件失败 — {str(e)}"

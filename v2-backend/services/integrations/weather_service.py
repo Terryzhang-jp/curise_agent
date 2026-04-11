@@ -112,7 +112,7 @@ def _geocode_openmeteo(query: str) -> tuple[float, float] | None:
 def _geocode_llm(port_name: str, country_name: str) -> tuple[float, float]:
     """Ask LLM for port coordinates. LLMs reliably know major port locations."""
     import json as _json
-    from services.pdf_analyzer import _get_model
+    from services.documents.pdf_analyzer import _get_model
 
     prompt = (
         f"港口: {port_name}, {country_name}\n"
@@ -227,7 +227,7 @@ def _fetch_marine(lat: float, lon: float, date_str: str) -> dict:
 
 def _generate_summary(location: str, date_str: str, weather: dict, marine: dict) -> str:
     """Generate AI delivery condition summary via Gemini."""
-    from services.pdf_analyzer import _get_model
+    from services.documents.pdf_analyzer import _get_model
 
     weather_desc = (
         f"天气: {weather.get('condition', 'N/A')}, "

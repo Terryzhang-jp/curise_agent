@@ -31,7 +31,7 @@ from services.agent.stream_queue import (
     get_or_create_queue, get_queue, remove_queue, push_event,
     get_or_create_cancel_event, set_cancelled, remove_cancel_event,
 )
-from services.document_context_package import build_document_context_injection
+from services.documents.document_context_package import build_document_context_injection
 
 require_chat_user = require_role("superadmin", "admin", "employee")
 
@@ -173,7 +173,7 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
 
     # Restore persisted files from Supabase (e.g., after server restart)
     try:
-        from services.workspace_manager import restore_workspace
+        from services.common.workspace_manager import restore_workspace
         restored = restore_workspace(session_id, workspace_dir)
         if restored:
             logger.info("Restored %d file(s) for session %s: %s",
@@ -477,7 +477,7 @@ async def send_message(
         if len(file_content) > MAX_FILE_SIZE:
             raise HTTPException(400, "文件大小不能超过 20 MB")
         # Save to Supabase Storage
-        from services.file_storage import storage
+        from services.common.file_storage import storage
         safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
         file_url = storage.upload("chat", safe_name, file_content)
         file_bytes = file_content
@@ -748,7 +748,7 @@ def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None
         # Sync workspace files to Supabase Storage (best-effort)
         workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
         try:
-            from services.workspace_manager import sync_workspace
+            from services.common.workspace_manager import sync_workspace
             synced = sync_workspace(session_id, workspace_dir)
             if synced:
                 logger.info("Synced %d workspace file(s) for session %s", len(synced), session_id)
@@ -866,7 +866,7 @@ def download_file(
 
     # Fallback: download from Supabase Storage (inquiry files are stored there)
     try:
-        from services.file_storage import storage
+        from services.common.file_storage import storage
         # Try common storage paths where inquiry files are uploaded
         for prefix in ("inquiries", "chat"):
             try:
@@ -905,7 +905,7 @@ def list_workspace_files(
 
     workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
     try:
-        from services.workspace_manager import list_workspace_files as _list_files
+        from services.common.workspace_manager import list_workspace_files as _list_files
         return _list_files(session_id, workspace_dir)
     except Exception:
         return []
@@ -935,7 +935,7 @@ def list_session_artifacts(
     # 1. Workspace files (local + synced)
     workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
     try:
-        from services.workspace_manager import list_workspace_files as _list_files
+        from services.common.workspace_manager import list_workspace_files as _list_files
         ws_files = _list_files(session_id, workspace_dir)
         for f in ws_files:
             if f.get("is_output"):
@@ -1064,7 +1064,7 @@ def download_artifact(
 
         file_url = file_entry.get("file_url", filename)
         try:
-            from services.file_storage import storage
+            from services.common.file_storage import storage
             content = storage.download(file_url)
         except FileNotFoundError:
             raise HTTPException(404, "文件已丢失")

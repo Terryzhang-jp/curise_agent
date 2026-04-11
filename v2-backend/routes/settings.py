@@ -12,7 +12,7 @@ from models import (
 )
 from routes.auth import get_current_user
 from security import require_role
-from services.file_storage import storage
+from services.common.file_storage import storage
 
 require_admin = require_role("superadmin", "admin")
 from schemas import (
@@ -288,7 +288,7 @@ async def analyze_order_template_pdf(
 
     try:
         import asyncio
-        from services.schema_extraction import analyze_template, _infer_field_mapping
+        from services.data.schema_extraction import analyze_template, _infer_field_mapping
 
         loop = asyncio.get_event_loop()
         schema = await loop.run_in_executor(None, analyze_template, file_bytes)
@@ -382,7 +382,7 @@ def list_supplier_templates(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    from services.inquiry_agent import get_production_templates
+    from services.orders.inquiry_agent import get_production_templates
 
     q = db.query(SupplierTemplate)
     if supplier_id is not None:
@@ -521,7 +521,7 @@ async def analyze_supplier_template(
 
     try:
         import asyncio
-        from services.template_analysis_agent import run_template_analysis_agent
+        from services.templates.template_analysis_agent import run_template_analysis_agent
 
         order_context = None
         if order_template_id:
@@ -549,7 +549,7 @@ async def analyze_supplier_template(
     # Extract styles (code-based, not AI) and merge with semantic analysis
     template_styles = None
     try:
-        from services.template_style_extractor import extract_template_styles, merge_semantic_and_styles
+        from services.templates.template_style_extractor import extract_template_styles, merge_semantic_and_styles
         styles = extract_template_styles(file_bytes)
         template_styles = merge_semantic_and_styles(
             result.get("cell_map", {}), styles, result.get("product_table_config"),
@@ -561,8 +561,8 @@ async def analyze_supplier_template(
     # Build zone config for deterministic template engine
     zone_config = None
     try:
-        from services.zone_config_builder import build_zone_config
-        from services.template_contract import build_template_contract
+        from services.templates.zone_config_builder import build_zone_config
+        from services.templates.template_contract import build_template_contract
         ptc = result.get("product_table_config", {})
         fp = result.get("field_positions", {})
         if ptc.get("start_row") and (fp or ptc.get("columns")):
@@ -587,7 +587,7 @@ async def analyze_supplier_template(
     # Generate HTML preview (non-critical — failure does not block analysis)
     template_html = None
     try:
-        from services.template_analyzer import generate_template_html
+        from services.templates.template_analyzer import generate_template_html
         template_html = generate_template_html(file_bytes)
     except Exception as html_err:
         import logging as _log

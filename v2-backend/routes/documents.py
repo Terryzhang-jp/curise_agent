@@ -14,13 +14,13 @@ from models import Document, Order, User
 from routes.auth import get_current_user
 from schemas import OrderDetail
 from security import require_role
-from services.document_order_projection import (
+from services.documents.document_order_projection import (
     get_document_extracted_view,
     build_order_payload,
     create_or_update_order_from_document,
 )
-from services.file_storage import storage
-from services.document_workflow import create_document_record, run_document_pipeline
+from services.common.file_storage import storage
+from services.documents.document_workflow import create_document_record, run_document_pipeline
 
 
 require_writer = require_role("superadmin", "admin", "employee")

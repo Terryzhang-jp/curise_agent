@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 
-from services.file_storage import storage as file_storage
+from services.common.file_storage import storage as file_storage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
@@ -617,7 +617,7 @@ def _generate_single_supplier(
     """
     from database import SessionLocal
     from models import SupplierTemplate
-    from services.excel_writer import InquiryWorkbook
+    from services.excel.excel_writer import InquiryWorkbook
     from services.agent.stream_queue import push_event
     from sqlalchemy import text as sa_text
 
@@ -722,8 +722,8 @@ def _generate_single_supplier(
 
     if zone_config and chosen_template.template_file_url:
         try:
-            from services.template_engine_legacy import fill_template as engine_fill
-            from services.template_engine_legacy import verify_output as engine_verify
+            from services.templates.template_engine_legacy import fill_template as engine_fill
+            from services.templates.template_engine_legacy import verify_output as engine_verify
 
             # ── Feature flag: choose renderer ──
             # INQUIRY_RENDERER=compose (default) → new compose-from-scratch renderer
@@ -767,7 +767,7 @@ def _generate_single_supplier(
                 )
                 generation_path = "template_engine_fill"
             else:  # compose (default)
-                from services.template_engine import compose_render
+                from services.templates.template_engine import compose_render
                 excel_bytes = compose_render(
                     template_bytes, zone_config, engine_order_data, supplier_id,
                 )

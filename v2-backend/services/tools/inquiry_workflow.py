@@ -41,8 +41,8 @@ def register(registry, ctx=None):
 
         try:
             from models import Order, SupplierTemplate
-            from services.inquiry_agent import select_template, _build_order_data_for_engine
-            from services.field_schema import analyze_gaps, schema_from_zone_config
+            from services.orders.inquiry_agent import select_template, _build_order_data_for_engine
+            from services.data.field_schema import analyze_gaps, schema_from_zone_config
             import sqlalchemy
 
             db = ctx.db
@@ -247,7 +247,7 @@ def register(registry, ctx=None):
 
             if supplier_id and int(supplier_id) > 0:
                 # Single supplier generation
-                from services.inquiry_agent import run_inquiry_single_supplier
+                from services.orders.inquiry_agent import run_inquiry_single_supplier
                 result = run_inquiry_single_supplier(
                     order=order,
                     db=db,
@@ -257,7 +257,7 @@ def register(registry, ctx=None):
                 )
             else:
                 # All suppliers
-                from services.inquiry_agent import run_inquiry_orchestrator
+                from services.orders.inquiry_agent import run_inquiry_orchestrator
                 result = run_inquiry_orchestrator(
                     order=order,
                     db=db,

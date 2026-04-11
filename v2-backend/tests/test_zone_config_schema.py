@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from services.zone_config_schema import (
+from services.templates.zone_config_schema import (
     ZoneConfigV1,
     ZoneConfigValidationError,
     is_valid_zone_config,

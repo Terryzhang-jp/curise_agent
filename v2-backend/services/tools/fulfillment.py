@@ -166,7 +166,7 @@ def create_fulfillment_tools(registry, ctx):
         elif header[:8] == b"\x89PNG\r\n\x1a\n": ext = ".png"
         elif header[:4] == b"%PDF": ext = ".pdf"
         elif header[:2] in (b"PK", b"\x50\x4b"): ext = ".xlsx"
-        from services.file_storage import storage
+        from services.common.file_storage import storage
         safe_name = f"att_{uuid.uuid4().hex[:8]}{ext}"
         storage.upload("attachments", safe_name, ctx.file_bytes)
         attachment = {"filename": safe_name, "original_name": safe_name,

@@ -6,9 +6,9 @@ from datetime import datetime
 
 from database import SessionLocal
 from models import Document, Order
-from services.document_order_projection import create_or_update_order_from_document
-from services.document_processor import process_document
-from services.file_storage import storage
+from services.documents.document_order_projection import create_or_update_order_from_document
+from services.documents.document_processor import process_document
+from services.common.file_storage import storage
 
 
 logger = logging.getLogger(__name__)

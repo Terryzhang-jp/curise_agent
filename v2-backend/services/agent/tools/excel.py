@@ -249,7 +249,7 @@ def register(registry, ctx=None):
 def _upload_to_storage(filename: str, local_path: str):
     """Cloud Run: upload modified file to Supabase Storage for persistence + download."""
     try:
-        from services.file_storage import storage
+        from services.common.file_storage import storage
         with open(local_path, "rb") as f:
             content = f.read()
         storage.upload(
@@ -264,7 +264,7 @@ def _upload_to_storage(filename: str, local_path: str):
 def _download_from_storage(filename: str, local_path: str) -> bool:
     """Cloud Run fallback: download file from Supabase Storage to local workspace."""
     try:
-        from services.file_storage import storage
+        from services.common.file_storage import storage
         for prefix in ("inquiries", "chat"):
             try:
                 content = storage.download(f"{prefix}/{filename}")

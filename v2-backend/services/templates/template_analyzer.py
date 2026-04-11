@@ -12,7 +12,7 @@ from typing import Any
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-from services.pdf_analyzer import _get_model, _parse_json_response
+from services.documents.pdf_analyzer import _get_model, _parse_json_response
 
 logger = logging.getLogger(__name__)
 

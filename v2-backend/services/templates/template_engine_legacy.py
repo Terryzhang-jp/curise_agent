@@ -20,8 +20,8 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.workbook.properties import CalcProperties
 from openpyxl.utils import get_column_letter, column_index_from_string
 
-from services.field_schema import _resolve_path
-from services.template_contract import verify_template_contract
+from services.data.field_schema import _resolve_path
+from services.templates.template_contract import verify_template_contract
 
 logger = logging.getLogger(__name__)
 

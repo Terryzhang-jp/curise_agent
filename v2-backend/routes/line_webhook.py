@@ -54,7 +54,7 @@ async def webhook(request: Request):
         MessageEvent, FollowEvent, JoinEvent,
         TextMessageContent, ImageMessageContent,
     )
-    from services.line_bot import (
+    from services.integrations.line_bot import (
         handle_text_message, handle_image_message,
         handle_follow_event, handle_join_event, handle_non_text_message,
     )

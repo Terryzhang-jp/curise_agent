@@ -75,7 +75,7 @@ def on_startup():
 def _ensure_storage_bucket():
     """Ensure Supabase Storage bucket exists."""
     try:
-        from services.file_storage import storage
+        from services.common.file_storage import storage
         storage.ensure_bucket()
     except Exception as e:
         logger.warning("Storage bucket check failed: %s", e)
@@ -115,7 +115,7 @@ def _ensure_product_upload_template():
     if os.path.exists(path):
         return
     try:
-        from services.template_generator import generate_product_upload_template
+        from services.templates.template_generator import generate_product_upload_template
         generate_product_upload_template(path)
         logger.info("Generated product upload template: %s", path)
     except Exception as e:

@@ -144,7 +144,7 @@ def _process_legacy(
     error_message: str | None = None,
 ) -> dict[str, Any]:
     """Original pipeline using smart_extract. Used for excel and as PDF fallback."""
-    from services.order_processor import smart_extract
+    from services.orders.order_processor import smart_extract
 
     extracted = smart_extract(file_bytes, file_type)
     metadata = extracted.get("order_metadata") or {}

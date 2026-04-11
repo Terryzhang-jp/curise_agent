@@ -206,7 +206,7 @@ def build_zone_config(
     config["header_fields"] = _build_header_fields(field_positions, cell_map)
 
     # ── 7b. Field schema (schema-driven replacement for header_fields) ──
-    from services.field_schema import build_field_schema
+    from services.data.field_schema import build_field_schema
     config["field_schema"] = build_field_schema(field_positions, cell_map)
 
     # ── 8. Cross-zone references ─────────────────────────────────

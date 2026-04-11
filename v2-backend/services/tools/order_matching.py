@@ -74,7 +74,7 @@ def register(registry, ctx=None):
         ctx.db.commit()
 
         try:
-            from services.order_processor import run_agent_matching
+            from services.orders.order_processor import run_agent_matching
             import time
 
             start = time.time()
@@ -106,13 +106,13 @@ def register(registry, ctx=None):
 
             # Auto-run post-matching analysis
             try:
-                from services.order_processor import run_financial_analysis
+                from services.orders.order_processor import run_financial_analysis
                 order.financial_data = run_financial_analysis(order)
             except Exception as e:
                 logger.warning("Financial analysis failed: %s", e)
 
             try:
-                from services.inquiry_agent import run_inquiry_pre_analysis
+                from services.orders.inquiry_agent import run_inquiry_pre_analysis
                 order.inquiry_data = run_inquiry_pre_analysis(order, ctx.db)
                 flag_modified(order, "inquiry_data")
             except Exception as e:

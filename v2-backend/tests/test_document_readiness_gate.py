@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import models  # noqa: E402
 from models import Document, Order  # noqa: E402
-from services.document_order_projection import create_or_update_order_from_document  # noqa: E402
+from services.documents.document_order_projection import create_or_update_order_from_document  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────

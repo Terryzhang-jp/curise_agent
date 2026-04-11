@@ -427,7 +427,7 @@ def handle_image_message(event, received_at: float):
         return
 
     # Save to Supabase Storage
-    from services.file_storage import storage
+    from services.common.file_storage import storage
     filename = f"{uuid.uuid4().hex[:8]}_line_image.jpg"
     storage.upload("line", filename, file_bytes, content_type="image/jpeg")
     logger.info("Saved LINE image to storage: %s (%d bytes)", filename, len(file_bytes))

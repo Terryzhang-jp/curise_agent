@@ -49,7 +49,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import column_index_from_string, get_column_letter
 
-from services.zone_config_schema import (
+from services.templates.zone_config_schema import (
     ZoneConfigV1,
     ZoneConfigValidationError,
     parse_zone_config,

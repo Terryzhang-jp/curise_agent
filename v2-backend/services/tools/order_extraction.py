@@ -84,7 +84,7 @@ def register(registry, ctx=None):
         file_bytes = None
         if order.file_url:
             try:
-                from services.file_storage import storage
+                from services.common.file_storage import storage
                 file_bytes = storage.download(order.file_url)
             except Exception as e:
                 return f"Error: 无法下载文件 {order.file_url}: {e}"
@@ -98,8 +98,8 @@ def register(registry, ctx=None):
         ctx.db.commit()
 
         try:
-            from services.order_processor import smart_extract, normalize_metadata
-            from services.product_normalizer import normalize_products
+            from services.orders.order_processor import smart_extract, normalize_metadata
+            from services.data.product_normalizer import normalize_products
             import copy
 
             extracted = smart_extract(file_bytes, order.file_type or "pdf")
@@ -133,7 +133,7 @@ def register(registry, ctx=None):
             method = extracted.get("extraction_method", "unknown")
 
             # Validation warnings
-            from services.order_processor import _validate_extraction_numbers
+            from services.orders.order_processor import _validate_extraction_numbers
             num_warnings = _validate_extraction_numbers(products)
 
             lines = [

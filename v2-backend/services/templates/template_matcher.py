@@ -70,7 +70,7 @@ def _phase1_fingerprint(
     file_bytes: bytes, templates: list[OrderFormatTemplate],
 ) -> tuple[OrderFormatTemplate, str] | None:
     """Phase 1: Exact fingerprint match for Excel files."""
-    from services.excel_parser import compute_fingerprint
+    from services.excel.excel_parser import compute_fingerprint
     from openpyxl import load_workbook
 
     try:
@@ -312,7 +312,7 @@ def build_guided_prompt(template: OrderFormatTemplate, field_definitions=None) -
         parts.append("")
 
     # Append standard metadata schema
-    from services.order_processor import ORDER_METADATA_SCHEMA
+    from services.orders.order_processor import ORDER_METADATA_SCHEMA
 
     parts.append("## 元数据字段（必须使用以下确切键名）")
     for k, v in ORDER_METADATA_SCHEMA.items():

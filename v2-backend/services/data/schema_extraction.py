@@ -182,7 +182,7 @@ def prepare_images(file_bytes: bytes) -> list[bytes]:
     A 38-page PDF at DPI=150 produces ~228MB of PIL Images but only ~8MB of JPEG bytes.
     By converting eagerly and releasing PIL objects, we reduce peak memory by ~220MB.
     """
-    from services.pdf_analyzer import _pdf_bytes_to_images
+    from services.documents.pdf_analyzer import _pdf_bytes_to_images
 
     size_mb = len(file_bytes) / (1024 * 1024)
     dpi = 150 if size_mb > COMPRESS_THRESHOLD_MB else 200
@@ -865,7 +865,7 @@ def _apply_field_mapping(raw_data: dict, schema: dict) -> dict:
     Input:  {single_values: {group: {key: val}}, products: [...], text_blocks: {...}}
     Output: {order_metadata: {...}, products: [...], extraction_method, ...}
     """
-    from services.order_processor import normalize_metadata
+    from services.orders.order_processor import normalize_metadata
 
     field_mapping = schema.get("field_mapping", {})
 

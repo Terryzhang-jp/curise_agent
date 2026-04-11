@@ -353,7 +353,7 @@ class InquiryWorkbook:
         """Convert current workbook state to HTML via xlsx2html."""
         if self._wb is None:
             return "<p>No workbook loaded</p>"
-        from services.template_analyzer import generate_template_html
+        from services.templates.template_analyzer import generate_template_html
         buf = io.BytesIO()
         self._wb.save(buf)
         return generate_template_html(buf.getvalue())

@@ -17,7 +17,7 @@ from queue import Empty
 
 from typing import Optional
 
-from services.file_storage import storage
+from services.common.file_storage import storage
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -40,7 +40,7 @@ from services.agent.stream_queue import (
     remove_queue,
     set_cancelled,
 )
-from services.document_workflow import (
+from services.documents.document_workflow import (
     create_document_and_pending_order,
     create_document_record,
     create_pending_order_for_document,
@@ -117,8 +117,8 @@ def _run_extract_only(order_id: int, file_bytes: bytes):
     """
     from database import SessionLocal
     from models import Order
-    from services.order_processor import smart_extract, normalize_metadata, _validate_extraction
-    from services.product_normalizer import normalize_products
+    from services.orders.order_processor import smart_extract, normalize_metadata, _validate_extraction
+    from services.data.product_normalizer import normalize_products
     from sqlalchemy.orm.attributes import flag_modified
     import copy, logging, time
 
@@ -187,7 +187,7 @@ def _run_extract_only(order_id: int, file_bytes: bytes):
 
 def _run_process_order(order_id: int, file_bytes: bytes):
     """Legacy: full auto processing (extract + match + analyze). Kept for backward compat."""
-    from services.order_processor import process_order
+    from services.orders.order_processor import process_order
     process_order(order_id, file_bytes)
 
 
@@ -350,7 +350,7 @@ async def rematch_order(
 
 def _run_rematch(order_id: int):
     """Background thread: re-run matching using current order data."""
-    from services.order_processor import run_agent_matching
+    from services.orders.order_processor import run_agent_matching
 
     db = SessionLocal()
     try:
@@ -382,14 +382,14 @@ def _run_rematch(order_id: int):
             # Auto-run financial analysis
             if order.match_results:
                 try:
-                    from services.order_processor import run_financial_analysis
+                    from services.orders.order_processor import run_financial_analysis
                     order.financial_data = run_financial_analysis(order)
                 except Exception as e:
                     logger.warning("Rematch: Order %d financial analysis failed: %s", order_id, str(e))
 
                 # Auto-run inquiry pre-analysis
                 try:
-                    from services.inquiry_agent import run_inquiry_pre_analysis
+                    from services.orders.inquiry_agent import run_inquiry_pre_analysis
                     order.inquiry_data = run_inquiry_pre_analysis(order, db)
                 except Exception as e:
                     logger.warning("Rematch: Order %d inquiry pre-analysis failed: %s", order_id, str(e))
@@ -484,7 +484,7 @@ async def set_order_template(
 
 def _run_process_order_with_template(order_id: int, file_bytes: bytes, template_id: int):
     """Wrapper for background thread execution with template override."""
-    from services.order_processor import process_order
+    from services.orders.order_processor import process_order
     process_order(order_id, file_bytes, template_id_override=template_id)
 
 
@@ -548,7 +548,7 @@ def anomaly_check(
     if order.status not in ("ready", "extracted"):
         raise HTTPException(400, "订单尚未处理完成")
 
-    from services.order_processor import run_anomaly_check
+    from services.orders.order_processor import run_anomaly_check
     anomaly_data = run_anomaly_check(order)
     order.anomaly_data = anomaly_data
     db.commit()
@@ -572,7 +572,7 @@ def financial_analysis(
     if not order.match_results:
         raise HTTPException(400, "没有匹配结果，无法进行财务分析")
 
-    from services.order_processor import run_financial_analysis
+    from services.orders.order_processor import run_financial_analysis
     order.financial_data = run_financial_analysis(order, base_currency=base_currency)
     db.commit()
     db.refresh(order)
@@ -594,7 +594,7 @@ def delivery_environment(
     if not order.port_id or not order.delivery_date:
         raise HTTPException(400, "缺少港口或交货日期信息")
 
-    from services.weather_service import fetch_delivery_environment
+    from services.integrations.weather_service import fetch_delivery_environment
     from models import Port, Country
     port = db.query(Port).get(order.port_id)
     country = db.query(Country).get(port.country_id) if port and port.country_id else None
@@ -663,7 +663,7 @@ def generate_inquiry(
 
 def _run_inquiry_background(order_id: int, stream_key: str, template_overrides=None, supplier_ids=None):
     """Background thread: run inquiry orchestrator and save results."""
-    from services.inquiry_agent import InquiryCancelledError, run_inquiry_orchestrator
+    from services.orders.inquiry_agent import InquiryCancelledError, run_inquiry_orchestrator
 
     db = SessionLocal()
     try:
@@ -817,7 +817,7 @@ def cancel_inquiry(
 
 def _run_inquiry_single_background(order_id: int, supplier_id: int, stream_key: str, template_id=None):
     """Background thread: run single supplier inquiry and merge result into order."""
-    from services.inquiry_agent import InquiryCancelledError, run_inquiry_single_supplier
+    from services.orders.inquiry_agent import InquiryCancelledError, run_inquiry_single_supplier
 
     db = SessionLocal()
     try:
@@ -978,8 +978,8 @@ def inquiry_readiness(
     user attention, and an overall summary. This is the single source of truth
     for the frontend's inquiry tab rendering.
     """
-    from services.inquiry_agent import select_template, _build_order_data_for_engine
-    from services.field_schema import analyze_gaps, schema_from_zone_config
+    from services.orders.inquiry_agent import select_template, _build_order_data_for_engine
+    from services.data.field_schema import analyze_gaps, schema_from_zone_config
     from models import SupplierTemplate
     import sqlalchemy
 
@@ -1134,9 +1134,9 @@ def inquiry_data_preview(
     Returns structured preview of header fields (with resolved values),
     product data summary, and any warnings — without generating the actual Excel.
     """
-    from services.inquiry_agent import select_template, _build_order_data_for_engine
-    from services.field_schema import _resolve_path
-    from services.template_engine_legacy import _resolve_product_field
+    from services.orders.inquiry_agent import select_template, _build_order_data_for_engine
+    from services.data.field_schema import _resolve_path
+    from services.templates.template_engine_legacy import _resolve_product_field
     from models import SupplierTemplate
     import sqlalchemy
 

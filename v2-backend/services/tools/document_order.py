@@ -4,7 +4,7 @@ import json
 import re
 from datetime import UTC, datetime
 
-from services.document_order_projection import (
+from services.documents.document_order_projection import (
     EDITABLE_DOCUMENT_FIELDS,
     apply_document_field_overrides,
     build_order_payload,

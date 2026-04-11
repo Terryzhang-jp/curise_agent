@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from config import settings
 from models import User
 from routes.auth import get_current_user
-from services.excel_parser import parse_excel_file, parse_excel_cell_positions
+from services.excel.excel_parser import parse_excel_file, parse_excel_cell_positions
 
 router = APIRouter(prefix="/excel", tags=["excel"])
 
@@ -64,7 +64,7 @@ async def parse_file(
     # Extract raw text for AI inference (non-critical)
     raw_text = ""
     try:
-        from services.template_matcher import get_scannable_text
+        from services.templates.template_matcher import get_scannable_text
         file_type_hint = "pdf" if filename.lower().endswith(".pdf") else "excel"
         raw_text = get_scannable_text(content, file_type_hint)[:5000]
     except Exception:
@@ -73,7 +73,7 @@ async def parse_file(
     if filename.lower().endswith(".pdf"):
         # PDF path: AI-driven analysis
         try:
-            from services.pdf_analyzer import analyze_pdf_structure
+            from services.documents.pdf_analyzer import analyze_pdf_structure
             analysis = analyze_pdf_structure(content)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"PDF 分析失败: {str(e)}")
