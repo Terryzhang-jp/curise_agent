@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+const toUTC = (s: string) => s.endsWith("Z") || s.includes("+") ? s : s + "Z";
 import { useParams, useRouter } from "next/navigation";
 import {
   getOrder,
@@ -537,7 +539,7 @@ export default function OrderDetailPage() {
               {order.processed_at && (
                 <span>
                   处理于{" "}
-                  {new Date(order.processed_at).toLocaleString("zh-CN", {
+                  {new Date(toUTC(order.processed_at)).toLocaleString("zh-CN", {
                     month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
                   })}
                 </span>
@@ -1143,7 +1145,7 @@ function OverviewTab({
               <CheckCircle2 className="h-3.5 w-3.5" /> 已审核
             </div>
             <p className="text-xs text-muted-foreground">
-              审核时间: {order.reviewed_at ? new Date(order.reviewed_at).toLocaleString("zh-CN") : "-"}
+              审核时间: {order.reviewed_at ? new Date(toUTC(order.reviewed_at)).toLocaleString("zh-CN") : "-"}
             </p>
             {order.review_notes && (
               <p className="text-xs mt-1">备注: {order.review_notes}</p>
@@ -1294,7 +1296,7 @@ function DeliveryEnvironmentCard({ data }: { data: DeliveryEnvironment }) {
         )}
 
         <div className="text-[10px] text-muted-foreground text-right">
-          数据来源: {data.source} · 获取于 {new Date(data.fetched_at).toLocaleString("zh-CN")}
+          数据来源: {data.source} · 获取于 {new Date(toUTC(data.fetched_at)).toLocaleString("zh-CN")}
         </div>
       </CardContent>
     </Card>
@@ -2575,7 +2577,7 @@ function FulfillmentTab({ order }: { order: Order }) {
                         <div className="text-[10px] text-muted-foreground">{att.description}</div>
                       )}
                       <div className="text-[10px] text-muted-foreground">
-                        {att.uploaded_at ? new Date(att.uploaded_at).toLocaleString("zh-CN") : ""}
+                        {att.uploaded_at ? new Date(toUTC(att.uploaded_at)).toLocaleString("zh-CN") : ""}
                       </div>
                     </div>
                     <a href={fileUrl} target="_blank" rel="noopener noreferrer">

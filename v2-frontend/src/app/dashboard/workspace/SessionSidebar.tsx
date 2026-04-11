@@ -23,8 +23,9 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Plus, MoreHorizontal, Trash2, MessageSquare } from "lucide-react";
 
+const toUTC = (s: string) => s.endsWith("Z") || s.includes("+") ? s : s + "Z";
 function formatTime(dateStr: string) {
-  return new Date(dateStr).toLocaleString("zh-CN", {
+  return new Date(toUTC(dateStr)).toLocaleString("zh-CN", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",

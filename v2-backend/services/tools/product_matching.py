@@ -156,8 +156,6 @@ def _match_products_against_db(products, db, country_id=None, port_id=None, deli
             # the final data uses the authoritative source.
             if mp.get("unit"):
                 match_result["unit"] = mp["unit"]
-            if mp.get("price") is not None:
-                match_result["unit_price"] = mp["price"]
 
         results.append(match_result)
 

@@ -71,9 +71,10 @@ function StatusDot({ status }: { status: DocumentStatus }) {
   );
 }
 
+const toUTC = (s: string) => s.endsWith("Z") || s.includes("+") ? s : s + "Z";
 function formatRelative(iso: string | null) {
   if (!iso) return "—";
-  const then = new Date(iso).getTime();
+  const then = new Date(toUTC(iso)).getTime();
   const now = Date.now();
   const diffMs = now - then;
   const sec = Math.round(diffMs / 1000);
@@ -84,7 +85,7 @@ function formatRelative(iso: string | null) {
   if (hour < 24) return `${hour} 小时前`;
   const day = Math.round(hour / 24);
   if (day < 30) return `${day} 天前`;
-  return new Date(iso).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+  return new Date(toUTC(iso)).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
 }
 
 export default function DocumentsPage() {

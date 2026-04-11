@@ -66,9 +66,10 @@ function tryParseQueryResult(content: string): QueryResult | null {
   return null;
 }
 
+const toUTC = (s: string) => s.endsWith("Z") || s.includes("+") ? s : s + "Z";
 function formatTime(dateStr: string): string {
   try {
-    return new Date(dateStr).toLocaleTimeString("zh-CN", {
+    return new Date(toUTC(dateStr)).toLocaleTimeString("zh-CN", {
       hour: "2-digit",
       minute: "2-digit",
     });

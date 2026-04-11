@@ -72,8 +72,9 @@ const FULFILLMENT_COLORS: Record<string, string> = {
   paid: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300",
 };
 
+const toUTC = (iso: string) => iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z";
 const formatTime = (iso: string) =>
-  new Date(iso).toLocaleString("zh-CN", {
+  new Date(toUTC(iso)).toLocaleString("zh-CN", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",

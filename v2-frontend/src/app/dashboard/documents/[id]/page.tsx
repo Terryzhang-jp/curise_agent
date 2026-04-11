@@ -105,9 +105,10 @@ function StatusDot({ status }: { status: DocumentStatus }) {
   );
 }
 
+const toUTC = (s: string) => s.endsWith("Z") || s.includes("+") ? s : s + "Z";
 function formatTime(iso: string | null) {
   if (!iso) return "—";
-  return new Date(iso).toLocaleString("zh-CN", {
+  return new Date(toUTC(iso)).toLocaleString("zh-CN", {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",

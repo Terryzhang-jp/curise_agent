@@ -51,9 +51,10 @@ function roleBadge(role: string) {
   );
 }
 
+const toUTC = (s: string) => s.endsWith("Z") || s.includes("+") ? s : s + "Z";
 function formatDate(dateStr: string | null) {
   if (!dateStr) return "-";
-  const d = new Date(dateStr);
+  const d = new Date(toUTC(dateStr));
   return d.toLocaleDateString("zh-CN", {
     year: "numeric",
     month: "2-digit",

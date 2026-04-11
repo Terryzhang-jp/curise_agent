@@ -567,7 +567,7 @@ export default function OrderFormatTab() {
                                 <span>数据起始行: {tpl.data_start_row}</span>
                               </>
                             )}
-                            <span>创建: {new Date(tpl.created_at).toLocaleDateString("zh-CN")}</span>
+                            <span>创建: {new Date((tpl.created_at.endsWith("Z") || tpl.created_at.includes("+") ? tpl.created_at : tpl.created_at + "Z")).toLocaleDateString("zh-CN")}</span>
                           </div>
                           <div className="flex items-center gap-2">
                             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => openEdit(tpl)}>
