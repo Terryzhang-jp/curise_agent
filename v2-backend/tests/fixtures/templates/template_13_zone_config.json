@@ -1,0 +1,270 @@
+{
+  "zones": {
+    "product_data": {
+      "start": 22,
+      "end": 32
+    },
+    "summary": {
+      "start": 33,
+      "end": 35
+    }
+  },
+  "summary_formulas": [
+    {
+      "cell": "L33",
+      "type": "product_sum",
+      "col": "L",
+      "label": "Sub Total"
+    },
+    {
+      "cell": "L34",
+      "type": "relative",
+      "formula_template": "={sum_cell}*0.08",
+      "label": "tax"
+    },
+    {
+      "cell": "L35",
+      "type": "relative",
+      "formula_template": "=+{sum_cell}+{tax_cell}",
+      "label": "GRAND TOTAL"
+    }
+  ],
+  "summary_static_values": {
+    "I33": "Sub Total",
+    "K33": "JPY",
+    "I34": "Tax",
+    "K34": "JPY",
+    "I35": "GRAND TOTAL",
+    "K35": "JPY"
+  },
+  "stale_columns_in_summary": [
+    "D",
+    "I",
+    "K"
+  ],
+  "product_row_formulas": {
+    "L": "=H{row}*J{row}"
+  },
+  "product_columns": {
+    "A": "line_number",
+    "B": "po_number",
+    "C": "product_code",
+    "D": "product_name_en",
+    "E": "product_name_jp",
+    "F": "description",
+    "H": "quantity",
+    "I": "unit",
+    "J": "unit_price",
+    "K": "currency"
+  },
+  "header_fields": {
+    "A2": "ship_name",
+    "A4": "suppliers.{sid}.supplier_name",
+    "K4": "order_date",
+    "A5": "suppliers.{sid}.supplier_info.contact",
+    "K5": "po_number",
+    "A6": "suppliers.{sid}.supplier_info.address",
+    "K6": "voyage",
+    "A7": "suppliers.{sid}.supplier_info.phone",
+    "A8": "suppliers.{sid}.supplier_info.email",
+    "H8": "delivery_date",
+    "K8": "delivery_location.delivery_notes",
+    "H9": "delivery_address",
+    "H10": "destination_port",
+    "H11": "delivery_location.contact_person",
+    "I12": "ship_name",
+    "H13": "suppliers.{sid}.supplier_info.default_payment_terms",
+    "H14": "suppliers.{sid}.supplier_info.default_payment_method"
+  },
+  "external_refs": [
+    {
+      "cell": "H16",
+      "formula_template": "={grand_total_cell}"
+    }
+  ],
+  "template_contract": {
+    "version": 2,
+    "sheet_name": "0804発注書 (ML)",
+    "template_dimensions": "A1:Q46",
+    "header_merged_ranges": [
+      "A1:L1",
+      "A20:A21",
+      "A2:L2",
+      "B20:B21",
+      "C20:E20",
+      "F16:G18",
+      "F20:G20",
+      "F21:G21",
+      "F8:G8",
+      "F9:G9",
+      "H13:J13",
+      "H15:J15",
+      "H16:J18",
+      "H20:I20",
+      "H21:I21",
+      "H5:I5",
+      "H7:I7",
+      "H8:J8",
+      "H9:L9",
+      "J7:L7",
+      "K20:L20",
+      "K21:L21",
+      "K4:L4",
+      "K6:L6"
+    ],
+    "header_field_anchors": [
+      {
+        "target_cell": "A2",
+        "anchor_cell": "A1",
+        "value": "PURCHASE ORDER"
+      },
+      {
+        "target_cell": "H13",
+        "anchor_cell": "F13",
+        "value": "Payment Date:"
+      },
+      {
+        "target_cell": "H14",
+        "anchor_cell": "F14",
+        "value": "Payment Method:"
+      },
+      {
+        "target_cell": "H8",
+        "anchor_cell": "F8",
+        "value": "Delivery Date:"
+      },
+      {
+        "target_cell": "H9",
+        "anchor_cell": "F9",
+        "value": "Delivery Address:"
+      },
+      {
+        "target_cell": "K4",
+        "anchor_cell": "J4",
+        "value": "DATE："
+      },
+      {
+        "target_cell": "K5",
+        "anchor_cell": "J5",
+        "value": "Invoice："
+      },
+      {
+        "target_cell": "K6",
+        "anchor_cell": "J6",
+        "value": "Voyage："
+      }
+    ],
+    "product_header_cells": [
+      {
+        "col": "C",
+        "row_offset": -1,
+        "value": "商品コード"
+      },
+      {
+        "col": "D",
+        "row_offset": -1,
+        "value": "英語表記"
+      },
+      {
+        "col": "E",
+        "row_offset": -1,
+        "value": "日本語表記"
+      },
+      {
+        "col": "F",
+        "row_offset": -1,
+        "value": "（詳細）"
+      },
+      {
+        "col": "H",
+        "row_offset": -1,
+        "value": "(数量)"
+      },
+      {
+        "col": "J",
+        "row_offset": -1,
+        "value": "(単価）"
+      },
+      {
+        "col": "K",
+        "row_offset": -1,
+        "value": "(合計)"
+      }
+    ],
+    "product_row_merges": [
+      {
+        "start_col": 6,
+        "end_col": 7
+      }
+    ],
+    "summary_relative_merges": [
+      {
+        "row_offset": 0,
+        "start_col": 9,
+        "end_col": 10
+      },
+      {
+        "row_offset": 1,
+        "start_col": 9,
+        "end_col": 10
+      },
+      {
+        "row_offset": 2,
+        "start_col": 9,
+        "end_col": 10
+      }
+    ],
+    "summary_static_labels": [
+      {
+        "row_offset": 0,
+        "col": "I",
+        "value": "Sub Total"
+      },
+      {
+        "row_offset": 0,
+        "col": "K",
+        "value": "JPY"
+      },
+      {
+        "row_offset": 1,
+        "col": "I",
+        "value": "Tax"
+      },
+      {
+        "row_offset": 1,
+        "col": "K",
+        "value": "JPY"
+      },
+      {
+        "row_offset": 2,
+        "col": "I",
+        "value": "GRAND TOTAL"
+      },
+      {
+        "row_offset": 2,
+        "col": "K",
+        "value": "JPY"
+      }
+    ],
+    "formula_anchors": [
+      {
+        "row_offset": 0,
+        "col": "L",
+        "label": "Sub Total",
+        "type": "product_sum"
+      },
+      {
+        "row_offset": 1,
+        "col": "L",
+        "label": "tax",
+        "type": "relative"
+      },
+      {
+        "row_offset": 2,
+        "col": "L",
+        "label": "GRAND TOTAL",
+        "type": "relative"
+      }
+    ]
+  }
+}

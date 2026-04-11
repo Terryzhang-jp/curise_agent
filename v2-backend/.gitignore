@@ -26,3 +26,6 @@ Thumbs.db
 # Test files
 test_*.py
 !tests/
+# Whitelisted regression suites that ship with the inquiry pipeline rigor work
+!tests/test_inquiry_pipeline_e2e.py
+!tests/test_zone_config_schema.py
