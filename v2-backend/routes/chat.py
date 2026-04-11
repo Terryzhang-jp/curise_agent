@@ -85,7 +85,8 @@ def _load_skills_into_ctx(db: DBSession, ctx):
     # Check two possible locations: inside app dir (for Cloud Run) and parent dir (legacy)
     app_dir = os.path.dirname(os.path.dirname(__file__))  # v2-backend/
     skills_candidates = [
-        os.path.join(app_dir, "skills"),            # v2-backend/skills/ (Cloud Run)
+        os.path.join(app_dir, "services", "agent", "skills"),  # v2-backend/services/agent/skills/
+        os.path.join(app_dir, "skills"),            # v2-backend/skills/ (legacy fallback)
         os.path.join(app_dir, "..", "skills"),       # curise_agent/skills/ (legacy)
     ]
     extra = [d for d in skills_candidates if os.path.isdir(d)]
