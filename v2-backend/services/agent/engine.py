@@ -117,7 +117,7 @@ class ReActAgent:
             self.max_turns = max_turns
             self.thinking_budget = thinking_budget
             self.warn_turns_remaining = warn_turns_remaining
-            self.model_name = "gemini-3-flash-preview"
+            self.model_name = getattr(provider, '_model', None) or "unknown"
             self._parallel_workers = 4
             self._loop_window = 20
             self.loop_threshold = 3
@@ -149,7 +149,8 @@ class ReActAgent:
         # Auto-compact settings (config mode sets this earlier; flat mode uses default)
         if not hasattr(self, '_compact_threshold'):
             self._compact_threshold = 70000
-        self._compact_done: bool = False  # Only compact once per run()
+        self._compact_cooldown: int = 0      # Turns remaining before next compact allowed
+        self._compact_min_interval: int = 5  # Minimum turns between compacts
 
         # Auto-inject LoopDetectionMiddleware if not already in middleware chain
         self._ensure_loop_detection_middleware()
@@ -537,6 +538,15 @@ class ReActAgent:
                 history.append(workspace_injection)
 
             # --- Skill injection (transient, first turn only) ---
+            scenario_context_injection = None
+            if turn == 0:
+                scenario_context_text = getattr(self.ctx, '_scenario_context_injection', '')
+                if scenario_context_text:
+                    scenario_context_injection = self.provider.build_system_injection(
+                        f"[Scenario Context]\n{scenario_context_text}"
+                    )
+                    history.append(scenario_context_injection)
+
             skill_injection = None
             if turn == 0:
                 skill_text = getattr(self.ctx, '_skill_injection', '')
@@ -575,6 +585,8 @@ class ReActAgent:
                     history.remove(todo_injection)
                 if workspace_injection is not None and workspace_injection in history:
                     history.remove(workspace_injection)
+                if scenario_context_injection is not None and scenario_context_injection in history:
+                    history.remove(scenario_context_injection)
                 if skill_injection is not None and skill_injection in history:
                     history.remove(skill_injection)
                 if midpoint_injection is not None and midpoint_injection in history:
@@ -750,15 +762,24 @@ class ReActAgent:
             # Use current_prompt_tokens (this call's full context size), NOT total
             # prompt_tokens is the full context each call, not incremental
             should_compact_mw = getattr(self.ctx, '_should_compact', False)
-            if not self._compact_done and (current_prompt_tokens >= self._compact_threshold or should_compact_mw):
+            if self._compact_cooldown > 0:
+                self._compact_cooldown -= 1
+            if self._compact_cooldown <= 0 and (current_prompt_tokens >= self._compact_threshold or should_compact_mw):
                 self._log("auto_compact", f"Context size ({current_prompt_tokens}) exceeds threshold ({self._compact_threshold}), compacting...")
                 try:
                     self.compact()
                     history = self._load_history()
-                    self._compact_done = True
-                    self._log("auto_compact", "Context compacted successfully, reloaded history.")
+                    self._compact_cooldown = self._compact_min_interval
+                    # Reset SummarizationMiddleware so it can re-trigger
+                    if hasattr(self.ctx, '_should_compact'):
+                        self.ctx._should_compact = False
+                    if self._middleware:
+                        for mw in getattr(self._middleware, '_middlewares', []):
+                            if hasattr(mw, '_triggered'):
+                                mw._triggered = False
+                    self._log("auto_compact", f"Context compacted successfully, reloaded history. Cooldown={self._compact_cooldown} turns.")
                 except Exception as e:
-                    self._compact_done = True
+                    self._compact_cooldown = self._compact_min_interval  # Don't retry immediately on failure
                     self._log("error", f"Auto-compact failed: {e}")
 
             # === Tool Result Clearing (Anthropic pattern) ===
@@ -840,72 +861,152 @@ class ReActAgent:
     # Context compression (compact)
     # ----------------------------------------------------------
 
+    _COMPACT_MAX_INPUT_CHARS = 30000
+    _COMPACT_MAX_RETRY = 1
+
+    _COMPACT_PROMPT_TEMPLATE = (
+        "请根据以下对话生成一份结构化摘要，用于替代原始对话历史。"
+        "摘要必须足够详细，使后续对话无需回看原始消息即可继续工作。\n\n"
+        "请严格按以下 7 个部分输出，每部分不可省略：\n\n"
+        "1. **用户意图与请求**: 用户明确要求做什么？有哪些反馈或修正指令？\n"
+        "2. **已完成的步骤**: 按时间顺序列出已完成的操作及结果（含具体数字：产品数、匹配率、生成文件名等）\n"
+        "3. **错误与修复**: 遇到了哪些错误？如何修复的？用户对此有什么反馈？\n"
+        "4. **当前工作**: 压缩前正在做什么？做到哪一步了？\n"
+        "5. **待完成任务**: 明确列出还没做的事\n"
+        "6. **关键数据**: 订单 ID、供应商名称、匹配统计、文件路径等不可丢失的具体数值\n"
+        "7. **下一步**: 基于当前进度，接下来应该做什么？\n\n"
+        "规则：\n"
+        "- 用中文输出\n"
+        "- 不要遗漏用户的任何修正指令（如'改成XX'、'不要XX'）\n"
+        "- 数字和文件名必须原样保留，不能概括\n"
+        "- 不要编造对话中没有的信息\n\n"
+        "--- 对话内容 ---\n\n{conversation}\n\n{extra_context}"
+    )
+
     def compact(self) -> str:
-        """Compress context: generate summary, subsequent chats use summary + new messages."""
+        """Compress context: structured summary + post-compact state restoration."""
         messages = self.storage.list_messages(self.session_id)
         if not messages:
             return "当前 session 没有消息，无需压缩。"
 
-        conversation_text = []
+        # ── Step 1: Build conversation text (keep recent, truncate old) ──
+        conversation_lines = self._build_compact_input(messages)
+        full_text = "\n".join(conversation_lines)
+
+        # Truncate from HEAD (preserve most recent messages)
+        if len(full_text) > self._COMPACT_MAX_INPUT_CHARS:
+            excess = len(full_text) - self._COMPACT_MAX_INPUT_CHARS
+            full_text = f"[...前 {excess} 字符已省略，以下为最近的对话...]\n\n" + full_text[-self._COMPACT_MAX_INPUT_CHARS:]
+
+        # ── Step 2: Gather extra context (todo, workspace, session state) ──
+        extra_parts = []
+        todo_state = self.ctx.todo_state_summary()
+        if todo_state:
+            extra_parts.append(todo_state)
+
+        # Workspace files
+        workspace = getattr(self.ctx, 'workspace_dir', None)
+        if workspace:
+            try:
+                import os
+                files = [f for f in os.listdir(workspace) if not f.startswith('_')]
+                if files:
+                    extra_parts.append(f"[工作目录文件]: {', '.join(files[:20])}")
+            except OSError:
+                pass
+
+        # Session state (order IDs, operation state) — critical for post-compact continuity
+        order_ids = list(getattr(self.ctx, '_referenced_order_ids', set()))
+        if order_ids:
+            extra_parts.append(f"[关联订单 ID]: {', '.join(str(x) for x in order_ids)}")
+
+        session_data = getattr(self.ctx, 'session_data', {})
+        if session_data:
+            # Extract key operational state without dumping everything
+            op_state = session_data.get("operation_state", {})
+            if op_state:
+                extra_parts.append(f"[操作状态]: {json.dumps(op_state, ensure_ascii=False)[:500]}")
+
+        extra_context = "\n".join(extra_parts) if extra_parts else ""
+
+        # ── Step 3: Generate summary with retry on prompt-too-long ──
+        summary_text = self._generate_compact_summary(full_text, extra_context)
+        if summary_text is None:
+            return "摘要生成失败（已重试）"
+
+        # ── Step 4: Store summary + post-compact state restoration ──
+        # Build the stored message with summary + critical state
+        restore_parts = [f"[对话摘要]\n\n{summary_text}"]
+        if order_ids:
+            restore_parts.append(f"\n[恢复状态] 关联订单: {', '.join(str(x) for x in order_ids)}")
+        if todo_state:
+            restore_parts.append(f"\n{todo_state}")
+
+        summary_msg = self.storage.create_message(
+            self.session_id,
+            "user",
+            [text_part("\n".join(restore_parts))],
+        )
+        self.storage.update_session(self.session_id, summary_message_id=summary_msg.id)
+
+        return f"Context 压缩完成。摘要已保存。\n\n{summary_text}"
+
+    def _build_compact_input(self, messages: list) -> list[str]:
+        """Convert messages to text lines for compact summary input.
+
+        Tool results are truncated to 300 chars. Tool call args are truncated to 200 chars.
+        User messages are kept in full (they contain intent/feedback).
+        """
+        lines = []
         for msg in messages:
             role_label = {"user": "用户", "assistant": "助手", "tool": "工具"}.get(msg.role, msg.role)
             for p in msg.parts:
                 ptype = p.get("type", "")
                 data = p.get("data", {})
                 if ptype == "text":
-                    conversation_text.append(f"{role_label}: {data.get('text', '')}")
+                    text = data.get("text", "")
+                    # User messages: keep full (contain intent); assistant: truncate long text
+                    if msg.role == "user":
+                        lines.append(f"{role_label}: {text}")
+                    else:
+                        if len(text) > 500:
+                            lines.append(f"{role_label}: {text[:500]}...")
+                        else:
+                            lines.append(f"{role_label}: {text}")
                 elif ptype == "tool_call":
-                    conversation_text.append(
-                        f"助手调用工具: {data.get('name', '')}({json.dumps(data.get('args', {}), ensure_ascii=False)})"
-                    )
+                    args_str = json.dumps(data.get("args", {}), ensure_ascii=False)
+                    if len(args_str) > 200:
+                        args_str = args_str[:200] + "..."
+                    lines.append(f"调用 {data.get('name', '')}({args_str})")
                 elif ptype == "tool_result":
                     result_text = data.get("result", "")
-                    if len(result_text) > 200:
-                        result_text = result_text[:200] + "..."
-                    conversation_text.append(f"工具结果[{data.get('name', '')}]: {result_text}")
+                    if len(result_text) > 300:
+                        result_text = result_text[:300] + "..."
+                    lines.append(f"结果[{data.get('name', '')}]: {result_text}")
+        return lines
 
-        full_text = "\n".join(conversation_text)
-        if len(full_text) > 12000:
-            full_text = full_text[:12000] + "\n... (截断)"
-
-        # Include todo state and workspace info in summary prompt
-        extra_context = ""
-        todo_state = self.ctx.todo_state_summary()
-        if todo_state:
-            extra_context += f"\n\n{todo_state}"
-        workspace = getattr(self.ctx, 'workspace_dir', None)
-        if workspace:
+    def _generate_compact_summary(self, conversation: str, extra_context: str) -> str | None:
+        """Generate summary with retry on prompt-too-long errors."""
+        for attempt in range(self._COMPACT_MAX_RETRY + 1):
+            prompt_text = self._COMPACT_PROMPT_TEMPLATE.format(
+                conversation=conversation,
+                extra_context=extra_context,
+            )
             try:
-                import os
-                files = os.listdir(workspace)
-                if files:
-                    extra_context += f"\n\n[工作目录文件]: {', '.join(files[:20])}"
-            except OSError:
-                pass
-
-        summary_prompt = (
-            "请总结以下对话的关键内容，重点包括：\n"
-            "1. 已完成的处理步骤和结果\n"
-            "2. 当前正在进行什么\n"
-            "3. 接下来需要做什么\n"
-            "4. 重要的中间结果和数据（如产品数量、匹配率等）\n\n"
-            "请用简洁的中文总结：\n\n"
-            f"{full_text}{extra_context}"
-        )
-
-        try:
-            summary_history = [self.provider.build_user_message(summary_prompt)]
-            resp = self.provider.generate(summary_history)
-            summary_text = "\n".join(resp.text_parts) if resp.text_parts else "(摘要生成失败)"
-        except Exception as e:
-            return f"摘要生成失败: {e}"
-
-        summary_msg = self.storage.create_message(
-            self.session_id,
-            "user",
-            [text_part(f"[对话摘要] 以下是之前对话的摘要：\n\n{summary_text}")],
-        )
-
-        self.storage.update_session(self.session_id, summary_message_id=summary_msg.id)
-
-        return f"Context 压缩完成。摘要已保存。\n\n摘要内容:\n{summary_text}"
+                summary_history = [self.provider.build_user_message(prompt_text)]
+                resp = self.provider.generate(summary_history)
+                summary_text = "\n".join(resp.text_parts) if resp.text_parts else None
+                if summary_text:
+                    return summary_text
+            except Exception as e:
+                error_str = str(e).lower()
+                is_too_long = any(kw in error_str for kw in ("too long", "context_length", "token", "resource_exhausted"))
+                if is_too_long and attempt < self._COMPACT_MAX_RETRY:
+                    # Truncate 30% from head and retry
+                    cut = len(conversation) // 3
+                    conversation = f"[...前 {cut} 字符已省略...]\n" + conversation[cut:]
+                    logger.warning("Compact prompt too long, truncated %d chars, retrying (attempt %d)", cut, attempt + 1)
+                    continue
+                logger.error("Compact summary generation failed: %s", e)
+                return None
+        return None

@@ -21,6 +21,7 @@ from routes.tool_settings import router as tool_settings_router
 from routes.users import router as users_router
 from routes.data import router as data_router
 from routes.line_webhook import router as line_router
+from routes.documents import router as documents_router
 from database import engine
 from models import Base
 
@@ -57,6 +58,7 @@ app.include_router(tool_settings_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(data_router, prefix="/api")
 app.include_router(line_router, prefix="/api")
+app.include_router(documents_router, prefix="/api")
 
 UPLOAD_DIR = settings.UPLOAD_DIR
 os.makedirs(UPLOAD_DIR, exist_ok=True)

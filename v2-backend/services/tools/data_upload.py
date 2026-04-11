@@ -33,76 +33,20 @@ from services.tools.registry_loader import ToolMetaInfo
 logger = logging.getLogger(__name__)
 
 TOOL_META = {
-    "parse_file": ToolMetaInfo(
+    "parse_upload": ToolMetaInfo(
         display_name="解析上传文件",
         group="business",
         description="解析上传的 Excel/CSV 文件，创建暂存数据",
-        prompt_description="解析上传的 Excel/CSV 文件，创建暂存数据",
+        prompt_description="解析上传文件（Excel/CSV → 暂存数据）",
         summary="解析上传文件",
-        auto_register=False,  # Only when file is attached or batch exists
-    ),
-    "analyze_columns": ToolMetaInfo(
-        display_name="分析列映射",
-        group="business",
-        description="分析未映射列（交叉比对 DB 参考表，检测 supplier_id/country_id 等）",
-        prompt_description="分析未映射列（交叉比对 DB 参考表，检测 supplier_id/country_id 等）",
-        summary="分析列映射",
         auto_register=False,
     ),
-    "resolve_and_validate": ToolMetaInfo(
-        display_name="验证暂存数据",
+    "manage_upload": ToolMetaInfo(
+        display_name="上传管理",
         group="business",
-        description="验证暂存数据（代码匹配+LLM模糊匹配+置信度分级）",
-        prompt_description="验证暂存数据（代码匹配+LLM模糊匹配+置信度分级）",
-        summary="验证暂存数据",
-        auto_register=False,
-    ),
-    "create_references": ToolMetaInfo(
-        display_name="创建引用数据",
-        group="business",
-        description="自动创建缺失的供应商/国家等引用数据",
-        prompt_description="自动创建缺失的供应商/国家等引用数据",
-        summary="创建引用数据",
-        auto_register=False,
-    ),
-    "preview_changes": ToolMetaInfo(
-        display_name="预览变更",
-        group="business",
-        description="生成变更预览报告（新增/更新/异常/无变化）",
-        prompt_description="生成变更预览报告（新增/更新/异常/无变化）",
-        summary="预览变更",
-        auto_register=False,
-    ),
-    "execute_upload": ToolMetaInfo(
-        display_name="执行产品导入",
-        group="business",
-        description="确认后原子执行产品导入，写入变更日志",
-        prompt_description="确认后原子执行产品导入，写入变更日志",
-        summary="执行产品导入",
-        auto_register=False,
-    ),
-    "audit_data": ToolMetaInfo(
-        display_name="数据质量审计",
-        group="business",
-        description="数据质量审计（检查列缺失、格式错误、重复数据、单位/价格合理性等）",
-        prompt_description="数据质量审计（检查列缺失、格式错误、重复数据、单位/价格合理性等）",
-        summary="数据质量审计",
-        auto_register=False,
-    ),
-    "prepare_upload": ToolMetaInfo(
-        display_name="准备上传",
-        group="business",
-        description="一键准备上传（验证匹配+数据审计+变更预览，返回统一审查卡片）",
-        prompt_description="一键准备上传（验证匹配+数据审计+变更预览，返回统一审查卡片）",
-        summary="准备上传",
-        auto_register=False,
-    ),
-    "rollback_batch": ToolMetaInfo(
-        display_name="回滚批次",
-        group="business",
-        description="回滚已完成的批次导入（删除新增、恢复更新产品原值）",
-        prompt_description="回滚已完成的批次导入（删除新增、恢复更新产品原值）",
-        summary="回滚批次",
+        description="产品数据上传管道: 准备→执行→回滚→预览→审计→列分析→引用创建",
+        prompt_description="产品上传管理（准备/执行/回滚/预览/审计）",
+        summary="管理上传",
         auto_register=False,
     ),
 }

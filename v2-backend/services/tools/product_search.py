@@ -15,8 +15,8 @@ TOOL_META = {
         description="按关键词搜索产品数据库",
         prompt_description="按关键词搜索产品数据库",
         summary="搜索产品数据库",
-        is_enabled_default=False,
-        auto_register=False,
+        is_enabled_default=True,
+        auto_register=True,
     ),
 }
 

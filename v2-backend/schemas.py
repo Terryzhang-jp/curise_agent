@@ -322,6 +322,7 @@ class CompanyConfigResponse(BaseModel):
 class OrderListItem(BaseModel):
     """订单列表项 — 不含 products/match_results 等大字段"""
     id: int
+    document_id: Optional[int] = None
     filename: str
     file_url: Optional[str] = None
     file_type: Optional[str] = "xlsx"
@@ -348,6 +349,7 @@ class OrderDetail(BaseModel):
     """订单详情 — 含全部字段"""
     id: int
     user_id: int
+    document_id: Optional[int] = None
     filename: str
     file_url: Optional[str] = None
     file_type: str
@@ -397,6 +399,8 @@ class OrderReviewRequest(BaseModel):
 class OrderUpdateRequest(BaseModel):
     order_metadata: Optional[dict[str, Any]] = None
     products: Optional[list[dict[str, Any]]] = None
+    port_id: Optional[int] = None
+    country_id: Optional[int] = None
 
 
 class OrderRematchRequest(BaseModel):

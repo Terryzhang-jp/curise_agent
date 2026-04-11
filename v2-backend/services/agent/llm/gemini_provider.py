@@ -6,11 +6,45 @@ All google.genai imports are confined to this single file.
 
 from __future__ import annotations
 
+import logging
+import random
 import time
 from typing import Any
 
 from google import genai
 from google.genai import types
+
+logger = logging.getLogger(__name__)
+
+
+# HTTP status codes that are worth retrying on. 4xx codes are caller bugs and
+# should fail fast — except 408 (request timeout) and 429 (rate limit), which
+# are transient.
+_RETRYABLE_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Decide whether a Gemini SDK exception should be retried.
+
+    Conservative: only retry transient infra failures, never logic errors.
+    """
+    msg = str(exc).lower()
+
+    # Network / SDK-level transient signals
+    transient_markers = (
+        "timeout", "timed out", "connection reset", "connection aborted",
+        "temporarily unavailable", "deadline exceeded",
+        "internal error", "service unavailable", "bad gateway",
+    )
+    if any(marker in msg for marker in transient_markers):
+        return True
+
+    # Try to extract numeric HTTP status code from the error message
+    for code in _RETRYABLE_HTTP_CODES:
+        if str(code) in msg:
+            return True
+
+    return False
 
 from services.agent.config import LLMConfig
 from services.agent.llm.base import (
@@ -27,7 +61,10 @@ class GeminiProvider(LLMProvider):
 
     def __init__(self, config: LLMConfig):
         self._config = config
-        self._client = genai.Client(api_key=config.api_key)
+        self._client = genai.Client(
+            api_key=config.api_key,
+            http_options={"timeout": 180_000},  # 180s timeout to prevent indefinite hangs
+        )
         self._model_name = config.model_name
         self._gen_config: types.GenerateContentConfig | None = None
 
@@ -63,8 +100,9 @@ class GeminiProvider(LLMProvider):
         if self._gen_config is None:
             raise RuntimeError("Provider not configured. Call configure() first.")
 
-        last_error = None
-        for attempt in range(self._config.max_retries + 1):
+        last_error: Exception | None = None
+        max_attempts = self._config.max_retries + 1
+        for attempt in range(max_attempts):
             try:
                 resp = self._client.models.generate_content(
                     model=self._model_name,
@@ -74,10 +112,31 @@ class GeminiProvider(LLMProvider):
                 return self._parse_response(resp)
             except Exception as e:
                 last_error = e
-                if attempt < self._config.max_retries:
-                    time.sleep(self._config.retry_delay * (attempt + 1))
-                    continue
-                raise last_error
+                # Logic errors (4xx other than 408/429) should fail fast.
+                if not _is_retryable_error(e):
+                    logger.warning(
+                        "Gemini generate() non-retryable error on attempt %d/%d: %s",
+                        attempt + 1, max_attempts, e,
+                    )
+                    raise
+                if attempt >= max_attempts - 1:
+                    logger.error(
+                        "Gemini generate() exhausted %d retries, last error: %s",
+                        max_attempts, e,
+                    )
+                    raise
+                # Exponential backoff with jitter, capped at 30s
+                base_delay = self._config.retry_delay * (2 ** attempt)
+                jitter = random.uniform(0, base_delay * 0.25)
+                sleep_for = min(base_delay + jitter, 30.0)
+                logger.warning(
+                    "Gemini generate() retryable error on attempt %d/%d (%s), sleeping %.1fs",
+                    attempt + 1, max_attempts, e, sleep_for,
+                )
+                time.sleep(sleep_for)
+        # Unreachable, but mypy/pyright wants it
+        assert last_error is not None
+        raise last_error
 
     def build_user_message(self, text: str) -> Any:
         return types.Content(role="user", parts=[types.Part(text=text)])

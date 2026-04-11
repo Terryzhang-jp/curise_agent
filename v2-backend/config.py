@@ -30,6 +30,9 @@ class Settings:
     # Kimi K2.5 (Moonshot) — preferred for agent tool calling (93% accuracy)
     MOONSHOT_API_KEY: str = os.getenv("MOONSHOT_API_KEY", "")
 
+    # DeepSeek — preferred for PDF extraction (fast, cheap, paid tier)
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+
     # Google Document AI (optional — for OCR extraction)
     DOCUMENT_AI_PROJECT_ID: str = os.getenv("DOCUMENT_AI_PROJECT_ID", "")
     DOCUMENT_AI_PROCESSOR_ID: str = os.getenv("DOCUMENT_AI_PROCESSOR_ID", "")
@@ -45,7 +48,7 @@ class Settings:
 
     # File uploads
     UPLOAD_DIR: str = os.path.join(os.path.dirname(__file__), "uploads")
-    MAX_UPLOAD_SIZE: int = 25 * 1024 * 1024  # 25 MB
+    MAX_UPLOAD_SIZE: int = 30 * 1024 * 1024  # 30 MB
 
     # Supabase Storage
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")

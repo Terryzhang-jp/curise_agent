@@ -33,7 +33,7 @@ class DeepSeekProvider(LLMProvider):
 
     def __init__(self, config: LLMConfig, base_url: str = _BASE_URL):
         self._config = config
-        self._client = OpenAI(api_key=config.api_key, base_url=base_url)
+        self._client = OpenAI(api_key=config.api_key, base_url=base_url, timeout=180.0)
         self._model = config.model_name
         self._thinking = "reasoner" in config.model_name
         self._system_prompt: str = ""

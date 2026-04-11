@@ -23,7 +23,10 @@ class LLMConfig:
     api_key: str = ""
     thinking_budget: int = 4096
     max_output_tokens: int = 65536
-    max_retries: int = 2
+    # Retries: 3 retries → up to 4 attempts. Combined with exponential backoff
+    # (1s, 2s, 4s, 8s + jitter) this tolerates ~15s of transient infra errors,
+    # which is the typical Gemini 500/503 burst window.
+    max_retries: int = 3
     retry_delay: float = 1.0
 
 

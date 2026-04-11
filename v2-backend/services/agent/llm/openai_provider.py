@@ -27,7 +27,7 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, config: LLMConfig):
         self._config = config
-        self._client = OpenAI(api_key=config.api_key)
+        self._client = OpenAI(api_key=config.api_key, timeout=180.0)
         self._model = config.model_name
         self._system_prompt: str = ""
         self._tools: list[dict] | None = None

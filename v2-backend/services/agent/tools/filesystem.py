@@ -1,6 +1,7 @@
-"""filesystem 组工具 — read_file + list_files + write_file + edit_file"""
+"""filesystem — consolidated manage_files tool (read/write/list/edit)"""
 
 import hashlib
+import json
 import os
 
 
@@ -9,86 +10,39 @@ def _compute_hash(content: str) -> str:
 
 
 def register(registry, ctx=None):
-    """注册 filesystem 组工具"""
+    """注册 manage_files 工具"""
     if ctx is None:
         from services.agent.tool_context import ToolContext
         ctx = ToolContext()
 
-    @registry.tool(
-        description=(
-            "Read the contents of a file. Supports offset and limit for reading "
-            "specific portions of large files. Returns file content with line numbers."
-        ),
-        parameters={
-            "file_path": {
-                "type": "STRING",
-                "description": "Path to the file to read",
-            },
-            "offset": {
-                "type": "NUMBER",
-                "description": "Line number to start reading from (0-based, default: 0)",
-                "required": False,
-            },
-            "limit": {
-                "type": "NUMBER",
-                "description": "Max number of lines to read (default: 200, max: 500)",
-                "required": False,
-            },
-        },
-        group="filesystem",
-    )
-    def read_file(file_path: str, offset: int = 0, limit: int = 200) -> str:
-        """读取文件内容，支持分页"""
-        try:
-            offset = int(offset)
-            limit = min(int(limit), 500)
+    # ── Internal helpers ──
 
+    def _read(file_path: str, offset: int = 0, limit: int = 200) -> str:
+        try:
+            offset, limit = int(offset), min(int(limit), 500)
             with open(file_path, "r", encoding="utf-8") as f:
                 all_lines = f.readlines()
-
             total = len(all_lines)
             if total == 0:
                 return f"文件 {file_path} 为空"
-
             if offset >= total:
                 return f"Error: offset ({offset}) exceeds total lines ({total})"
-
             end = min(offset + limit, total)
-            selected = all_lines[offset:end]
-
-            numbered = []
-            for i, line in enumerate(selected, start=offset + 1):
-                numbered.append(f"{i:>5}\t{line.rstrip()}")
-
+            numbered = [f"{i:>5}\t{line.rstrip()}" for i, line in enumerate(all_lines[offset:end], start=offset + 1)]
             result = "\n".join(numbered)
             if end < total:
                 result += f"\n\n[显示第 {offset+1}-{end} 行，共 {total} 行。使用 offset={end} 继续读取]"
-
             abs_path = os.path.abspath(file_path)
-            full_content = "".join(all_lines)
-            ctx.file_hashes[abs_path] = _compute_hash(full_content)
-
+            ctx.file_hashes[abs_path] = _compute_hash("".join(all_lines))
             return result
-
         except FileNotFoundError:
             return f"Error: file not found: {file_path}"
         except UnicodeDecodeError:
             return f"Error: file is not UTF-8 text: {file_path}"
         except Exception as e:
-            return f"Error: read_file failed: {e}"
+            return f"Error: read failed: {e}"
 
-    @registry.tool(
-        description="List files and subdirectories in a directory.",
-        parameters={
-            "directory": {
-                "type": "STRING",
-                "description": "Path to the directory to list",
-            }
-        },
-        group="filesystem",
-    )
-    def list_files(directory: str) -> str:
-        """列出目录中的文件"""
+    def _list(directory: str) -> str:
         try:
             entries = os.listdir(directory)
             if not entries:
@@ -99,116 +53,92 @@ def register(registry, ctx=None):
                 if os.path.isdir(full_path):
                     result += f"  [DIR]  {entry}/\n"
                 else:
-                    size = os.path.getsize(full_path)
-                    result += f"  [FILE] {entry} ({size} bytes)\n"
+                    result += f"  [FILE] {entry} ({os.path.getsize(full_path)} bytes)\n"
             return result
         except FileNotFoundError:
             return f"Error: directory not found: {directory}"
         except Exception as e:
-            return f"Error: list_files failed: {e}"
+            return f"Error: list failed: {e}"
 
-    @registry.tool(
-        description=(
-            "Write content to a file. Creates parent directories if needed. "
-            "Use this to create new files or overwrite existing ones."
-        ),
-        parameters={
-            "file_path": {
-                "type": "STRING",
-                "description": "Path to the file to write",
-            },
-            "content": {
-                "type": "STRING",
-                "description": "Content to write to the file",
-            },
-        },
-        group="filesystem",
-    )
-    def write_file(file_path: str, content: str) -> str:
-        """创建或覆盖写入文件"""
+    def _write(file_path: str, content: str) -> str:
         try:
             abs_path = os.path.abspath(file_path)
-            parent = os.path.dirname(abs_path)
-            os.makedirs(parent, exist_ok=True)
-
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
-
             ctx.file_hashes[abs_path] = _compute_hash(content)
-
             n_lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-            size = len(content.encode("utf-8"))
-            return f"已写入 {file_path} ({n_lines} 行, {size} bytes)"
-
+            return f"已写入 {file_path} ({n_lines} 行, {len(content.encode('utf-8'))} bytes)"
         except Exception as e:
-            return f"Error: write_file failed: {e}"
+            return f"Error: write failed: {e}"
 
-    @registry.tool(
-        description=(
-            "Edit a file by replacing an exact string with a new string (str_replace). "
-            "You MUST read_file first before editing. The old_string must appear exactly "
-            "once in the file. Provide enough context lines to make old_string unique."
-        ),
-        parameters={
-            "file_path": {
-                "type": "STRING",
-                "description": "Path to the file to edit",
-            },
-            "old_string": {
-                "type": "STRING",
-                "description": "The exact string to find and replace (must be unique in the file)",
-            },
-            "new_string": {
-                "type": "STRING",
-                "description": "The replacement string",
-            },
-        },
-        group="filesystem",
-    )
-    def edit_file(file_path: str, old_string: str, new_string: str) -> str:
-        """str_replace 模式编辑文件"""
+    def _edit(file_path: str, old_string: str, new_string: str) -> str:
         try:
             abs_path = os.path.abspath(file_path)
-
             if abs_path not in ctx.file_hashes:
-                return "Error: must read_file before editing."
-
+                return "Error: must read file before editing (use action=read first)."
             if not os.path.exists(abs_path):
                 return f"Error: file not found: {file_path}"
-
             with open(abs_path, "r", encoding="utf-8") as f:
                 content = f.read()
-
-            current_hash = _compute_hash(content)
-            if current_hash != ctx.file_hashes[abs_path]:
-                return "Error: file was modified externally, please read_file again."
-
+            if _compute_hash(content) != ctx.file_hashes[abs_path]:
+                return "Error: file was modified externally, please read again."
             count = content.count(old_string)
             if count == 0:
-                return "Error: old_string not found. Ensure exact match including whitespace and newlines."
+                return "Error: old_string not found."
             if count > 1:
-                return f"Error: found {count} matches, provide more context to make old_string unique."
-
+                return f"Error: {count} matches found, provide more context."
             new_content = content.replace(old_string, new_string, 1)
-
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
             ctx.file_hashes[abs_path] = _compute_hash(new_content)
-
-            pos = content.index(old_string)
-            line_num = content[:pos].count("\n") + 1
-            old_lines = old_string.count("\n") + 1
-            new_lines = new_string.count("\n") + 1
-
-            summary = f"已编辑 {file_path} (第 {line_num} 行附近)\n"
-            summary += f"  替换: {old_lines} 行 → {new_lines} 行\n"
-
-            old_preview = old_string[:100] + ("..." if len(old_string) > 100 else "")
-            new_preview = new_string[:100] + ("..." if len(new_string) > 100 else "")
-            summary += f"  - {repr(old_preview)}\n"
-            summary += f"  + {repr(new_preview)}"
-
-            return summary
-
+            line_num = content[:content.index(old_string)].count("\n") + 1
+            return f"已编辑 {file_path} (第 {line_num} 行)"
         except Exception as e:
-            return f"Error: edit_file failed: {e}"
+            return f"Error: edit failed: {e}"
+
+    # ── Consolidated tool ──
+
+    @registry.tool(
+        description=(
+            "文件操作工具。通过 action 参数选择操作:\n"
+            "- read: 读取文件内容 (fields: file_path, offset=0, limit=200)\n"
+            "- list: 列出目录内容 (fields: directory)\n"
+            "- write: 创建/覆盖写入文件 (fields: file_path, content)\n"
+            "- edit: str_replace 编辑 (fields: file_path, old_string, new_string)。编辑前必须先 read。\n\n"
+            "示例:\n"
+            '  manage_files(action="read", fields=\'{"file_path": "output.py"}\')\n'
+            '  manage_files(action="list", fields=\'{"directory": "."}\')\n'
+            '  manage_files(action="write", fields=\'{"file_path": "out.txt", "content": "hello"}\')\n'
+            '  manage_files(action="edit", fields=\'{"file_path": "x.py", "old_string": "foo", "new_string": "bar"}\')'
+        ),
+        parameters={
+            "action": {
+                "type": "STRING",
+                "description": "操作类型: read | list | write | edit",
+            },
+            "fields": {
+                "type": "STRING",
+                "description": "JSON 格式参数 (file_path, content, old_string, new_string, directory, offset, limit)",
+            },
+        },
+        group="filesystem",
+    )
+    def manage_files(action: str = "", fields: str = "{}") -> str:
+        if not action:
+            return "Error: 需要 action"
+        try:
+            p = json.loads(fields) if fields else {}
+        except (json.JSONDecodeError, TypeError):
+            p = {}
+
+        if action == "read":
+            return _read(p.get("file_path", ""), p.get("offset", 0), p.get("limit", 200))
+        elif action == "list":
+            return _list(p.get("directory", "."))
+        elif action == "write":
+            return _write(p.get("file_path", ""), p.get("content", ""))
+        elif action == "edit":
+            return _edit(p.get("file_path", ""), p.get("old_string", ""), p.get("new_string", ""))
+        else:
+            return f"Error: 未知 action '{action}'。支持: read, list, write, edit"

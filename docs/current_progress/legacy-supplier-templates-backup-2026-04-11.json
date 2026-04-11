@@ -1,0 +1,493 @@
+{
+  "backed_up_at": "2026-04-11T05:45:40.615383",
+  "supabase_url": "https://xadqiqxwzkeygndcvexz.supabase.co",
+  "legacy_count": 4,
+  "production_count": 3,
+  "legacy_templates": [
+    {
+      "id": 4,
+      "supplier_id": null,
+      "template_name": "日本询价单模版",
+      "template_file_url": "templates/template_9ee95801_template.xlsx",
+      "field_positions": {
+        "ship_name": {
+          "position": "A2",
+          "data_type": "string",
+          "description": "船名"
+        },
+        "supplier_name": {
+          "position": "A4",
+          "data_type": "string",
+          "description": "サプライヤー名"
+        },
+        "order_date": {
+          "position": "K4",
+          "data_type": "string",
+          "description": "注文日"
+        },
+        "supplier_contact": {
+          "position": "A5",
+          "data_type": "string",
+          "description": "サプライヤー担当者"
+        },
+        "invoice_number": {
+          "position": "K5",
+          "data_type": "string",
+          "description": "請求書番号"
+        },
+        "supplier_address": {
+          "position": "A6",
+          "data_type": "string",
+          "description": "サプライヤー住所"
+        },
+        "voyage": {
+          "position": "K6",
+          "data_type": "string",
+          "description": "航次"
+        },
+        "supplier_tel": {
+          "position": "A7",
+          "data_type": "string",
+          "description": "サプライヤー電話番号"
+        },
+        "supplier_email": {
+          "position": "A8",
+          "data_type": "string",
+          "description": "サプライヤーEメール"
+        },
+        "delivery_date": {
+          "position": "H8",
+          "data_type": "string",
+          "description": "納期"
+        },
+        "delivery_time_notes": {
+          "position": "K8",
+          "data_type": "string",
+          "description": "配送時間備考"
+        },
+        "delivery_address": {
+          "position": "H9",
+          "data_type": "string",
+          "description": "配送先住所"
+        },
+        "delivery_company_name": {
+          "position": "H10",
+          "data_type": "string",
+          "description": "配送先会社名"
+        },
+        "delivery_contact": {
+          "position": "H11",
+          "data_type": "string",
+          "description": "配送先担当者"
+        },
+        "ship_name_full": {
+          "position": "I12",
+          "data_type": "string",
+          "description": "船名（詳細）"
+        },
+        "company_name": {
+          "position": "A13",
+          "data_type": "string",
+          "description": "会社名"
+        },
+        "payment_date": {
+          "position": "H13",
+          "data_type": "string",
+          "description": "支払期日"
+        },
+        "company_zip_code": {
+          "position": "A14",
+          "data_type": "string",
+          "description": "会社郵便番号"
+        },
+        "payment_method": {
+          "position": "H14",
+          "data_type": "string",
+          "description": "支払方法"
+        },
+        "company_address": {
+          "position": "A15",
+          "data_type": "string",
+          "description": "会社住所"
+        },
+        "company_contact": {
+          "position": "H15",
+          "data_type": "string",
+          "description": "会社担当者"
+        },
+        "company_tel": {
+          "position": "A16",
+          "data_type": "string",
+          "description": "会社電話番号"
+        },
+        "company_fax": {
+          "position": "A17",
+          "data_type": "string",
+          "description": "会社FAX番号"
+        },
+        "company_email": {
+          "position": "A18",
+          "data_type": "string",
+          "description": "会社Eメール"
+        }
+      },
+      "has_product_table": true,
+      "product_table_config": {
+        "start_row": 22,
+        "columns": {
+          "A": "line_number",
+          "B": "po_number",
+          "C": "product_code",
+          "D": "product_name_en",
+          "E": "product_name_jp",
+          "F": "description",
+          "H": "quantity",
+          "I": "unit",
+          "J": "unit_price",
+          "K": "currency"
+        },
+        "formula_columns": [
+          "L"
+        ]
+      },
+      "created_by": 1,
+      "created_at": "2026-03-01T13:02:20.148044",
+      "updated_at": "2026-03-21T00:54:15.614069",
+      "country_id": 9,
+      "supplier_ids": [
+        1,
+        7,
+        9,
+        10,
+        29,
+        5,
+        14,
+        13,
+        8,
+        4,
+        2,
+        11,
+        6,
+        12,
+        3,
+        30,
+        28
+      ],
+      "order_format_template_id": null,
+      "field_mapping_metadata": {
+        "items": [],
+        "annotations": {
+          "J22": "小数点后面两位",
+          "A2": "这个地方 前面是船名 后面是港口名"
+        }
+      },
+      "template_styles": null
+    },
+    {
+      "id": 5,
+      "supplier_id": null,
+      "template_name": "日本订单2",
+      "template_file_url": "templates/template_3332f9cd_template.xlsx",
+      "field_positions": {
+        "ship_name": {
+          "position": "A2",
+          "data_type": "string",
+          "description": "船名"
+        },
+        "supplier_name": {
+          "position": "A4",
+          "data_type": "string",
+          "description": "供应商名称"
+        },
+        "order_date": {
+          "position": "K4",
+          "data_type": "string",
+          "description": "订单日期"
+        },
+        "supplier_contact": {
+          "position": "A5",
+          "data_type": "string",
+          "description": "供应商担当者"
+        },
+        "invoice_number": {
+          "position": "K5",
+          "data_type": "string",
+          "description": "发票编号"
+        },
+        "supplier_address": {
+          "position": "A6",
+          "data_type": "string",
+          "description": "供应商地址"
+        },
+        "voyage": {
+          "position": "K6",
+          "data_type": "string",
+          "description": "航次"
+        },
+        "supplier_tel": {
+          "position": "A7",
+          "data_type": "string",
+          "description": "供应商电话"
+        },
+        "supplier_email": {
+          "position": "A8",
+          "data_type": "string",
+          "description": "供应商邮箱"
+        },
+        "delivery_date": {
+          "position": "H8",
+          "data_type": "string",
+          "description": "交货日期"
+        },
+        "delivery_time_notes": {
+          "position": "K8",
+          "data_type": "string",
+          "description": "交货时间备注"
+        },
+        "delivery_address": {
+          "position": "H9",
+          "data_type": "string",
+          "description": "配送地址"
+        },
+        "destination": {
+          "position": "H10",
+          "data_type": "string",
+          "description": "配送目的地"
+        },
+        "delivery_contact": {
+          "position": "H11",
+          "data_type": "string",
+          "description": "配送联系人"
+        },
+        "ship_name_alt": {
+          "position": "I12",
+          "data_type": "string",
+          "description": "船名备注"
+        },
+        "payment_date": {
+          "position": "H13",
+          "data_type": "string",
+          "description": "付款日期/条件"
+        },
+        "payment_method": {
+          "position": "H14",
+          "data_type": "string",
+          "description": "付款方式"
+        }
+      },
+      "has_product_table": true,
+      "product_table_config": {
+        "start_row": 22,
+        "columns": {
+          "A": "line_number",
+          "B": "po_number",
+          "C": "product_code",
+          "D": "product_name_en",
+          "E": "product_name_jp",
+          "F": "description",
+          "H": "quantity",
+          "I": "unit",
+          "J": "unit_price",
+          "K": "currency",
+          "L": "item_amount"
+        },
+        "formula_columns": [
+          "L"
+        ]
+      },
+      "created_by": 1,
+      "created_at": "2026-03-04T02:08:59.398207",
+      "updated_at": "2026-03-13T01:31:21.090844",
+      "country_id": 9,
+      "supplier_ids": [
+        1,
+        7,
+        29
+      ],
+      "order_format_template_id": null,
+      "field_mapping_metadata": {
+        "items": [],
+        "annotations": {
+          "H16": "小数点之后两位"
+        }
+      },
+      "template_styles": null
+    },
+    {
+      "id": 7,
+      "supplier_id": null,
+      "template_name": "泰国订单模板",
+      "template_file_url": "/uploads/template_7f6f28ec_（2026年2月10日）TW Mar.6 Bangkok.xlsx",
+      "field_positions": {
+        "po_number": {
+          "position": "B2",
+          "data_type": "string",
+          "description": "po_number"
+        },
+        "ship_name": {
+          "position": "C2",
+          "data_type": "string",
+          "description": "ship_name"
+        },
+        "delivery_date": {
+          "position": "D2",
+          "data_type": "string",
+          "description": "delivery_date"
+        },
+        "supplier_name": {
+          "position": "E2",
+          "data_type": "string",
+          "description": "supplier_name"
+        },
+        "vendor_name": {
+          "position": "E2",
+          "data_type": "string",
+          "description": "vendor_name"
+        }
+      },
+      "has_product_table": true,
+      "product_table_config": {
+        "start_row": 2,
+        "columns": {
+          "A": "line_number",
+          "B": "po_number",
+          "G": "product_code",
+          "H": "product_name_en",
+          "I": "quantity",
+          "J": "unit",
+          "K": "description"
+        },
+        "formula_columns": []
+      },
+      "created_by": 1,
+      "created_at": "2026-03-10T06:22:26.529162",
+      "updated_at": "2026-03-10T06:22:26.529166",
+      "country_id": 12,
+      "supplier_ids": [
+        27
+      ],
+      "order_format_template_id": null,
+      "field_mapping_metadata": null,
+      "template_styles": null
+    },
+    {
+      "id": 9,
+      "supplier_id": null,
+      "template_name": "松武注文サンプル",
+      "template_file_url": "/uploads/template_7dabb183_01★松武 注文書0316横浜 (0303更新) .xlsx",
+      "field_positions": {
+        "ship_name": {
+          "position": "G2",
+          "data_type": "string",
+          "description": "船名"
+        },
+        "supplier_name": {
+          "position": "A3",
+          "data_type": "string",
+          "description": "供应商名称"
+        },
+        "order_date": {
+          "position": "K3",
+          "data_type": "string",
+          "description": "订单日期"
+        },
+        "supplier_zip_code": {
+          "position": "A4",
+          "data_type": "string",
+          "description": "供应商邮编"
+        },
+        "po_number": {
+          "position": "L4",
+          "data_type": "string",
+          "description": "订单编号"
+        },
+        "supplier_address": {
+          "position": "A5",
+          "data_type": "string",
+          "description": "供应商地址"
+        },
+        "invoice_number": {
+          "position": "K5",
+          "data_type": "string",
+          "description": "发票编号"
+        },
+        "supplier_tel": {
+          "position": "A6",
+          "data_type": "string",
+          "description": "供应商电话"
+        },
+        "supplier_fax": {
+          "position": "A7",
+          "data_type": "string",
+          "description": "供应商传真"
+        },
+        "delivery_date": {
+          "position": "I7",
+          "data_type": "string",
+          "description": "交货日期"
+        },
+        "delivery_status": {
+          "position": "K7",
+          "data_type": "string",
+          "description": "确认状态"
+        },
+        "delivery_address": {
+          "position": "I8",
+          "data_type": "string",
+          "description": "配送地址"
+        },
+        "delivery_time_notes": {
+          "position": "I9",
+          "data_type": "string",
+          "description": "配送备注"
+        },
+        "payment_date": {
+          "position": "I10",
+          "data_type": "string",
+          "description": "付款期限"
+        },
+        "payment_method": {
+          "position": "I11",
+          "data_type": "string",
+          "description": "付款方式"
+        }
+      },
+      "has_product_table": true,
+      "product_table_config": {
+        "start_row": 19,
+        "columns": {
+          "A": "line_number",
+          "B": "po_number",
+          "C": "product_code",
+          "D": "product_name_en",
+          "E": "product_name_jp",
+          "F": "description",
+          "H": "quantity",
+          "I": "unit",
+          "J": "currency",
+          "K": "unit_price",
+          "M": "item_amount",
+          "O": "adjusted_quantity",
+          "P": "adjusted_amount"
+        },
+        "formula_columns": [
+          "D",
+          "E",
+          "K",
+          "M",
+          "P"
+        ]
+      },
+      "created_by": 1,
+      "created_at": "2026-03-11T09:00:13.436725",
+      "updated_at": "2026-03-11T09:00:13.436729",
+      "country_id": 9,
+      "supplier_ids": [
+        2
+      ],
+      "order_format_template_id": null,
+      "field_mapping_metadata": null,
+      "template_styles": null
+    }
+  ]
+}

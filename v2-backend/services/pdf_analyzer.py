@@ -84,11 +84,11 @@ def _pdf_bytes_to_images(file_bytes: bytes, dpi: int = 200) -> list[Image.Image]
     return convert_from_bytes(file_bytes, dpi=dpi)
 
 
-def _parse_json_response(text: str) -> dict:
-    """Extract a JSON object from Gemini response text, handling markdown wrappers."""
+def _parse_json_response(text: str) -> dict | list:
+    """Extract a JSON object or array from Gemini response text, handling markdown wrappers."""
     text = text.strip()
 
-    def _try_parse(s: str) -> dict | None:
+    def _try_parse(s: str):
         try:
             return json.loads(s)
         except json.JSONDecodeError:
@@ -108,19 +108,34 @@ def _parse_json_response(text: str) -> dict:
     result = _try_parse(text)
     if result is not None:
         return result
-    # Try extracting from ```json ... ```
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        result = _try_parse(m.group(1))
+    # Try stripping markdown code block wrapper (most reliable method)
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")
+        # Find closing ``` and take everything between
+        end_idx = len(lines) - 1
+        for i in range(len(lines) - 1, 0, -1):
+            if lines[i].strip() == "```":
+                end_idx = i
+                break
+        inner = "\n".join(lines[1:end_idx])
+        result = _try_parse(inner)
         if result is not None:
             return result
-    # Try extracting first { ... }
+    # Try extracting first { ... } (object, greedy)
     m = re.search(r"(\{.*\})", text, re.DOTALL)
     if m:
         result = _try_parse(m.group(1))
         if result is not None:
             return result
-    raise ValueError("无法从 AI 响应中提取有效 JSON")
+    # Try extracting first [ ... ] (array, greedy)
+    m = re.search(r"(\[.*\])", text, re.DOTALL)
+    if m:
+        result = _try_parse(m.group(1))
+        if result is not None:
+            return result
+    preview = text[:300] + "..." if len(text) > 300 else text
+    raise ValueError(f"无法从 AI 响应中提取有效 JSON。原始输出前 300 字符: {preview}")
 
 
 def analyze_pdf_structure(file_bytes: bytes) -> dict:

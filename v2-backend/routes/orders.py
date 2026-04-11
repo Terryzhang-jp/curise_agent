@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import threading
-import uuid
 from datetime import datetime
 from queue import Empty
 
@@ -32,7 +31,21 @@ from models import Order, User, Country
 from routes.auth import get_current_user
 from security import require_role
 from schemas import OrderListItem, OrderDetail, OrderReviewRequest, OrderUpdateRequest, OrderRematchRequest
-from services.agent.stream_queue import get_or_create_queue, get_queue, remove_queue, push_event
+from services.agent.stream_queue import (
+    get_or_create_cancel_event,
+    get_or_create_queue,
+    get_queue,
+    push_event,
+    remove_cancel_event,
+    remove_queue,
+    set_cancelled,
+)
+from services.document_workflow import (
+    create_document_and_pending_order,
+    create_document_record,
+    create_pending_order_for_document,
+    run_document_pipeline,
+)
 
 # Write operations require non-finance roles
 require_writer = require_role("superadmin", "admin", "employee")
@@ -63,7 +76,7 @@ async def upload_order(
     current_user: User = Depends(require_writer),
     db: DBSession = Depends(get_db),
 ):
-    """Upload a file and create an order with automatic processing."""
+    """Upload a file and create an order through the document-first pipeline."""
     if not file.filename:
         raise HTTPException(400, "文件名不能为空")
 
@@ -72,37 +85,108 @@ async def upload_order(
         raise HTTPException(400, "仅支持 PDF 和 XLSX 文件")
 
     content = await file.read()
+    if not content:
+        raise HTTPException(400, "文件内容不能为空")
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(400, "文件大小不能超过 25 MB")
 
-    # Save file to Supabase Storage
-    safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
-    file_url = storage.upload("orders", safe_name, content)
-
     file_type = "pdf" if lower.endswith(".pdf") else "excel"
-
-    order = Order(
+    # Atomic: blob + document + order all in one compensated operation.
+    # If any step fails the blob is cleaned up and no DB rows remain.
+    document, order = create_document_and_pending_order(
+        db,
         user_id=current_user.id,
         filename=file.filename,
-        file_url=file_url,
+        content=content,
         file_type=file_type,
-        status="uploading",
+        content_type=file.content_type,
     )
-    db.add(order)
-    db.commit()
-    db.refresh(order)
 
-    # Launch background processing
     order_id = order.id
-    file_bytes = content
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _run_process_order, order_id, file_bytes)
+    loop.run_in_executor(None, run_document_pipeline, document.id, content, True, order_id)
 
     return order
 
 
+def _run_extract_only(order_id: int, file_bytes: bytes):
+    """Background: extract order data from PDF, then wait for Agent to match.
+
+    Old flow: extract → match → analyze (all automatic)
+    New flow: extract only → status="extracted" → Agent decides next steps
+    """
+    from database import SessionLocal
+    from models import Order
+    from services.order_processor import smart_extract, normalize_metadata, _validate_extraction
+    from services.product_normalizer import normalize_products
+    from sqlalchemy.orm.attributes import flag_modified
+    import copy, logging, time
+
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).get(order_id)
+        if not order:
+            return
+
+        order.status = "extracting"
+        db.commit()
+
+        start = time.time()
+        extracted = smart_extract(file_bytes, order.file_type or "pdf")
+        elapsed = time.time() - start
+
+        order.extraction_data = extracted
+        order.order_metadata = extracted.get("order_metadata")
+
+        raw_products = copy.deepcopy(extracted.get("products") or [])
+        order.products = normalize_products(raw_products)
+        order.product_count = len(order.products)
+
+        total_amount = (extracted.get("order_metadata") or {}).get("total_amount")
+        if total_amount is not None:
+            try:
+                order.total_amount = float(total_amount)
+            except (ValueError, TypeError):
+                pass
+
+        flag_modified(order, "extraction_data")
+        flag_modified(order, "order_metadata")
+        flag_modified(order, "products")
+
+        # Quality gate
+        warnings = _validate_extraction(order, extracted)
+        if warnings:
+            order.processing_error = "提取警告: " + "; ".join(warnings)
+
+        if order.product_count == 0:
+            order.status = "error"
+            order.processing_error = "提取失败: 未识别到任何产品"
+        else:
+            order.status = "extracted"
+            # Note: NOT "ready" — Agent needs to match products first
+
+        order.processed_at = None  # Will be set after matching
+        db.commit()
+        logger.info("Order %d: extraction done — %d products, %.1fs", order_id, order.product_count, elapsed)
+
+    except Exception as e:
+        logger.error("Order %d extraction failed: %s", order_id, e, exc_info=True)
+        db.rollback()
+        try:
+            order = db.query(Order).get(order_id)
+            if order:
+                order.status = "error"
+                order.processing_error = str(e)
+                db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+
+
 def _run_process_order(order_id: int, file_bytes: bytes):
-    """Wrapper for background thread execution."""
+    """Legacy: full auto processing (extract + match + analyze). Kept for backward compat."""
     from services.order_processor import process_order
     process_order(order_id, file_bytes)
 
@@ -221,6 +305,11 @@ def update_order(
                     order.total_amount = total
             except (ValueError, TypeError):
                 pass
+
+    if body.port_id is not None:
+        order.port_id = body.port_id
+    if body.country_id is not None:
+        order.country_id = body.country_id
 
     db.commit()
     db.refresh(order)
@@ -456,7 +545,7 @@ def anomaly_check(
 ):
     """Run anomaly detection on an order."""
     order = _get_order(db, order_id, current_user)
-    if order.status != "ready":
+    if order.status not in ("ready", "extracted"):
         raise HTTPException(400, "订单尚未处理完成")
 
     from services.order_processor import run_anomaly_check
@@ -478,7 +567,7 @@ def financial_analysis(
 ):
     """Run or re-run financial analysis on an order."""
     order = _get_order(db, order_id, current_user)
-    if order.status != "ready":
+    if order.status not in ("ready", "extracted"):
         raise HTTPException(400, "订单尚未处理完成")
     if not order.match_results:
         raise HTTPException(400, "没有匹配结果，无法进行财务分析")
@@ -531,9 +620,14 @@ def delivery_environment(
 
 class GenerateInquiryRequest(BaseModel):
     template_overrides: Optional[dict[int, Optional[int]]] = None
+    supplier_ids: Optional[list[int]] = None
 
 class GenerateInquirySingleRequest(BaseModel):
     template_id: Optional[int] = None
+
+
+class CancelInquiryRequest(BaseModel):
+    stream_key: Optional[str] = None
 
 @router.post("/{order_id}/generate-inquiry")
 def generate_inquiry(
@@ -556,19 +650,20 @@ def generate_inquiry(
         raise HTTPException(409, "询价单正在生成中，请稍候")
 
     get_or_create_queue(stream_key)
+    get_or_create_cancel_event(stream_key)
 
     threading.Thread(
         target=_run_inquiry_background,
-        args=(order_id, stream_key, body.template_overrides),
+        args=(order_id, stream_key, body.template_overrides, body.supplier_ids),
         daemon=True,
     ).start()
 
     return {"status": "generating", "stream_key": stream_key}
 
 
-def _run_inquiry_background(order_id: int, stream_key: str, template_overrides=None):
+def _run_inquiry_background(order_id: int, stream_key: str, template_overrides=None, supplier_ids=None):
     """Background thread: run inquiry orchestrator and save results."""
-    from services.inquiry_agent import run_inquiry_orchestrator
+    from services.inquiry_agent import InquiryCancelledError, run_inquiry_orchestrator
 
     db = SessionLocal()
     try:
@@ -578,31 +673,41 @@ def _run_inquiry_background(order_id: int, stream_key: str, template_overrides=N
             push_event(stream_key, {"type": "error", "message": "订单不存在"})
             return
 
-        inquiry_data = run_inquiry_orchestrator(order, db, stream_key, template_overrides)
+        inquiry_data = run_inquiry_orchestrator(
+            order,
+            db,
+            stream_key,
+            template_overrides,
+            supplier_ids=supplier_ids,
+        )
 
         order.inquiry_data = inquiry_data
+        cancel_event = get_or_create_cancel_event(stream_key)
         # Auto-advance fulfillment status to inquiry_sent
-        if order.fulfillment_status == "pending":
+        if order.fulfillment_status == "pending" and not cancel_event.is_set():
             order.fulfillment_status = "inquiry_sent"
         db.commit()
         logger.info("Inquiry: Order %d saved, %d files generated",
                      order_id, len(inquiry_data.get("generated_files", [])))
 
         # Push done only after DB commit succeeds
-        push_event(stream_key, {"type": "done", "data": inquiry_data})
+        if not cancel_event.is_set():
+            push_event(stream_key, {"type": "done", "data": inquiry_data})
+    except InquiryCancelledError:
+        db.rollback()
     except Exception as e:
         logger.error("Inquiry: Order %d failed: %s", order_id, str(e), exc_info=True)
         db.rollback()
         try:
             order = db.query(Order).get(order_id)
             if order:
-                order.status = "error"
                 order.processing_error = f"询价生成失败: {str(e)}"
                 db.commit()
         except Exception:
             db.rollback()
         push_event(stream_key, {"type": "error", "message": str(e)})
     finally:
+        remove_cancel_event(stream_key)
         db.close()
 
 
@@ -633,7 +738,7 @@ async def inquiry_stream(
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
             event_type = event.get("type", "")
-            if event_type in ("done", "error"):
+            if event_type in ("done", "error", "cancelled"):
                 remove_queue(stream_key)
                 return
 
@@ -683,6 +788,7 @@ def generate_inquiry_single(
         raise HTTPException(409, "该供应商询价单正在生成中")
 
     get_or_create_queue(stream_key)
+    get_or_create_cancel_event(stream_key)
 
     threading.Thread(
         target=_run_inquiry_single_background,
@@ -693,9 +799,25 @@ def generate_inquiry_single(
     return {"status": "generating", "stream_key": stream_key, "supplier_id": supplier_id}
 
 
+@router.post("/{order_id}/cancel-inquiry")
+def cancel_inquiry(
+    order_id: int,
+    body: CancelInquiryRequest = CancelInquiryRequest(),
+    current_user: User = Depends(require_writer),
+    db: DBSession = Depends(get_db),
+):
+    """Cancel an ongoing inquiry generation run for an order or a single supplier."""
+    _get_order(db, order_id, current_user)
+
+    stream_key = body.stream_key or f"inquiry-{order_id}"
+    set_cancelled(stream_key)
+    push_event(stream_key, {"type": "cancelled", "message": "询价生成已停止"})
+    return {"status": "cancelled", "stream_key": stream_key}
+
+
 def _run_inquiry_single_background(order_id: int, supplier_id: int, stream_key: str, template_id=None):
     """Background thread: run single supplier inquiry and merge result into order."""
-    from services.inquiry_agent import run_inquiry_single_supplier
+    from services.inquiry_agent import InquiryCancelledError, run_inquiry_single_supplier
 
     db = SessionLocal()
     try:
@@ -724,13 +846,18 @@ def _run_inquiry_single_background(order_id: int, supplier_id: int, stream_key: 
         flag_modified(order, "inquiry_data")
         db.commit()
 
-        push_event(stream_key, {"type": "done", "data": result})
+        cancel_event = get_or_create_cancel_event(stream_key)
+        if not cancel_event.is_set():
+            push_event(stream_key, {"type": "done", "data": result})
+    except InquiryCancelledError:
+        db.rollback()
     except Exception as e:
         logger.error("Inquiry single supplier %d for order %d failed: %s",
                      supplier_id, order_id, str(e), exc_info=True)
         db.rollback()
         push_event(stream_key, {"type": "error", "message": str(e)})
     finally:
+        remove_cancel_event(stream_key)
         db.close()
 
 
@@ -851,7 +978,7 @@ def inquiry_readiness(
     user attention, and an overall summary. This is the single source of truth
     for the frontend's inquiry tab rendering.
     """
-    from services.inquiry_agent import resolve_template, _build_order_data_for_engine
+    from services.inquiry_agent import select_template, _build_order_data_for_engine
     from services.field_schema import analyze_gaps, schema_from_zone_config
     from models import SupplierTemplate
     import sqlalchemy
@@ -893,7 +1020,7 @@ def inquiry_readiness(
         info = supplier_rows.get(sid, {"name": f"供应商 #{sid}", "contact": "", "email": "", "phone": ""})
 
         # Template resolution
-        template, method, candidates = resolve_template(sid, all_templates)
+        template, method, candidates = select_template(sid, all_templates)
 
         # Check for user template override in inquiry_data
         existing_entry = existing_suppliers.get(sid_str, {})
@@ -932,10 +1059,13 @@ def inquiry_readiness(
                 status = "ready"  # only warnings, can still generate
                 total_ready += 1
         else:
-            # No field_schema — can still generate via LLM path, but flag it
-            gap_report = {"gaps": [], "summary": {"total": 0, "resolved": 0, "warnings": 0, "blocking": 0}, "ready": True}
-            status = "ready"
-            total_ready += 1
+            gap_report = {
+                "gaps": [],
+                "summary": {"total": 0, "resolved": 0, "warnings": 0, "blocking": 1},
+                "ready": False,
+            }
+            status = "blocked"
+            total_blocked += 1
 
         # Compute subtotal
         subtotal = 0.0
@@ -965,13 +1095,17 @@ def inquiry_readiness(
                 "name": template_name,
                 "method": method,
                 "has_zone_config": has_zone_config,
+                "candidate_count": len(candidates),
             },
             "gaps": gap_report["gaps"],
             "gap_summary": gap_report["summary"],
             "file": existing_entry.get("file"),
             "verify_results": existing_entry.get("verify_results"),
             "elapsed_seconds": existing_entry.get("elapsed_seconds"),
-            "error": existing_entry.get("error"),
+            "error": existing_entry.get("error") or (
+                "当前供应商没有已上架的 zone_config 模板，无法生成询价单"
+                if not template else None
+            ),
         }
 
     return {
@@ -1000,8 +1134,9 @@ def inquiry_data_preview(
     Returns structured preview of header fields (with resolved values),
     product data summary, and any warnings — without generating the actual Excel.
     """
-    from services.inquiry_agent import resolve_template, _build_order_data_for_engine
-    from services.template_engine import _resolve_path, _resolve_product_field
+    from services.inquiry_agent import select_template, _build_order_data_for_engine
+    from services.field_schema import _resolve_path
+    from services.template_engine_legacy import _resolve_product_field
     from models import SupplierTemplate
     import sqlalchemy
 
@@ -1031,11 +1166,14 @@ def inquiry_data_preview(
 
     # Resolve template
     all_templates = db.query(SupplierTemplate).all()
-    if template_id:
-        template = db.query(SupplierTemplate).filter(SupplierTemplate.id == template_id).first()
-        method = "user_selected"
-    else:
-        template, method, _ = resolve_template(supplier_id, all_templates)
+    try:
+        template, method, candidates = select_template(
+            supplier_id,
+            all_templates,
+            template_id_override=template_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Build order_data (same as generation pipeline)
     order_meta = order.order_metadata or {}
@@ -1115,7 +1253,8 @@ def inquiry_data_preview(
         formula_cols = list(zone_config.get("product_row_formulas", {}).keys())
         summary_formulas = zone_config.get("summary_formulas", [])
     else:
-        # No zone_config — still show product data in generic format
+        # No production template — still show raw product data for inspection,
+        # but make the block reason explicit so generation stays deterministic.
         formula_cols = []
         summary_formulas = []
         engine_products = order_data.get("suppliers", {}).get(sid, {}).get("products", [])
@@ -1129,7 +1268,12 @@ def inquiry_data_preview(
                 "unit_price": p.get("unit_price"),
                 "pack_size": p.get("pack_size", ""),
             })
-        warnings.append("该供应商没有绑定的模板配置，将使用 LLM 模式生成")
+        if candidates:
+            warnings.append(
+                f"当前无精确模板绑定，将使用候选模板自动选择逻辑；候选数: {len(candidates)}"
+            )
+        else:
+            warnings.append("当前供应商没有已上架的 zone_config 模板，无法生成询价单")
 
     # Data completeness warnings
     missing_vals = sum(1 for h in header_fields if h["value"] is None)

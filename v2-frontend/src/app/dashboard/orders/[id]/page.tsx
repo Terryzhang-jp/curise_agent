@@ -10,6 +10,7 @@ import {
   runFinancialAnalysis,
   fetchDeliveryEnvironment,
   startGenerateInquiry,
+  cancelGenerateInquiry,
   streamInquiryProgress,
   startGenerateInquirySingleSupplier,
   streamInquiryProgressWithKey,
@@ -22,12 +23,16 @@ import {
   updateOrder,
   rematchOrder,
   downloadOrderFile,
+  getPortsList,
+  getCountriesList,
   type Order,
   type OrderStatus,
   type OrderProduct,
   type InquiryStep,
   type FulfillmentStatus,
   type DeliveryEnvironment,
+  type PortItem,
+  type CountryItem,
 } from "@/lib/orders-api";
 import { StatusBadge, ReviewedBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -125,7 +130,13 @@ export default function OrderDetailPage() {
   const [isEditing, setIsEditing] = useState(false);
   const [editedMetadata, setEditedMetadata] = useState<Record<string, string>>({});
   const [editedProducts, setEditedProducts] = useState<OrderProduct[]>([]);
+  const [editedPortId, setEditedPortId] = useState<number | null>(null);
+  const [editedCountryId, setEditedCountryId] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // Ports / countries for geo selector
+  const [portsList, setPortsList] = useState<PortItem[]>([]);
+  const [countriesList, setCountriesList] = useState<CountryItem[]>([]);
 
   // Add meta field dialog
   const [showAddFieldDialog, setShowAddFieldDialog] = useState(false);
@@ -142,6 +153,8 @@ export default function OrderDetailPage() {
 
   // Inquiry streaming
   const [inquiryGenerating, setInquiryGenerating] = useState(false);
+  const [inquiryStopping, setInquiryStopping] = useState(false);
+  const [activeInquiryStreamKey, setActiveInquiryStreamKey] = useState<string | null>(null);
   const [inquirySteps, setInquirySteps] = useState<InquiryStep[]>([]);
   const abortInquiryRef = useRef<(() => void) | null>(null);
 
@@ -160,6 +173,9 @@ export default function OrderDetailPage() {
 
   useEffect(() => {
     fetchOrder();
+    // Load ports and countries for geo editing
+    getPortsList().then(setPortsList);
+    getCountriesList().then(setCountriesList);
   }, [fetchOrder]);
 
   // Polling
@@ -211,6 +227,14 @@ export default function OrderDetailPage() {
     }
   };
 
+  function resetInquiryRun() {
+    setInquiryGenerating(false);
+    setInquiryStopping(false);
+    setActiveInquiryStreamKey(null);
+    setInquirySteps([]);
+    abortInquiryRef.current = null;
+  }
+
   // Core metadata fields — always shown in edit mode even if null
   const CORE_META_KEYS = [
     "po_number", "ship_name", "vendor_name", "delivery_date",
@@ -240,6 +264,8 @@ export default function OrderDetailPage() {
     }
     setEditedMetadata(metaStrings);
     setEditedProducts(JSON.parse(JSON.stringify(order.products || [])));
+    setEditedPortId(order.port_id ?? null);
+    setEditedCountryId(order.country_id ?? null);
     setIsEditing(true);
   }
 
@@ -247,6 +273,8 @@ export default function OrderDetailPage() {
     setIsEditing(false);
     setEditedMetadata({});
     setEditedProducts([]);
+    setEditedPortId(null);
+    setEditedCountryId(null);
   }
 
   async function saveEdits() {
@@ -276,6 +304,8 @@ export default function OrderDetailPage() {
       const updated = await updateOrder(order.id, {
         order_metadata: cleanMeta,
         products: editedProducts,
+        port_id: editedPortId ?? undefined,
+        country_id: editedCountryId ?? undefined,
       });
       setOrder(updated);
       setIsEditing(false);
@@ -289,13 +319,19 @@ export default function OrderDetailPage() {
   }
 
   // Inquiry streaming handler
-  async function handleGenerateInquiry(templateOverrides?: Record<number, number | null>) {
+  async function handleGenerateInquiry(
+    templateOverrides?: Record<number, number | null>,
+    supplierIds?: number[],
+  ) {
     if (!order) return;
     setInquiryGenerating(true);
+    setInquiryStopping(false);
     setInquirySteps([]);
+    setActiveTab("inquiry");
 
     try {
-      await startGenerateInquiry(orderId, templateOverrides);
+      const { stream_key } = await startGenerateInquiry(orderId, templateOverrides, supplierIds);
+      setActiveInquiryStreamKey(stream_key);
 
       const abort = streamInquiryProgress(
         orderId,
@@ -305,18 +341,22 @@ export default function OrderDetailPage() {
         async () => {
           // Done — refresh order data
           await fetchOrder();
-          setInquiryGenerating(false);
-          setInquirySteps([]);
+          resetInquiryRun();
           toast.success("询价单生成完成");
         },
         (err) => {
-          setInquiryGenerating(false);
-          toast.error(err.message || "询价单生成失败");
+          const message = err.message || "询价单生成失败";
+          resetInquiryRun();
+          if (message.includes("已停止") || message.includes("已取消")) {
+            toast.success("询价生成已停止");
+          } else {
+            toast.error(message);
+          }
         }
       );
       abortInquiryRef.current = abort;
     } catch (err) {
-      setInquiryGenerating(false);
+      resetInquiryRun();
       toast.error(err instanceof Error ? err.message : "启动询价单生成失败");
     }
   }
@@ -325,10 +365,13 @@ export default function OrderDetailPage() {
   async function handleRedoSupplier(supplierId: number, templateId?: number) {
     if (!order) return;
     setInquiryGenerating(true);
+    setInquiryStopping(false);
     setInquirySteps([]);
+    setActiveTab("inquiry");
 
     try {
       const { stream_key } = await startGenerateInquirySingleSupplier(orderId, supplierId, templateId);
+      setActiveInquiryStreamKey(stream_key);
 
       // SSE with supplier-specific stream_key
       const abort = streamInquiryProgressWithKey(
@@ -339,21 +382,36 @@ export default function OrderDetailPage() {
         },
         async () => {
           await fetchOrder();
-          setInquiryGenerating(false);
-          setInquirySteps([]);
+          resetInquiryRun();
           toast.success(`供应商 #${supplierId} 询价单重新生成完成`);
         },
         (err) => {
-          setInquiryGenerating(false);
-          toast.error(err.message || "重新生成失败");
+          const message = err.message || "重新生成失败";
+          resetInquiryRun();
+          if (message.includes("已停止") || message.includes("已取消")) {
+            toast.success("询价生成已停止");
+          } else {
+            toast.error(message);
+          }
         }
       );
       abortInquiryRef.current = abort;
     } catch (err) {
-      setInquiryGenerating(false);
+      resetInquiryRun();
       toast.error(err instanceof Error ? err.message : "启动重新生成失败");
     }
   }
+
+  const cancelInquiryRun = useCallback(async () => {
+    if (!order || !activeInquiryStreamKey || inquiryStopping) return;
+    setInquiryStopping(true);
+    try {
+      await cancelGenerateInquiry(order.id, activeInquiryStreamKey);
+    } catch (err) {
+      setInquiryStopping(false);
+      toast.error(err instanceof Error ? err.message : "停止失败");
+    }
+  }, [activeInquiryStreamKey, inquiryStopping, order]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -443,7 +501,8 @@ export default function OrderDetailPage() {
 
   const metadata = order.order_metadata || {};
   const isProcessing = PROCESSING_STATUSES.includes(order.status);
-  const isReady = order.status === "ready";
+  const isReady = order.status === "ready" || order.status === "extracted";
+  const hasInquiryWorkbench = Boolean(order.match_results?.length);
   const isError = order.status === "error";
   const canEdit = (isReady || isError) && !isEditing;
 
@@ -489,6 +548,15 @@ export default function OrderDetailPage() {
                   模板提取 ({order.template_match_method || "auto"})
                 </span>
               )}
+              {order.document_id ? (
+                <button
+                  type="button"
+                  className="text-primary hover:underline"
+                  onClick={() => router.push(`/dashboard/documents/${order.document_id}`)}
+                >
+                  查看源文档 #{order.document_id}
+                </button>
+              ) : null}
             </div>
           </div>
 
@@ -606,7 +674,12 @@ export default function OrderDetailPage() {
 
       {/* Inquiry generation progress */}
       {inquiryGenerating && (
-        <InquiryProgress steps={inquirySteps} order={order} />
+        <InquiryProgress
+          steps={inquirySteps}
+          order={order}
+          onCancel={cancelInquiryRun}
+          stopping={inquiryStopping}
+        />
       )}
 
       {/* Tabs */}
@@ -637,7 +710,7 @@ export default function OrderDetailPage() {
                   财务分析
                 </TabsTrigger>
               )}
-              {order.inquiry_data && (
+              {hasInquiryWorkbench && (
                 <TabsTrigger value="inquiry" className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none px-3 text-xs">
                   询价单
                 </TabsTrigger>
@@ -657,6 +730,12 @@ export default function OrderDetailPage() {
                 onUpdateMeta={updateMetaField}
                 onDeleteMeta={deleteMetaField}
                 onAddMeta={addMetaField}
+                portsList={portsList}
+                countriesList={countriesList}
+                editedPortId={editedPortId}
+                editedCountryId={editedCountryId}
+                onUpdatePort={setEditedPortId}
+                onUpdateCountry={setEditedCountryId}
               />
             </TabsContent>
             <TabsContent value="products" className="h-full m-0">
@@ -691,7 +770,15 @@ export default function OrderDetailPage() {
               )}
             </TabsContent>
             <TabsContent value="inquiry" className="h-full m-0">
-              {order.inquiry_data && <InquiryTab order={order} onRedoSupplier={handleRedoSupplier} onGenerateAll={handleGenerateInquiry} inquiryGenerating={inquiryGenerating} />}
+              {hasInquiryWorkbench && (
+                <InquiryTab
+                  order={order}
+                  onRedoSupplier={handleRedoSupplier}
+                  onGenerateAll={handleGenerateInquiry}
+                  inquiryGenerating={inquiryGenerating}
+                  inquiryStopping={inquiryStopping}
+                />
+              )}
             </TabsContent>
             <TabsContent value="fulfillment" className="h-full m-0">
               <FulfillmentTab order={order} />
@@ -818,6 +905,12 @@ function OverviewTab({
   onUpdateMeta,
   onDeleteMeta,
   onAddMeta,
+  portsList,
+  countriesList,
+  editedPortId,
+  editedCountryId,
+  onUpdatePort,
+  onUpdateCountry,
 }: {
   order: Order;
   isEditing: boolean;
@@ -825,6 +918,12 @@ function OverviewTab({
   onUpdateMeta: (key: string, value: string) => void;
   onDeleteMeta: (key: string) => void;
   onAddMeta: () => void;
+  portsList: PortItem[];
+  countriesList: CountryItem[];
+  editedPortId: number | null;
+  editedCountryId: number | null;
+  onUpdatePort: (id: number | null) => void;
+  onUpdateCountry: (id: number | null) => void;
 }) {
   const metadata = order.order_metadata || {};
   const stats = order.match_statistics;
@@ -845,20 +944,61 @@ function OverviewTab({
         </CardHeader>
         <CardContent>
           {isEditing ? (
-            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-              {Object.entries(editedMetadata).map(([key, value]) => (
-                <div key={key} className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground shrink-0 w-20 truncate" title={key}>{key}</span>
-                  <Input
-                    value={value}
-                    onChange={(e) => onUpdateMeta(key, e.target.value)}
-                    className="h-7 text-xs flex-1"
-                  />
-                  <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => onDeleteMeta(key)}>
-                    <X className="h-3 w-3" />
-                  </Button>
-                </div>
-              ))}
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+              {Object.entries(editedMetadata).map(([key, value]) => {
+                // destination_port 用港口下拉替代文本输入
+                if (key === "destination_port") {
+                  return (
+                    <div key={key} className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground shrink-0 w-20 truncate" title="目的港">目的港</span>
+                      <Select
+                        value={editedPortId ? String(editedPortId) : "__none__"}
+                        onValueChange={(v) => {
+                          if (v === "__none__") {
+                            onUpdatePort(null);
+                            onUpdateCountry(null);
+                            onUpdateMeta("destination_port", "");
+                          } else {
+                            const port = portsList.find((p) => p.id === Number(v));
+                            if (port) {
+                              onUpdatePort(port.id);
+                              if (port.country_id) onUpdateCountry(port.country_id);
+                              onUpdateMeta("destination_port", port.name);
+                            }
+                          }
+                        }}
+                      >
+                        <SelectTrigger className="h-7 text-xs flex-1">
+                          <SelectValue placeholder="选择港口" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__" className="text-xs">无</SelectItem>
+                          {portsList.map((p) => (
+                            <SelectItem key={p.id} value={String(p.id)} className="text-xs">
+                              {p.name}{p.country_name ? ` · ${p.country_name}` : ""}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  );
+                }
+                return (
+                  <div key={key} className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground shrink-0 w-20 truncate" title={key}>{key}</span>
+                    <Input
+                      value={value}
+                      onChange={(e) => onUpdateMeta(key, e.target.value)}
+                      className="h-7 text-xs flex-1"
+                    />
+                    <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => onDeleteMeta(key)}>
+                      <X className="h-3 w-3" />
+                    </Button>
+                  </div>
+                );
+              })}
+              </div>
             </div>
           ) : (
             <div className="grid grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-2.5 text-xs">
@@ -868,7 +1008,15 @@ function OverviewTab({
               <InfoRow label="交货日期" value={metadata.delivery_date ? String(metadata.delivery_date) : undefined} />
               <InfoRow label="订单日期" value={metadata.order_date ? String(metadata.order_date) : undefined} />
               <InfoRow label="币种" value={metadata.currency ? String(metadata.currency) : undefined} />
-              <InfoRow label="目的港" value={metadata.destination_port ? String(metadata.destination_port) : undefined} />
+              <InfoRow label="目的港" value={
+                (() => {
+                  if (order.port_id) {
+                    const port = portsList.find((p) => p.id === order.port_id);
+                    if (port) return port.country_name ? `${port.name} · ${port.country_name}` : port.name;
+                  }
+                  return metadata.destination_port ? String(metadata.destination_port) : undefined;
+                })()
+              } />
               <InfoRow label="文件类型" value={order.file_type?.toUpperCase()} />
               <InfoRow label="产品数量" value={order.product_count ? String(order.product_count) : undefined} />
               <InfoRow label="总金额" value={order.total_amount != null ? String(order.total_amount) : undefined} />
@@ -1244,7 +1392,17 @@ interface SupplierProgress {
   elapsedSeconds: number;
 }
 
-function InquiryProgress({ steps, order }: { steps: InquiryStep[]; order?: Order | null }) {
+function InquiryProgress({
+  steps,
+  order,
+  onCancel,
+  stopping,
+}: {
+  steps: InquiryStep[];
+  order?: Order | null;
+  onCancel?: () => void;
+  stopping?: boolean;
+}) {
   const groups = useMemo(() => {
     const map = new Map<number, SupplierProgress>();
     let currentSid: number | null = null;
@@ -1319,7 +1477,7 @@ function InquiryProgress({ steps, order }: { steps: InquiryStep[]; order?: Order
   const progress = groups.length > 0 ? (doneCount / groups.length) * 100 : 0;
 
   if (isLegacy) {
-    return <LegacyInquiryProgress steps={steps} />;
+    return <LegacyInquiryProgress steps={steps} onCancel={onCancel} stopping={stopping} />;
   }
 
   return (
@@ -1337,9 +1495,27 @@ function InquiryProgress({ steps, order }: { steps: InquiryStep[]; order?: Order
             生成询价单
           </span>
         </div>
-        <span className="text-xs text-muted-foreground tabular-nums">
-          {doneCount}/{groups.length} · {totalElapsed.toFixed(1)}s
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {doneCount}/{groups.length} · {totalElapsed.toFixed(1)}s
+          </span>
+          {onCancel && (
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7 text-xs"
+              disabled={stopping}
+              onClick={onCancel}
+            >
+              {stopping ? (
+                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+              ) : (
+                <X className="mr-1 h-3 w-3" />
+              )}
+              {stopping ? "停止中..." : "停止生成"}
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Progress bar */}
@@ -1403,7 +1579,15 @@ function InquiryProgress({ steps, order }: { steps: InquiryStep[]; order?: Order
   );
 }
 
-function LegacyInquiryProgress({ steps }: { steps: InquiryStep[] }) {
+function LegacyInquiryProgress({
+  steps,
+  onCancel,
+  stopping,
+}: {
+  steps: InquiryStep[];
+  onCancel?: () => void;
+  stopping?: boolean;
+}) {
   let currentAction = "";
   let completedCount = 0;
   for (const step of steps) {
@@ -1429,6 +1613,22 @@ function LegacyInquiryProgress({ steps }: { steps: InquiryStep[] }) {
         <span className="text-xs text-muted-foreground tabular-nums ml-auto">
           {completedCount} 步 · {totalElapsed.toFixed(1)}s
         </span>
+        {onCancel && (
+          <Button
+            variant="destructive"
+            size="sm"
+            className="h-7 text-xs"
+            disabled={stopping}
+            onClick={onCancel}
+          >
+            {stopping ? (
+              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+            ) : (
+              <X className="mr-1 h-3 w-3" />
+            )}
+            {stopping ? "停止中..." : "停止生成"}
+          </Button>
+        )}
       </div>
       {currentAction && (
         <p className="text-xs text-muted-foreground/70 pl-[30px]">{currentAction}</p>
@@ -1444,11 +1644,13 @@ function InquiryTab({
   onRedoSupplier,
   onGenerateAll,
   inquiryGenerating,
+  inquiryStopping,
 }: {
   order: Order;
   onRedoSupplier?: (supplierId: number, templateId?: number) => void;
-  onGenerateAll?: (templateOverrides?: Record<number, number | null>) => void;
+  onGenerateAll?: (templateOverrides?: Record<number, number | null>, supplierIds?: number[]) => void;
   inquiryGenerating?: boolean;
+  inquiryStopping?: boolean;
 }) {
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
@@ -1469,11 +1671,14 @@ function InquiryTab({
   // ── Readiness data (primary data source) ──
   const [readiness, setReadiness] = useState<InquiryReadiness | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(false);
+  const [readinessError, setReadinessError] = useState<string | null>(null);
   const prevGeneratingRef = useRef(false);
 
   // ── Inline gap editing: per-supplier override values + debounce timers ──
   const [inlineOverrides, setInlineOverrides] = useState<Record<number, Record<string, string>>>({});
   const [inlineSaving, setInlineSaving] = useState<Record<number, boolean>>({});
+  const [inlineSaveError, setInlineSaveError] = useState<Record<number, string | null>>({});
+  const [inlineSavedAt, setInlineSavedAt] = useState<Record<number, string>>({});
   const saveTimerRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
   // Ref keeps latest overrides accessible inside stale closures (setTimeout)
   const inlineOverridesRef = useRef(inlineOverrides);
@@ -1481,11 +1686,12 @@ function InquiryTab({
 
   const loadReadiness = useCallback(async () => {
     setReadinessLoading(true);
+    setReadinessError(null);
     try {
       const data = await getInquiryReadiness(order.id);
       setReadiness(data);
-    } catch {
-      // Silently fail — readiness is supplementary
+    } catch (err) {
+      setReadinessError(err instanceof Error ? err.message : "加载询价工作台失败");
     } finally {
       setReadinessLoading(false);
     }
@@ -1544,10 +1750,21 @@ function InquiryTab({
   }, [displaySupplierIds, readinessSuppliers]);
 
   // Blocked supplier names (for confirm dialog)
-  const blockedSupplierNames = useMemo(() => {
+  const blockedSuppliers = useMemo(() => {
     return displaySupplierIds
       .filter((sid) => readinessSuppliers[String(sid)]?.status === "blocked")
-      .map((sid) => readinessSuppliers[String(sid)]?.supplier_name || `#${sid}`);
+      .map((sid) => {
+        const item = readinessSuppliers[String(sid)];
+        return {
+          supplierId: sid,
+          name: item?.supplier_name || `#${sid}`,
+          reason: item?.error || "缺少必填字段",
+        };
+      });
+  }, [displaySupplierIds, readinessSuppliers]);
+
+  const readySupplierIds = useMemo(() => {
+    return displaySupplierIds.filter((sid) => readinessSuppliers[String(sid)]?.status !== "blocked");
   }, [displaySupplierIds, readinessSuppliers]);
 
   // ── Inline gap editing: debounced save ──
@@ -1556,10 +1773,23 @@ function InquiryTab({
     if (!overrides || Object.keys(overrides).length === 0) return;
 
     setInlineSaving((prev) => ({ ...prev, [supplierId]: true }));
+    setInlineSaveError((prev) => ({ ...prev, [supplierId]: null }));
     try {
       await saveInquiryFieldOverrides(order.id, supplierId, overrides);
+      setInlineSavedAt((prev) => ({
+        ...prev,
+        [supplierId]: new Date().toLocaleTimeString("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }),
+      }));
       loadReadiness();
-    } catch {
+    } catch (err) {
+      setInlineSaveError((prev) => ({
+        ...prev,
+        [supplierId]: err instanceof Error ? err.message : "自动保存失败",
+      }));
       toast.error("自动保存失败");
     } finally {
       setInlineSaving((prev) => ({ ...prev, [supplierId]: false }));
@@ -1571,6 +1801,7 @@ function InquiryTab({
       ...prev,
       [supplierId]: { ...(prev[supplierId] || {}), [cell]: value },
     }));
+    setInlineSaveError((prev) => ({ ...prev, [supplierId]: null }));
 
     // Debounce: save after 800ms of no typing
     if (saveTimerRef.current[supplierId]) {
@@ -1652,7 +1883,11 @@ function InquiryTab({
   }
 
   function handleGenerateClick() {
-    if (blockedSupplierNames.length > 0) {
+    if (readySupplierIds.length === 0) {
+      toast.error("当前没有可生成询价单的供应商");
+      return;
+    }
+    if (blockedSuppliers.length > 0) {
       setConfirmGenerateOpen(true);
     } else {
       onGenerateAll?.(buildOverridesForGenerate());
@@ -1703,7 +1938,36 @@ function InquiryTab({
     }
   }
 
-  if (!inquiry && displaySupplierIds.length === 0) return null;
+  if (!inquiry && displaySupplierIds.length === 0) {
+    return (
+      <div className="h-full overflow-y-auto px-6 py-5">
+        <Card>
+          <CardContent className="py-10">
+            <div className="flex flex-col items-center justify-center gap-3 text-center">
+              {readinessLoading ? (
+                <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+              ) : (
+                <FileSpreadsheet className="h-5 w-5 text-muted-foreground" />
+              )}
+              <div className="space-y-1">
+                <p className="text-sm font-medium">询价工作台</p>
+                <p className="text-xs text-muted-foreground">
+                  {readinessError
+                    ? readinessError
+                    : "当前没有可生成询价单的供应商。请先完成产品匹配。"}
+                </p>
+              </div>
+              {readinessError && (
+                <Button variant="outline" size="sm" className="text-xs" onClick={loadReadiness}>
+                  重试加载
+                </Button>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   const readyCount = summary?.ready ?? 0;
   const blockedCount = (summary?.blocked ?? 0) + (summary?.needs_input ?? 0);
@@ -1778,15 +2042,17 @@ function InquiryTab({
             <Button
               size="sm"
               className="text-xs h-7"
-              disabled={inquiryGenerating}
+              disabled={inquiryGenerating || inquiryStopping}
               onClick={handleGenerateClick}
             >
-              {inquiryGenerating ? (
+              {inquiryGenerating || inquiryStopping ? (
                 <Loader2 className="mr-1 h-3 w-3 animate-spin" />
               ) : (
                 <FileSpreadsheet className="mr-1 h-3 w-3" />
               )}
-              {inquiryGenerating
+              {inquiryStopping
+                ? "停止中..."
+                : inquiryGenerating
                 ? "生成中..."
                 : blockedCount > 0
                 ? `生成 ${readyCount}/${totalCount} 就绪`
@@ -1795,6 +2061,18 @@ function InquiryTab({
           )}
         </div>
       </div>
+
+      {readinessError && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/20 dark:bg-amber-950/30 dark:text-amber-300">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span>{readinessError}</span>
+          </div>
+          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={loadReadiness}>
+            重试
+          </Button>
+        </div>
+      )}
 
       {/* ── Supplier cards grid ── */}
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1828,6 +2106,24 @@ function InquiryTab({
               onFieldOverride={(cell, value) => handleInlineOverride(sid, cell, value)}
               fieldOverrideValues={inlineOverrides[sid] || {}}
               savingOverrides={inlineSaving[sid]}
+              saveFeedback={
+                inlineSaving[sid]
+                  ? "保存中"
+                  : inlineSaveError[sid]
+                  ? inlineSaveError[sid] || "保存失败"
+                  : inlineSavedAt[sid]
+                  ? `已保存 ${inlineSavedAt[sid]}`
+                  : undefined
+              }
+              saveFeedbackTone={
+                inlineSaving[sid]
+                  ? "saving"
+                  : inlineSaveError[sid]
+                  ? "error"
+                  : inlineSavedAt[sid]
+                  ? "saved"
+                  : "idle"
+              }
             />
           );
         })}
@@ -1839,11 +2135,18 @@ function InquiryTab({
           <AlertDialogHeader>
             <AlertDialogTitle>部分供应商缺必填字段</AlertDialogTitle>
             <AlertDialogDescription>
-              以下供应商缺少必填字段，生成的询价单可能不完整：
+              以下供应商当前不参与生成：
               <span className="block mt-2 font-medium text-foreground">
-                {blockedSupplierNames.join("、")}
+                {blockedSuppliers.map((item) => item.name).join("、")}
               </span>
-              <span className="block mt-1">是否跳过这些供应商，继续生成其余？</span>
+              <span className="block mt-2 space-y-1">
+                {blockedSuppliers.map((item) => (
+                  <span key={item.supplierId} className="block text-xs text-muted-foreground">
+                    {item.name}: {item.reason}
+                  </span>
+                ))}
+              </span>
+              <span className="block mt-2">是否跳过这些供应商，只生成其余可用供应商？</span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1851,7 +2154,7 @@ function InquiryTab({
             <AlertDialogAction
               onClick={() => {
                 setConfirmGenerateOpen(false);
-                onGenerateAll?.(buildOverridesForGenerate());
+                onGenerateAll?.(buildOverridesForGenerate(), readySupplierIds);
               }}
             >
               继续生成

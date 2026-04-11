@@ -42,19 +42,18 @@ def capabilities(ctx: PromptContext) -> str:
         all_descs = {}
 
     if ctx.enabled_tools is None:
-        # List ALL default-registered tools so the LLM knows what it has
+        # List ALL default-registered tools (consolidated per-resource names)
         default_tools = [
-            # Business — query & overview
-            "get_db_schema", "query_db", "get_order_overview",
-            # Business — inquiry workflow
-            "check_inquiry_readiness", "fill_inquiry_gaps", "generate_inquiries",
-            # Business — fulfillment
-            "get_order_fulfillment", "update_order_fulfillment",
-            "record_delivery_receipt", "attach_order_file",
+            # Business — per-resource tools
+            "manage_order", "manage_inquiry", "manage_fulfillment",
+            "manage_upload", "parse_upload",
+            # Query
+            "get_db_schema", "query_db",
             # Utility
-            "think", "calculate", "get_current_time",
-            "todo_write", "todo_read", "use_skill",
-            "bash", "request_confirmation", "ask_clarification",
+            "think", "calculate", "use_skill",
+            "manage_todo", "bash",
+            "request_confirmation", "ask_clarification",
+            "modify_excel", "search_product_database",
         ]
         tool_lines = [f"- {n}: {all_descs.get(n, n)}" for n in default_tools if n in all_descs]
     else:
@@ -126,73 +125,6 @@ FROM v2_orders
 2. **不要用相同的 SQL 重试** — 必须修改出错的部分
 3. 如果是 JSON/JSONB 类型错误，检查上方 JSON 指南
 4. 复杂查询先用 LIMIT 5 测试小数据集，确认无误后再去 LIMIT"""
-
-_FULFILLMENT_RULES = """## 履约管理
-你可以管理订单的完整履约周期：
-- 查看/更新履约状态: pending → inquiry_sent → quoted → confirmed → delivering → delivered → invoiced → paid
-- 记录交货验收: 逐产品记录接收数量、拒收数量和原因
-- 附加文件: 上传交货照片、发票扫描件等到订单
-- 记录发票和付款信息
-
-用户可能用自然语言描述状态更新（如"订单已交货"、"土豆只收了500kg"），你需要理解意图并调用相应工具。"""
-
-_DATA_UPLOAD_RULES = """## 上传模板
-如果用户询问模板或格式要求，告知可以下载模板文件：
-- 下载地址：/uploads/product_upload_template.xlsx
-- 模板包含 16 列（product_name、country_id、category_id 等），第二个 sheet 有参考表可查 ID
-- 必填字段：product_name、country_id、category_id、effective_from
-
-## 产品上传流程
-1. parse_file 解析文件
-2. analyze_columns 分析未映射列（检测 supplier_id/country_id 等引用列）
-3. 确认国家、港口、供应商、生效日期
-4. prepare_upload 一键验证+审计+预览（传入所有参数）
-5. 用户确认后 execute_upload
-6. 如有错误可用 rollback_batch 回滚
-
-## 规则
-- parse_file 后必须立即调用 analyze_columns
-- 必须在 prepare_upload 之前确认国家、港口、生效日期
-- prepare_upload 返回卡片后等待用户确认，不要主动执行
-- 如有缺失供应商/国家，用 create_references 创建后再调用 prepare_upload
-- 简短回复，不要重复卡片已展示的信息"""
-
-_INQUIRY_WORKFLOW = """## 询价单生成
-
-### 工具链（3步走）
-1. **check_inquiry_readiness(order_id)** — 检查各供应商数据完整性，返回缺失字段
-2. **fill_inquiry_gaps(order_id, supplier_id, field_values)** — 补充缺失字段值
-3. **generate_inquiries(order_id, supplier_id?, template_id?)** — 生成 Excel（单个供应商或全部）
-
-### 交互协议
-用户不会记得 order_id 和 supplier_id，他们会用自然语言描述：
-- "帮我生成询价单" → 缺订单+供应商，需要引导
-- "Celebrity Millennium 的询价单" → 通过船名查订单
-- "给三祐生成询价单" → 通过供应商名查 supplier_id
-- "最近那个横滨的订单" → 通过目的港查订单
-
-**步骤：**
-1. **识别订单**: 用 query_db 按用户线索查询（船名/PO号/日期/目的港）
-   - 无线索 → 查最近订单列表：
-     `SELECT id, order_metadata->>'po_number' as po, order_metadata->>'ship_name' as ship, product_count, created_at FROM v2_orders WHERE status='ready' ORDER BY created_at DESC LIMIT 10`
-   - 结果用 markdown 表格展示，让用户选择
-
-2. **识别供应商**: 确定订单后，查该订单涉及的供应商：
-   `SELECT DISTINCT s.id, s.name, count(*) as product_count FROM v2_orders o, json_array_elements(o.match_results) as mr, suppliers s WHERE o.id=<order_id> AND s.id=(mr->'matched_product'->>'supplier_id')::int GROUP BY s.id, s.name`
-   - 1个供应商 → 直接确认
-   - 多个 → 展示列表让用户选择（或确认"全部生成"）
-
-3. **检查就绪状态**: `check_inquiry_readiness(order_id)` — 确认数据完整
-   - 有 blocking 缺失 → 用 `fill_inquiry_gaps` 补充
-   - 全部 ready → 进入生成
-
-4. **生成**: `generate_inquiries(order_id, supplier_id)` 或 `generate_inquiries(order_id)` 全部
-   - 生成完成后自动显示下载卡片
-
-### 注意事项
-- **严禁编造数据**: 生成结果直接转述给用户，不要自己编造预览数据或虚构表格内容
-- **不需要手写 Excel**: generate_inquiries 调用后端编排器自动处理模板解析、数据填充、格式设置
-- 用户上传模板时，传 template_id 参数即可"""
 
 def domain_knowledge(ctx: PromptContext) -> str:
     """Minimal domain context — workflow details are in Skills (DeerFlow pattern)."""

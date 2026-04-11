@@ -313,7 +313,7 @@ class Order(Base):
         CheckConstraint("payment_amount >= 0", name="ck_v2_orders_payment_amount_nonneg"),
         CheckConstraint("invoice_amount >= 0", name="ck_v2_orders_invoice_amount_nonneg"),
         CheckConstraint(
-            "status IN ('uploading','pending_template','extracting','matching','ready','error')",
+            "status IN ('uploading','pending_template','extracting','extracted','matching','needs_review','ready','error')",
             name="ck_v2_orders_status_enum",
         ),
         CheckConstraint(
@@ -324,6 +324,7 @@ class Order(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, nullable=False, index=True)
+    document_id = Column(Integer, ForeignKey("v2_documents.id"), nullable=True, index=True)
     filename = Column(String(500), nullable=False)
     file_url = Column(String(500), nullable=True)
     file_type = Column(String(10), default="pdf")
@@ -367,6 +368,26 @@ class Order(Base):
     @property
     def has_inquiry(self) -> bool:
         return self.inquiry_data is not None
+
+
+class Document(Base):
+    __tablename__ = "v2_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    filename = Column(String(500), nullable=False)
+    file_url = Column(String(500), nullable=True)
+    file_type = Column(String(20), nullable=False, default="pdf")
+    file_size_bytes = Column(Integer, nullable=True)
+    doc_type = Column(String(50), nullable=True)
+    content_markdown = Column(Text, nullable=True)
+    extracted_data = Column(JSON, nullable=True)
+    extraction_method = Column(String(50), nullable=True)
+    status = Column(String(20), default="uploaded")
+    processing_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    extracted_at = Column(DateTime, nullable=True)
 
 
 class AgentSession(Base):
@@ -568,44 +589,6 @@ class AgentMemory(Base):
     last_accessed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-class SubAgentTask(Base):
-    """子Agent任务追踪 — 记录委派执行的状态和结果"""
-
-    __tablename__ = "v2_sub_agent_tasks"
-    __table_args__ = (
-        CheckConstraint(
-            "status IN ('pending', 'running', 'completed', 'failed', 'timeout')",
-            name="ck_sub_agent_tasks_status",
-        ),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    parent_session_id = Column(String(36), ForeignKey("v2_agent_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
-    parent_turn = Column(Integer, nullable=True)
-    sub_agent_name = Column(String(100), nullable=False)
-    task_description = Column(Text, nullable=False)
-    status = Column(String(20), nullable=False, default="pending")
-    result_preview = Column(Text, nullable=True)
-    error_message = Column(Text, nullable=True)
-    duration_ms = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
-
-
-class AgentFeedback(Base):
-    """Agent 反馈 — 用户对 agent 回复的评分和反馈"""
-
-    __tablename__ = "v2_agent_feedback"
-
-    id = Column(Integer, primary_key=True, index=True)
-    session_id = Column(String(36), ForeignKey("v2_agent_sessions.id", ondelete="CASCADE"), nullable=True, index=True)
-    message_id = Column(Integer, nullable=True)
-    rating = Column(Integer, nullable=True)
-    feedback_text = Column(Text, nullable=True)
-    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ExchangeRate(Base):

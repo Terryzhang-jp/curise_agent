@@ -1,6 +1,7 @@
-"""shell 组工具 — bash 命令执行"""
+"""shell 组工具 — bash 命令执行 (白名单模式)"""
 
 import os
+import shlex
 import signal
 import subprocess
 
@@ -12,11 +13,37 @@ TOOL_META = {
         group="shell",
         description="执行 bash/Python 命令（生成 Excel、数据处理等）",
         prompt_description="执行 bash/Python 命令（可用于生成 Excel、数据处理、代码执行等）",
-        summary="执行命令",  # Note: chat_storage uses callable _extract_bash_summary for richer summaries
+        summary="执行命令",
     ),
 }
 
-# 危险命令模式
+# ── 白名单模式: 只允许以下前缀的命令 ──
+# 白名单比黑名单安全: 未列入的命令一律拒绝, 不靠正则匹配绕过。
+_ALLOWED_PREFIXES = [
+    # 文件读取
+    "ls", "cat", "head", "tail", "wc", "stat", "file", "find", "du",
+    # Python 执行 (主要用途: openpyxl 生成 Excel, 数据处理)
+    "python3 ", "python ",
+    # 包管理查询
+    "pip list", "pip show", "pip freeze",
+    # 文件操作 (workspace 内)
+    "cp ", "mv ", "mkdir ", "touch ",
+    # 其他安全命令
+    "echo ", "date", "pwd", "which ", "sort ", "uniq ", "grep ", "awk ", "sed ",
+    "xlsx2csv", "csvtool",
+]
+
+# 即使在白名单内, 以下 shell 元字符也被禁止 (防止命令注入)
+_DANGEROUS_METACHAR = [
+    "`",      # 命令替换 `cmd`
+    "$(",     # 命令替换 $(cmd)
+    "| bash", "| sh", "| zsh",  # 管道到 shell
+    "; rm",   # 分号拼接危险命令
+    ">/dev/", # 设备写入
+    ">> /etc", "> /etc",  # 系统文件覆盖
+]
+
+# 旧黑名单作为第二道防线 (保留向后兼容)
 _BLOCKED_PATTERNS = [
     "rm -rf /",
     "rm -rf /*",
@@ -70,11 +97,27 @@ def register(registry, ctx=None):
         group="shell",
     )
     def bash(command: str, timeout: int = 30, working_directory: str = "") -> str:
-        """执行 bash 命令"""
-        cmd_lower = command.lower().strip()
+        """执行 bash 命令 (白名单模式)"""
+        cmd_stripped = command.strip()
+        cmd_lower = cmd_stripped.lower()
+
+        # Layer 1: 黑名单 (保留, 最危险的命令直接拦截)
         for pattern in _BLOCKED_PATTERNS:
             if pattern in cmd_lower:
                 return f"Error: command blocked by security policy (matched: {pattern})"
+
+        # Layer 2: 危险元字符检查 (防止命令注入)
+        for meta in _DANGEROUS_METACHAR:
+            if meta in cmd_stripped:
+                return f"Error: 命令包含不允许的元字符: {meta!r}。如需此操作请写入 Python 脚本后执行。"
+
+        # Layer 3: 白名单 (命令前缀必须匹配)
+        allowed = any(cmd_stripped.startswith(p) or cmd_stripped.startswith(p.rstrip()) for p in _ALLOWED_PREFIXES)
+        if not allowed:
+            return (
+                f"Error: 命令 '{cmd_stripped[:50]}...' 不在允许列表中。"
+                f"允许的命令前缀: {', '.join(sorted(set(p.strip() for p in _ALLOWED_PREFIXES)))}"
+            )
 
         timeout = min(max(int(timeout), 1), 120)
 

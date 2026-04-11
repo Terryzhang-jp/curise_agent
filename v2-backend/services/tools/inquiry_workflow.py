@@ -20,62 +20,36 @@ from services.tools.registry_loader import ToolMetaInfo
 logger = logging.getLogger(__name__)
 
 TOOL_META = {
-    "check_inquiry_readiness": ToolMetaInfo(
-        display_name="检查询价就绪状态",
+    "manage_inquiry": ToolMetaInfo(
+        display_name="询价管理",
         group="business",
-        description="检查订单各供应商的询价数据完整性，识别缺失字段",
-        prompt_description="检查订单询价就绪状态（缺失字段、模板绑定等）",
-        summary="检查询价就绪状态",
-        is_enabled_default=True,
-    ),
-    "fill_inquiry_gaps": ToolMetaInfo(
-        display_name="补充询价字段",
-        group="business",
-        description="为供应商补充缺失的询价字段值",
-        prompt_description="为指定供应商补充缺失的询价表头字段",
-        summary="补充询价字段",
-        is_enabled_default=True,
-    ),
-    "generate_inquiries": ToolMetaInfo(
-        display_name="生成询价单",
-        group="business",
-        description="为订单生成供应商询价Excel（单个或全部）",
-        prompt_description="生成询价单Excel文件",
-        summary="生成询价单",
+        description="询价全流程: 检查就绪→补充字段→生成Excel",
+        prompt_description="询价管理（检查就绪/补充字段/生成Excel）",
+        summary="管理询价",
         is_enabled_default=True,
     ),
 }
 
 
 def register(registry, ctx=None):
-    """Register inquiry workflow tools."""
+    """Register consolidated manage_inquiry tool."""
 
-    @registry.tool(
-        description=(
-            "检查订单的询价单生成就绪状态。返回每个供应商的状态：ready（可生成）、needs_input（缺必填字段）、completed（已生成）。\n"
-            "在调用 generate_inquiries 前使用此工具确认数据完整性。\n"
-            "如果供应商状态为 completed，说明已有询价单，再次调用 generate_inquiries 会重新生成（覆盖旧文件）。"
-        ),
-        parameters={
-            "order_id": {
-                "type": "NUMBER",
-                "description": "订单 ID",
-            },
-        },
-        group="business",
-    )
-    def check_inquiry_readiness(order_id: int) -> str:
+    # ── Internal helper: check readiness ──
+    def _check_readiness(order_id: int) -> str:
         if not ctx or not ctx.db:
             return "Error: no database session available"
 
         try:
             from models import Order, SupplierTemplate
-            from services.inquiry_agent import resolve_template, _build_order_data_for_engine
+            from services.inquiry_agent import select_template, _build_order_data_for_engine
             from services.field_schema import analyze_gaps, schema_from_zone_config
             import sqlalchemy
 
             db = ctx.db
-            order = db.query(Order).filter(Order.id == int(order_id)).first()
+            from services.tools._security import scope_to_owner
+            _q = db.query(Order).filter(Order.id == int(order_id))
+            _q = scope_to_owner(_q, Order, ctx)
+            order = _q.first()
             if not order:
                 return f"Error: 订单 {order_id} 不存在"
             if not order.match_results:
@@ -110,10 +84,11 @@ def register(registry, ctx=None):
             results = []
             total_ready = 0
             total_needs_input = 0
+            total_blocked = 0
 
             for sid, products in products_by_supplier.items():
                 info = supplier_rows.get(sid, {"name": f"供应商 #{sid}"})
-                template, method, _ = resolve_template(sid, all_templates)
+                template, method, candidates = select_template(sid, all_templates)
 
                 existing_entry = existing_suppliers.get(str(sid), {})
                 field_overrides = existing_entry.get("field_overrides", {})
@@ -133,12 +108,19 @@ def register(registry, ctx=None):
                         field_schema = ts.get("field_schema") or schema_from_zone_config(ts)
                         gap_report = analyze_gaps(field_schema, order_data, sid, field_overrides)
 
-                gen_status = existing_entry.get("status", "pending")
+                if not template:
+                    gap_report["summary"]["blocking"] = max(
+                        gap_report["summary"].get("blocking", 0), 1
+                    )
                 blocking = gap_report["summary"]["blocking"]
                 warnings = gap_report["summary"]["warnings"]
+                gen_status = existing_entry.get("status", "pending")
 
                 if gen_status == "completed":
                     status = "completed"
+                elif not template:
+                    status = "blocked"
+                    total_blocked += 1
                 elif blocking > 0:
                     status = "needs_input"
                     total_needs_input += 1
@@ -155,6 +137,7 @@ def register(registry, ctx=None):
                     "template": template.template_name if template else None,
                     "template_method": method,
                     "has_zone_config": has_zone_config,
+                    "candidate_count": len(candidates),
                     "blocking_gaps": blocking,
                     "warning_gaps": warnings,
                     "resolved_fields": gap_report["summary"].get("resolved", 0),
@@ -168,6 +151,8 @@ def register(registry, ctx=None):
                          "severity": g["severity"], "category": g["category"]}
                         for g in gap_report["gaps"]
                     ]
+                if not template:
+                    supplier_line["error"] = "当前供应商没有已上架的 zone_config 模板，无法生成询价单"
 
                 results.append(supplier_line)
 
@@ -176,6 +161,7 @@ def register(registry, ctx=None):
                 "supplier_count": len(products_by_supplier),
                 "ready": total_ready,
                 "needs_input": total_needs_input,
+                "blocked": total_blocked,
                 "total_products": sum(len(v) for v in products_by_supplier.values()),
             }
 
@@ -185,30 +171,8 @@ def register(registry, ctx=None):
             logger.error("check_inquiry_readiness failed: %s", e, exc_info=True)
             return f"Error: {type(e).__name__}: {e}"
 
-    @registry.tool(
-        description=(
-            "补充供应商询价单的缺失字段值。先用 check_inquiry_readiness 确认哪些字段缺失，"
-            "然后用此工具传入 JSON 格式的字段值。保存后下次生成询价单时自动使用。"
-        ),
-        parameters={
-            "order_id": {
-                "type": "NUMBER",
-                "description": "订单 ID",
-            },
-            "supplier_id": {
-                "type": "NUMBER",
-                "description": "供应商 ID",
-            },
-            "field_values": {
-                "type": "STRING",
-                "description": (
-                    'JSON 格式的字段映射，如: {"H8": "2026/04/01", "B5": "供应商名称"}'
-                ),
-            },
-        },
-        group="business",
-    )
-    def fill_inquiry_gaps(order_id: int, supplier_id: int, field_values: str = "{}") -> str:
+    # ── Internal helper: fill gaps ──
+    def _fill_gaps(order_id: int, supplier_id: int, field_values: str = "{}") -> str:
         if not ctx or not ctx.db:
             return "Error: no database session available"
 
@@ -217,7 +181,10 @@ def register(registry, ctx=None):
             from sqlalchemy.orm.attributes import flag_modified
 
             db = ctx.db
-            order = db.query(Order).filter(Order.id == int(order_id)).first()
+            from services.tools._security import scope_to_owner
+            _q = db.query(Order).filter(Order.id == int(order_id))
+            _q = scope_to_owner(_q, Order, ctx)
+            order = _q.first()
             if not order:
                 return f"Error: 订单 {order_id} 不存在"
 
@@ -256,33 +223,8 @@ def register(registry, ctx=None):
             logger.error("fill_inquiry_gaps failed: %s", e, exc_info=True)
             return f"Error: {type(e).__name__}: {e}"
 
-    @registry.tool(
-        description=(
-            "Generate inquiry Excel files for an order. "
-            "Can generate for all suppliers (default) or a single supplier. "
-            "This runs the full inquiry orchestrator: template resolution, "
-            "data filling, format enforcement, and file upload. "
-            "生成供应商询价单 Excel 文件。返回文件名和产品数。文件保存到工作目录，可用 modify_excel 修改。"
-        ),
-        parameters={
-            "order_id": {
-                "type": "NUMBER",
-                "description": "订单 ID",
-            },
-            "supplier_id": {
-                "type": "NUMBER",
-                "description": "供应商 ID。留空或传 0 则为所有供应商生成。",
-                "required": False,
-            },
-            "template_id": {
-                "type": "NUMBER",
-                "description": "模板 ID（查 v2_supplier_templates 表获取）。留空则自动匹配。",
-                "required": False,
-            },
-        },
-        group="business",
-    )
-    def generate_inquiries(order_id: int, supplier_id: int = 0, template_id: int = 0) -> str:
+    # ── Internal helper: generate ──
+    def _generate(order_id: int, supplier_id: int = 0, template_id: int = 0) -> str:
         if not ctx or not ctx.db:
             return "Error: no database session available"
 
@@ -290,7 +232,10 @@ def register(registry, ctx=None):
             from models import Order
 
             db = ctx.db
-            order = db.query(Order).filter(Order.id == int(order_id)).first()
+            from services.tools._security import scope_to_owner
+            _q = db.query(Order).filter(Order.id == int(order_id))
+            _q = scope_to_owner(_q, Order, ctx)
+            order = _q.first()
             if not order:
                 return f"Error: 订单 {order_id} 不存在"
             if not order.match_results:
@@ -415,6 +360,62 @@ def register(registry, ctx=None):
         except Exception as e:
             logger.error("generate_inquiries failed: %s", e, exc_info=True)
             return f"Error: {type(e).__name__}: {e}"
+
+
+    # ── Consolidated tool ──
+
+    @registry.tool(
+        description=(
+            "询价管理工具。通过 action 参数选择操作:\n"
+            "- check: 检查就绪状态（每个供应商的缺失字段、模板绑定情况）\n"
+            "- fill_gaps: 补充缺失字段 (fields: supplier_id, field_values={cell: value})\n"
+            "- generate: 生成询价 Excel (fields: supplier_id=0则全部, template_id=0则自动)\n\n"
+            "流程: check → fill_gaps (如有缺失) → generate\n\n"
+            "示例:\n"
+            '  manage_inquiry(action="check", order_id=123)\n'
+            '  manage_inquiry(action="fill_gaps", order_id=123, fields=\'{"supplier_id": 5, "field_values": {"H8": "2026/04/15"}}\')\n'
+            '  manage_inquiry(action="generate", order_id=123)\n'
+            '  manage_inquiry(action="generate", order_id=123, fields=\'{"supplier_id": 5}\')'
+        ),
+        parameters={
+            "action": {
+                "type": "STRING",
+                "description": "操作类型: check | fill_gaps | generate",
+            },
+            "order_id": {
+                "type": "NUMBER",
+                "description": "订单 ID",
+            },
+            "fields": {
+                "type": "STRING",
+                "description": "JSON 格式额外参数 (fill_gaps: supplier_id+field_values; generate: supplier_id+template_id)",
+                "required": False,
+            },
+        },
+        group="business",
+    )
+    def manage_inquiry(action: str = "", order_id: int = 0, fields: str = "{}") -> str:
+        if not action or not order_id:
+            return "Error: 需要 action 和 order_id"
+        try:
+            parsed = json.loads(fields) if fields and fields != "{}" else {}
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+
+        if action == "check":
+            return _check_readiness(int(order_id))
+        elif action == "fill_gaps":
+            sid = parsed.get("supplier_id", 0)
+            fv = parsed.get("field_values", "{}")
+            if isinstance(fv, dict):
+                fv = json.dumps(fv, ensure_ascii=False)
+            return _fill_gaps(int(order_id), int(sid), fv)
+        elif action == "generate":
+            sid = parsed.get("supplier_id", 0)
+            tid = parsed.get("template_id", 0)
+            return _generate(int(order_id), int(sid), int(tid))
+        else:
+            return f"Error: 未知 action '{action}'。支持: check, fill_gaps, generate"
 
 
 def _save_operation_state(ctx, state: dict):

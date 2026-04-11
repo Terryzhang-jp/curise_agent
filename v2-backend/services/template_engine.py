@@ -1,11 +1,41 @@
-"""Deterministic template engine for inquiry Excel generation.
+"""Template engine v2: compose-from-scratch xlsx renderer.
 
-Given a template file + zone_config + order_data → fills and outputs Excel bytes.
-Zero LLM calls. All cell positions, formulas, and data mappings are pre-computed
-in zone_config (built by zone_config_builder.py at template analysis time).
+Why this exists
+===============
+The original `template_engine.fill_template` mutates an openpyxl Workbook in
+place: it calls `insert_rows`, `delete_rows`, and tries to clean up the
+mess (stale merge ranges, lost cell formats). openpyxl's row manipulation
+has known footguns — merge ranges don't auto-shift, cell formats can be
+silently reset to General, and the cleanup code in fill_template is a long
+list of workarounds that has accumulated bugs over time. On 2026-04-11 we
+found 5 distinct production bugs in fill_template in a single day.
 
-Pipeline: load template → fill header → resize product zone → fill products
-         → write formulas → update cross-refs → clone styles → return bytes
+This module takes the opposite approach: **compose, never mutate**.
+
+  1. Open the template as a READ-ONLY reference
+  2. Build a NEW Workbook from scratch
+  3. Walk the template's rows top-to-bottom and emit each cell at its
+     final position in the destination, computing row offsets explicitly
+  4. Re-create merges, formulas, and styles in the destination
+  5. Save
+
+Because we never touch openpyxl's row manipulation APIs, every footgun
+that bit fill_template is structurally impossible here. The trade-off is
+that we do more work per cell (explicit copies), but the time difference
+on real templates is well under 1 second.
+
+This module is the production version of the POC at
+`tests/_poc_compose_renderer.py`. Both should produce byte-equivalent
+output (modulo cell ordering); the POC is preserved as a reference.
+
+Public API
+----------
+    compose_render(template_bytes, zone_config_dict, order_data, supplier_id) -> bytes
+
+Validation
+----------
+The `zone_config_dict` is validated against `ZoneConfigV1` before use.
+Any malformed config raises `ZoneConfigValidationError` with field paths.
 """
 
 from __future__ import annotations
@@ -15,152 +45,94 @@ import io
 import logging
 from typing import Any
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
-from openpyxl.workbook.properties import CalcProperties
-from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.utils import column_index_from_string, get_column_letter
 
-from services.field_schema import _resolve_path
+from services.zone_config_schema import (
+    ZoneConfigV1,
+    ZoneConfigValidationError,
+    parse_zone_config,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def fill_template(
+# Integer-only number formats that should be promoted to optional-decimal
+# when the data is fractional. `#,##0.##` is the universal "show up to 2
+# decimals only when needed" format — backward-compatible with integer data.
+_INTEGER_ONLY_FORMATS = {
+    "#,##0",
+    "0",
+    "General",
+    "#,##0;-#,##0",
+    "#,##0_ ;-#,##0_ ",
+}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────────
+
+
+def compose_render(
     template_bytes: bytes,
-    zone_config: dict[str, Any],
+    zone_config_dict: dict[str, Any],
     order_data: dict[str, Any],
     supplier_id: str | int,
-    field_overrides: dict[str, str] | None = None,
 ) -> bytes:
-    """Fill a template with order data using zone config. Returns Excel bytes.
+    """Render a filled xlsx by composing from a template, never mutating it.
 
     Args:
-        template_bytes: Raw bytes of the template .xlsx file
-        zone_config: Complete zone configuration from zone_config_builder
-        order_data: Full order data dict (from inquiry_agent or equivalent)
-        supplier_id: Supplier ID (string or int) for data path resolution
-        field_overrides: Optional {cell_ref: value} overrides from user edits,
-                         applied on top of resolved header field values
+        template_bytes: Raw bytes of the .xlsx template file.
+        zone_config_dict: A dict matching `ZoneConfigV1` shape. Will be
+            validated; ZoneConfigValidationError raised on bad input.
+        order_data: The order's data, with the standard structure used by
+            inquiry_agent. Must contain `suppliers[str(supplier_id)].products`.
+        supplier_id: The supplier this inquiry is for.
 
     Returns:
-        Filled Excel file as bytes
+        The filled xlsx file as bytes.
+
+    Raises:
+        ZoneConfigValidationError: zone_config_dict failed schema validation.
+        ValueError: order_data is missing required structure (e.g. no products).
+        Exception: openpyxl-level failures (rare, indicates corrupt template).
     """
+    # ── Validate zone_config first — fail fast on bad config ──
+    config: ZoneConfigV1 = parse_zone_config(zone_config_dict)
+
     sid = str(supplier_id)
-
-    wb = load_workbook(io.BytesIO(template_bytes))
-    ws = wb.active
-
-    zones = zone_config["zones"]
-    prod_zone = zones["product_data"]
-    summ_zone = zones["summary"]
-
-    products = _get_products(order_data, sid)
+    supplier_data = (order_data.get("suppliers") or {}).get(sid)
+    if not supplier_data:
+        raise ValueError(f"order_data has no supplier {sid}")
+    products = supplier_data.get("products") or []
     if not products:
-        raise ValueError(f"No products found for supplier {sid}")
+        raise ValueError(f"supplier {sid} has no products in order_data")
 
-    template_rows = prod_zone["end"] - prod_zone["start"] + 1
-    actual_rows = len(products)
-    row_delta = actual_rows - template_rows
+    n_products = len(products)
 
-    logger.info(
-        "fill_template: supplier=%s, products=%d, template_rows=%d, delta=%d",
-        sid, actual_rows, template_rows, row_delta,
-    )
+    # ── Load source template (read-only reference) ──
+    src_wb = load_workbook(io.BytesIO(template_bytes))
+    src_ws = src_wb.active
 
-    # ── Step 0: Fill header fields ───────────────────────────────
-    header_fields = zone_config.get("header_fields", {})
-    for cell_ref, data_path in header_fields.items():
-        col_letter = "".join(c for c in cell_ref if c.isalpha())
-        row_num = int("".join(c for c in cell_ref if c.isdigit()))
-        col_idx = column_index_from_string(col_letter)
-        cell = ws.cell(row=row_num, column=col_idx)
-        if isinstance(cell, MergedCell):
-            continue
-        value = _resolve_path(order_data, data_path, sid)
-        if value is not None:
-            cell.value = value
+    # ── Create blank destination workbook ──
+    dst_wb = Workbook()
+    dst_ws = dst_wb.active
+    dst_ws.title = src_ws.title
 
-    # ── Step 0b: Apply user field overrides ────────────────────
-    if field_overrides:
-        for cell_ref, value in field_overrides.items():
-            col_letter = "".join(c for c in cell_ref if c.isalpha())
-            row_num = int("".join(c for c in cell_ref if c.isdigit()))
-            if not col_letter or not row_num:
-                continue
-            col_idx = column_index_from_string(col_letter)
-            cell = ws.cell(row=row_num, column=col_idx)
-            if not isinstance(cell, MergedCell):
-                cell.value = value
-        logger.info("Applied %d field overrides", len(field_overrides))
+    # ── Zone definitions ──
+    prod_start = config.zones.product_data.start
+    prod_end = config.zones.product_data.end
+    summ_start = config.zones.summary.start
+    summ_end = config.zones.summary.end
+    template_prod_rows = prod_end - prod_start + 1
+    row_delta = n_products - template_prod_rows
+    new_prod_end = prod_start + n_products - 1
+    new_summ_start = prod_end + 1 + row_delta
+    new_summ_end = new_summ_start + (summ_end - summ_start)
 
-    # ── Step 0c: Capture product-row merge pattern from template ──
-    # Before row manipulation, detect which columns are merged per product
-    # row (e.g. F:G merged for "description"). We'll re-apply after filling.
-    col_map = zone_config.get("product_columns", {})
-    row_merges = _detect_row_merge_pattern(ws, prod_zone["start"], col_map)
-
-    # ── Step 1: Resize product zone ──────────────────────────────
-    # Strategy: insert fresh rows at the START of the product zone, then
-    # delete old template rows. This avoids openpyxl's merge inheritance
-    # bug (inserting adjacent to merged summary rows propagates MergedCells).
-    new_prod_end = prod_zone["start"] + actual_rows - 1
-
-    if row_delta > 0:
-        # Insert fresh rows at the beginning — pushes everything down
-        ws.insert_rows(prod_zone["start"], actual_rows)
-        # Delete old template rows (now shifted down by actual_rows)
-        old_start = prod_zone["start"] + actual_rows
-        ws.delete_rows(old_start, template_rows)
-    elif row_delta < 0:
-        # Fewer products than template rows — delete excess from bottom
-        delete_start = prod_zone["start"] + actual_rows
-        ws.delete_rows(delete_start, abs(row_delta))
-
-    new_summ_start = new_prod_end + 1
-    new_summ_end = new_summ_start + (summ_zone["end"] - summ_zone["start"])
-
-    # ── Step 1b: Remove stale merge ranges in product zone ────────
-    # openpyxl does NOT update merge range metadata during insert/delete.
-    # Stale ranges from the original summary zone (e.g. I33:J33) stay at
-    # old row numbers — now inside the product zone — and corrupt cells
-    # on save/reload. Remove any range that overlaps the product zone.
-    max_col = ws.max_column or 12
-    merges_to_remove = [
-        mr for mr in list(ws.merged_cells.ranges)
-        if mr.min_row <= new_prod_end and mr.max_row >= prod_zone["start"]
-    ]
-    for mr in merges_to_remove:
-        ws.merged_cells.remove(mr)
-    if merges_to_remove:
-        logger.info("Removed %d stale merge ranges from product zone", len(merges_to_remove))
-
-    # Belt-and-suspenders: purge any MergedCell objects from _cells
-    for row in range(prod_zone["start"], new_prod_end + 1):
-        for col in range(1, max_col + 1):
-            if (row, col) in ws._cells and isinstance(ws._cells[(row, col)], MergedCell):
-                del ws._cells[(row, col)]
-
-    # ── Step 2: Clear product zone values ─────────────────────────
-    for row in range(prod_zone["start"], new_prod_end + 1):
-        for col in range(1, max_col + 1):
-            cell = ws.cell(row=row, column=col)
-            cell.value = None
-
-    # ── Step 3: Clear stale summary data ─────────────────────────
-    for row in range(new_summ_start, new_summ_end + 1):
-        for col_letter in zone_config.get("stale_columns_in_summary", []):
-            col_idx = column_index_from_string(col_letter)
-            cell = ws.cell(row=row, column=col_idx)
-            if not isinstance(cell, MergedCell):
-                cell.value = None
-
-    # ── Step 4: Fill product data ────────────────────────────────
-    col_map = zone_config.get("product_columns", {})
-    currency = order_data.get("currency") or "JPY"
-    po_number = order_data.get("po_number", "")
-
-    # Build flat order context for fields repeated per row (flat-table templates)
-    supplier_data = order_data.get("suppliers", {}).get(sid, {})
+    # ── Build flat order context for both header_fields and product cells ──
     order_context = {
         "ship_name": order_data.get("ship_name", ""),
         "delivery_date": order_data.get("delivery_date", ""),
@@ -168,323 +140,342 @@ def fill_template(
         "destination_port": order_data.get("destination_port", ""),
         "voyage": order_data.get("voyage", ""),
         "supplier_name": supplier_data.get("supplier_name", ""),
+        "po_number": order_data.get("po_number", ""),
+        "currency": order_data.get("currency", ""),
     }
 
+    # ── Pre-scan: does this order contain ANY fractional numeric value? ──
+    # If so, every integer-only format in the product zone (including formula
+    # cells whose value we can't see at render time) gets promoted to
+    # `#,##0.##`. This makes display precision consistent across the whole
+    # filled workbook regardless of which cells happen to be integer.
+    any_fractional = _scan_for_fractional_values(products)
+
+    # ── Phase 1: copy header rows (rows 1 to prod_start - 1) ──
+    for src_row in range(1, prod_start):
+        _copy_row_cells(src_ws, dst_ws, src_row, src_row)
+
+    # ── Phase 1b: apply header_fields (placeholder substitution) ──
+    for cell_ref, data_path in config.header_fields.items():
+        col_letter, row_num = _split_cell_ref(cell_ref)
+        if row_num >= prod_start:
+            continue  # not in header zone
+        col_idx = column_index_from_string(col_letter)
+        value = _resolve_data_path(order_data, data_path, sid)
+        if value is None:
+            continue
+        cell = dst_ws.cell(row=row_num, column=col_idx)
+        if isinstance(cell, MergedCell):
+            continue
+        cell.value = value
+        cell.number_format = _format_for_value(
+            cell.number_format, value, force_decimal=any_fractional
+        )
+
+    # ── Phase 2: emit N product rows from the template's first product row ──
+    template_row = prod_start
+    po_number = order_data.get("po_number", "")
+    currency = order_data.get("currency", "")
+
     for i, product in enumerate(products):
-        row = prod_zone["start"] + i
-        for col_letter, field_name in col_map.items():
+        dst_row = prod_start + i
+        # Copy the template product row's cell formats
+        _copy_row_cells(src_ws, dst_ws, template_row, dst_row)
+        # Override values with product data (with order_context fallback)
+        for col_letter, field_name in config.product_columns.items():
             col_idx = column_index_from_string(col_letter)
-            cell = ws.cell(row=row, column=col_idx)
-            if isinstance(cell, MergedCell):
-                continue
-            cell.value = _resolve_product_field(
-                field_name, product, i, po_number, currency, order_context,
+            value = _resolve_product_field(
+                field_name, product, i, po_number, currency, order_context
             )
-
-    # ── Step 5: Product row formulas ─────────────────────────────
-    for col_letter, formula_tpl in zone_config.get("product_row_formulas", {}).items():
-        col_idx = column_index_from_string(col_letter)
-        for row in range(prod_zone["start"], new_prod_end + 1):
-            cell = ws.cell(row=row, column=col_idx)
+            cell = dst_ws.cell(row=dst_row, column=col_idx)
             if isinstance(cell, MergedCell):
                 continue
-            cell.value = formula_tpl.replace("{row}", str(row))
+            cell.value = value
+            cell.number_format = _format_for_value(
+                cell.number_format, value, force_decimal=any_fractional
+            )
+        # Apply per-row formulas — formula cells don't have a value at render
+        # time, so we promote unconditionally if any product data is fractional
+        for col_letter, formula_tpl in config.product_row_formulas.items():
+            col_idx = column_index_from_string(col_letter)
+            cell = dst_ws.cell(row=dst_row, column=col_idx)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.value = formula_tpl.replace("{row}", str(dst_row))
+            if any_fractional:
+                cell.number_format = _promote_int_format(cell.number_format)
 
-    # ── Step 6: Summary formulas ─────────────────────────────────
-    formula_cells = {}  # placeholders for cross-references
+    # ── Phase 3: copy rows below the product zone (summary + footer) ──
+    # Each row gets shifted by row_delta. Formulas in summary cells are
+    # NOT auto-adjusted from the template — instead we re-emit them from
+    # `summary_formulas` in zone_config (the explicit declarative source
+    # of truth). This avoids fragile regex-based formula parsing.
+    for src_row in range(prod_end + 1, src_ws.max_row + 1):
+        dst_row = src_row + row_delta
+        _copy_row_cells(src_ws, dst_ws, src_row, dst_row)
 
-    for idx, sf in enumerate(zone_config.get("summary_formulas", [])):
-        col_letter = "".join(c for c in sf["cell"] if c.isalpha())
+    # ── Phase 3a: clear stale columns inside the summary zone ──
+    for row in range(new_summ_start, new_summ_end + 1):
+        for col_letter in config.stale_columns_in_summary:
+            col_idx = column_index_from_string(col_letter)
+            cell = dst_ws.cell(row=row, column=col_idx)
+            if not isinstance(cell, MergedCell):
+                cell.value = None
+
+    # ── Phase 3b: restore summary static values at new positions ──
+    for cell_ref, value in config.summary_static_values.items():
+        col_letter, orig_row = _split_cell_ref(cell_ref)
+        offset = orig_row - summ_start
+        new_row = new_summ_start + offset
         col_idx = column_index_from_string(col_letter)
-        target_row = new_summ_start + idx
+        cell = dst_ws.cell(row=new_row, column=col_idx)
+        if not isinstance(cell, MergedCell):
+            cell.value = value
 
-        if sf["type"] == "product_sum":
-            col = sf.get("col", col_letter)
-            formula = f"=SUM({col}{prod_zone['start']}:{col}{new_prod_end})"
-            formula_cells["sum_cell"] = f"{col_letter}{target_row}"
-        elif sf["type"] == "relative":
-            formula = sf["formula_template"]
-            for key, ref in formula_cells.items():
+    # ── Phase 3c: emit summary formulas at new positions ──
+    formula_cell_refs: dict[str, str] = {}
+    for sf in config.summary_formulas:
+        col_letter, orig_row = _split_cell_ref(sf.cell)
+        new_row = orig_row + row_delta
+        col_idx = column_index_from_string(col_letter)
+
+        if sf.type == "product_sum":
+            formula = f"=SUM({col_letter}{prod_start}:{col_letter}{new_prod_end})"
+            formula_cell_refs["sum_cell"] = f"{col_letter}{new_row}"
+        elif sf.type == "relative":
+            formula = sf.formula_template or ""
+            for key, ref in formula_cell_refs.items():
                 formula = formula.replace(f"{{{key}}}", ref)
-            # Track tax cell
-            label = sf.get("label", "")
-            if "tax" in label.lower() or "*0.08" in sf.get("formula_template", ""):
-                formula_cells["tax_cell"] = f"{col_letter}{target_row}"
+            label = (sf.label or "").lower()
+            if "tax" in label:
+                formula_cell_refs["tax_cell"] = f"{col_letter}{new_row}"
+            if "grand" in label or "total" in label:
+                formula_cell_refs["grand_total_cell"] = f"{col_letter}{new_row}"
         else:
             continue
 
-        ws.cell(row=target_row, column=col_idx).value = formula
+        cell = dst_ws.cell(row=new_row, column=col_idx)
+        if isinstance(cell, MergedCell):
+            continue
+        cell.value = formula
+        if any_fractional:
+            cell.number_format = _promote_int_format(cell.number_format)
 
-        # Track grand total
-        label = sf.get("label", "")
-        if "grand" in label.lower() or "total" in label.upper():
-            formula_cells["grand_total_cell"] = f"{col_letter}{target_row}"
-
-    # ── Step 6b: External cross-references ───────────────────────
-    for ext in zone_config.get("external_refs", []):
-        cell_ref = ext["cell"]
-        col_letter = "".join(c for c in cell_ref if c.isalpha())
-        row_num = int("".join(c for c in cell_ref if c.isdigit()))
+    # ── Phase 3d: external cross-references ──
+    # zone_config["external_refs"] declares header (or other) cells whose
+    # formulas reference summary cells (typically grand_total) by name.
+    # Template authors use these to display the grand total in the header.
+    # After row resizing, the underlying grand total cell has moved, so we
+    # must rewrite these formulas with the NEW addresses.
+    for ext in config.external_refs:
+        col_letter, row_num = _split_cell_ref(ext.cell)
         col_idx = column_index_from_string(col_letter)
-        formula = ext["formula_template"]
-        for key, ref in formula_cells.items():
+        formula = ext.formula_template
+        for key, ref in formula_cell_refs.items():
             formula = formula.replace(f"{{{key}}}", ref)
-        ws.cell(row=row_num, column=col_idx).value = formula
+        cell = dst_ws.cell(row=row_num, column=col_idx)
+        if isinstance(cell, MergedCell):
+            continue
+        cell.value = formula
+        if any_fractional:
+            cell.number_format = _promote_int_format(cell.number_format)
 
-    # ── Step 7: Restore summary static values ────────────────────
-    for cell_ref, value in zone_config.get("summary_static_values", {}).items():
-        col_letter = "".join(c for c in cell_ref if c.isalpha())
-        orig_row = int("".join(c for c in cell_ref if c.isdigit()))
-        offset = orig_row - summ_zone["start"]
-        new_row = new_summ_start + offset
-        col_idx = column_index_from_string(col_letter)
-        ws.cell(row=new_row, column=col_idx).value = value
+    # ── Phase 4: copy column widths (visual fidelity) ──
+    for col_letter, dim in src_ws.column_dimensions.items():
+        if dim.width:
+            dst_ws.column_dimensions[col_letter].width = dim.width
 
-    # ── Step 8: Clone styles ─────────────────────────────────────
-    src_row = prod_zone["start"]
-    for row in range(src_row + 1, new_prod_end + 1):
-        for col in range(1, max_col + 1):
-            src = ws.cell(row=src_row, column=col)
-            dst = ws.cell(row=row, column=col)
-            if isinstance(src, MergedCell) or isinstance(dst, MergedCell):
-                continue
-            if src.has_style:
-                dst.font = copy.copy(src.font)
-                dst.fill = copy.copy(src.fill)
-                dst.border = copy.copy(src.border)
-                dst.alignment = copy.copy(src.alignment)
-                dst.number_format = src.number_format
+    # ── Phase 4b: copy row heights, shifting rows below the product zone ──
+    # Rows in the product zone are replicated (all N products get the
+    # template product row's height). Rows below prod_end shift by row_delta.
+    template_prod_height = src_ws.row_dimensions[prod_start].height if prod_start in src_ws.row_dimensions else None
+    for src_row_num, dim in src_ws.row_dimensions.items():
+        if dim.height is None:
+            continue
+        if src_row_num < prod_start:
+            dst_ws.row_dimensions[src_row_num].height = dim.height
+        elif src_row_num > prod_end:
+            dst_ws.row_dimensions[src_row_num + row_delta].height = dim.height
+        # product-zone rows handled below
+    if template_prod_height is not None:
+        for i in range(n_products):
+            dst_ws.row_dimensions[prod_start + i].height = template_prod_height
 
-    # ── Step 8b: Re-apply product-row merges ──────────────────────
-    # Restore per-row merges captured in Step 0c (e.g. F:G for description).
-    if row_merges:
-        for row in range(prod_zone["start"], new_prod_end + 1):
-            for start_col, end_col in row_merges:
-                start_letter = get_column_letter(start_col)
-                end_letter = get_column_letter(end_col)
-                ws.merge_cells(f"{start_letter}{row}:{end_letter}{row}")
-        logger.info(
-            "Re-applied %d column merge(s) per product row (%d rows)",
-            len(row_merges), actual_rows,
+    # ── Phase 4c: copy sheet-level layout properties ──
+    # These control printing, zoom, and default row metrics. Losing them
+    # breaks PDF export and visual parity with the template.
+    try:
+        dst_ws.page_margins = copy.copy(src_ws.page_margins)
+        dst_ws.page_setup = copy.copy(src_ws.page_setup)
+        dst_ws.print_options = copy.copy(src_ws.print_options)
+        dst_ws.sheet_format = copy.copy(src_ws.sheet_format)
+        dst_ws.sheet_properties = copy.copy(src_ws.sheet_properties)
+        # sheet_view has no setter — mutate in place via the sheet_views list
+        if src_ws.sheet_view is not None and dst_ws.views.sheetView:
+            dst_ws.views.sheetView[0] = copy.copy(src_ws.sheet_view)
+        # Freeze panes (simple string like "A5") — safe to assign directly
+        if src_ws.freeze_panes:
+            dst_ws.freeze_panes = src_ws.freeze_panes
+        # Page header/footer
+        dst_ws.oddHeader = copy.copy(src_ws.oddHeader)
+        dst_ws.oddFooter = copy.copy(src_ws.oddFooter)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to copy sheet layout properties: %s", exc)
+
+    # ── Phase 4d: shift print area / print titles / auto filter by row_delta ──
+    # These reference absolute rows in the template; if the summary moved,
+    # they need to move too, or printing cuts off the wrong region.
+    if src_ws.print_area:
+        dst_ws.print_area = _shift_range_rows(src_ws.print_area, prod_end, row_delta)
+    if src_ws.print_title_rows:
+        # Print title rows are usually header rows (above prod_start) — no shift needed
+        dst_ws.print_title_rows = src_ws.print_title_rows
+    if src_ws.auto_filter and src_ws.auto_filter.ref:
+        dst_ws.auto_filter.ref = _shift_range_rows(
+            src_ws.auto_filter.ref, prod_end, row_delta
         )
 
-    # ── Step 9: Ensure minimum column widths ─────────────────────
-    # Templates with merged headers often leave data columns too narrow.
-    # After filling, enforce minimums based on field semantics so content
-    # is always readable when opened in Excel.
-    _ensure_column_widths(ws, col_map, zone_config.get("product_row_formulas", {}))
+    # ── Phase 5: re-create merges, adjusting positions ──
+    for merged in list(src_ws.merged_cells.ranges):
+        if merged.max_row < prod_start:
+            # Header merge: same position
+            try:
+                dst_ws.merge_cells(str(merged))
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Failed to copy header merge %s: %s", merged, exc)
 
-    # ── Force recalculation on open ──────────────────────────────
-    wb.calculation = CalcProperties(fullCalcOnLoad=True)
+        elif merged.min_row >= prod_start and merged.max_row <= prod_end:
+            # Product-zone merge: replicate per product row
+            row_offset_in_zone = merged.min_row - prod_start
+            for i in range(n_products):
+                dst_row = prod_start + i + row_offset_in_zone
+                start_letter = get_column_letter(merged.min_col)
+                end_letter = get_column_letter(merged.max_col)
+                try:
+                    dst_ws.merge_cells(f"{start_letter}{dst_row}:{end_letter}{dst_row}")
+                except Exception:  # pragma: no cover
+                    pass
 
-    # ── Save to bytes ────────────────────────────────────────────
+        elif merged.min_row > prod_end:
+            # Summary or footer merge: shift down by row_delta
+            new_min = merged.min_row + row_delta
+            new_max = merged.max_row + row_delta
+            start_letter = get_column_letter(merged.min_col)
+            end_letter = get_column_letter(merged.max_col)
+            try:
+                dst_ws.merge_cells(f"{start_letter}{new_min}:{end_letter}{new_max}")
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Failed to copy summary merge %s → %s%d:%s%d: %s",
+                               merged, start_letter, new_min, end_letter, new_max, exc)
+        else:
+            # Boundary-straddling merge — rare, skip with warning
+            logger.warning("Skipped boundary-straddling merge: %s", merged)
+
+    # ── Save ──
     buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    logger.info(
-        "fill_template complete: %d products, output=%d bytes",
-        actual_rows, buf.getbuffer().nbytes,
-    )
-    return buf.read()
+    dst_wb.save(buf)
+    return buf.getvalue()
 
 
-def verify_output(
-    excel_bytes: bytes,
-    zone_config: dict[str, Any],
-    order_data: dict[str, Any],
-    supplier_id: str | int,
-) -> dict[str, Any]:
-    """Round-trip verification: read back generated Excel and compare against source data.
+# ──────────────────────────────────────────────────────────────────────
+# Helpers (private)
+# ──────────────────────────────────────────────────────────────────────
 
-    Returns: {"ok": bool, "errors": [...], "checks": int}
+
+def _split_cell_ref(cell_ref: str) -> tuple[str, int]:
+    """Split 'B2' into ('B', 2)."""
+    col_letter = "".join(c for c in cell_ref if c.isalpha())
+    row_num = int("".join(c for c in cell_ref if c.isdigit()))
+    return col_letter, row_num
+
+
+def _shift_range_rows(range_ref: str, pivot_row: int, row_delta: int) -> str:
+    """Shift rows > pivot_row in an Excel range reference by row_delta.
+
+    Handles refs like 'A1:K30', '$A$1:$K$30', "'Sheet'!$A$1:$K$30".
+    Rows <= pivot_row stay put (they're in the header/product zone).
     """
-    sid = str(supplier_id)
-    wb = load_workbook(io.BytesIO(excel_bytes))
-    ws = wb.active
+    import re
+    if not range_ref or row_delta == 0:
+        return range_ref
 
-    products = _get_products(order_data, sid)
-    prod_start = zone_config["zones"]["product_data"]["start"]
-    new_prod_end = prod_start + len(products) - 1
-    new_summ_start = new_prod_end + 1
+    def _shift_one(match: re.Match) -> str:
+        col = match.group(1)
+        row = int(match.group(2))
+        if row > pivot_row:
+            row += row_delta
+        return f"{col}{row}"
 
-    errors: list[str] = []
-    checks = 0
-
-    # ── 1. Header fields ─────────────────────────────────────────
-    for cell_ref, data_path in zone_config.get("header_fields", {}).items():
-        col_letter = "".join(c for c in cell_ref if c.isalpha())
-        row_num = int("".join(c for c in cell_ref if c.isdigit()))
-        col_idx = column_index_from_string(col_letter)
-
-        expected = _resolve_path(order_data, data_path, sid)
-        actual = ws.cell(row=row_num, column=col_idx).value
-        checks += 1
-
-        if expected and actual != expected:
-            # Allow string conversion mismatch (e.g., int vs str)
-            if str(actual) != str(expected):
-                errors.append(f"Header {cell_ref}: expected '{expected}', got '{actual}'")
-
-    # ── 2. Product data ──────────────────────────────────────────
-    col_map = zone_config.get("product_columns", {})
-    po_number = order_data.get("po_number", "")
-    currency = order_data.get("currency") or "JPY"
-
-    # Build flat order context for verify (same as fill_template Step 4)
-    supplier_data = order_data.get("suppliers", {}).get(sid, {})
-    verify_order_ctx = {
-        "ship_name": order_data.get("ship_name", ""),
-        "delivery_date": order_data.get("delivery_date", ""),
-        "order_date": order_data.get("order_date", ""),
-        "destination_port": order_data.get("destination_port", ""),
-        "voyage": order_data.get("voyage", ""),
-        "supplier_name": supplier_data.get("supplier_name", ""),
-    }
-
-    for i, product in enumerate(products):
-        row = prod_start + i
-        for col_letter, field_name in col_map.items():
-            col_idx = column_index_from_string(col_letter)
-            cell = ws.cell(row=row, column=col_idx)
-            if isinstance(cell, MergedCell):
-                continue
-
-            expected = _resolve_product_field(field_name, product, i, po_number, currency, verify_order_ctx)
-            actual = cell.value
-            checks += 1
-
-            if expected is None:
-                continue
-            if actual is None:
-                errors.append(f"Row {row} {col_letter} ({field_name}): expected '{expected}', got None")
-                continue
-
-            # Numeric comparison
-            if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-                if abs(float(expected) - float(actual)) > 0.001:
-                    errors.append(f"Row {row} {col_letter}: expected {expected}, got {actual}")
-            elif str(actual) != str(expected):
-                errors.append(f"Row {row} {col_letter}: expected '{expected}', got '{actual}'")
-
-    # ── 3. Product row formulas ──────────────────────────────────
-    for col_letter, formula_tpl in zone_config.get("product_row_formulas", {}).items():
-        col_idx = column_index_from_string(col_letter)
-        for row in range(prod_start, new_prod_end + 1):
-            cell = ws.cell(row=row, column=col_idx)
-            if isinstance(cell, MergedCell):
-                continue
-            expected = formula_tpl.replace("{row}", str(row))
-            checks += 1
-            if cell.value != expected:
-                errors.append(f"Formula {col_letter}{row}: expected '{expected}', got '{cell.value}'")
-                if len(errors) > 20:
-                    errors.append("... (truncated)")
-                    break
-
-    # ── 4. Summary formulas ──────────────────────────────────────
-    for idx, sf in enumerate(zone_config.get("summary_formulas", [])):
-        col_letter = "".join(c for c in sf["cell"] if c.isalpha())
-        col_idx = column_index_from_string(col_letter)
-        target_row = new_summ_start + idx
-        actual = ws.cell(row=target_row, column=col_idx).value
-        checks += 1
-        if actual is None or not str(actual).startswith("="):
-            errors.append(f"Summary {col_letter}{target_row}: expected formula, got '{actual}'")
-
-    # ── 5. Stale data check ──────────────────────────────────────
-    summ_zone = zone_config["zones"]["summary"]
-    new_summ_end = new_summ_start + (summ_zone["end"] - summ_zone["start"])
-    for row in range(new_summ_start, new_summ_end + 1):
-        for col_letter in zone_config.get("stale_columns_in_summary", []):
-            col_idx = column_index_from_string(col_letter)
-            cell = ws.cell(row=row, column=col_idx)
-            if isinstance(cell, MergedCell):
-                continue
-            checks += 1
-            # Check if it's a known static value
-            orig_row = summ_zone["start"] + (row - new_summ_start)
-            orig_ref = f"{col_letter}{orig_row}"
-            if orig_ref in zone_config.get("summary_static_values", {}):
-                continue
-            if cell.value is not None:
-                errors.append(f"Stale data {col_letter}{row}: '{cell.value}'")
-
-    # ── 6. Numeric type check ────────────────────────────────────
-    numeric_fields = {"quantity", "unit_price"}
-    for i in range(min(5, len(products))):
-        row = prod_start + i
-        for col_letter, field_name in col_map.items():
-            if field_name not in numeric_fields:
-                continue
-            col_idx = column_index_from_string(col_letter)
-            val = ws.cell(row=row, column=col_idx).value
-            checks += 1
-            if val is not None and isinstance(val, str):
-                errors.append(f"Row {row} {col_letter} ({field_name}): should be numeric, got string '{val}'")
-
-    result = {
-        "ok": len(errors) == 0,
-        "errors": errors,
-        "checks": checks,
-        "product_count": len(products),
-    }
-
-    if errors:
-        logger.warning("verify_output: %d errors in %d checks", len(errors), checks)
-        for e in errors[:5]:
-            logger.warning("  %s", e)
-    else:
-        logger.info("verify_output: all %d checks passed", checks)
-
-    return result
+    # Shift each cell ref (letters+digits) in the string
+    return re.sub(r"(\$?[A-Z]+\$?)(\d+)", _shift_one, range_ref)
 
 
-# ── Private helpers ──────────────────────────────────────────────
+def _scan_for_fractional_values(products: list[dict]) -> bool:
+    """Return True if any product has a non-integer numeric field."""
+    for product in products:
+        for v in product.values():
+            if isinstance(v, float) and v != int(v):
+                return True
+    return False
 
 
-def _detect_row_merge_pattern(
-    ws, first_row: int, col_map: dict[str, str],
-) -> list[tuple[int, int]]:
-    """Detect per-row column merges in the first product row of the template.
+def _copy_row_cells(src_ws, dst_ws, src_row: int, dst_row: int) -> None:
+    """Copy all cells in src_row to dst_row, including value + style."""
+    max_col = src_ws.max_column or 1
+    for col_idx in range(1, max_col + 1):
+        src_cell = src_ws.cell(row=src_row, column=col_idx)
+        if isinstance(src_cell, MergedCell):
+            continue
+        dst_cell = dst_ws.cell(row=dst_row, column=col_idx)
+        dst_cell.value = src_cell.value
+        if src_cell.has_style:
+            dst_cell.font = copy.copy(src_cell.font)
+            dst_cell.fill = copy.copy(src_cell.fill)
+            dst_cell.border = copy.copy(src_cell.border)
+            dst_cell.alignment = copy.copy(src_cell.alignment)
+            dst_cell.number_format = src_cell.number_format
+            dst_cell.protection = copy.copy(src_cell.protection)
 
-    Scans merge ranges that span exactly one row (the first product row) and
-    cover columns used in the product table. Returns a list of (start_col, end_col)
-    tuples representing merges to replicate per product row.
 
-    Also infers merges from "gaps" in col_map: if column G has no mapping but
-    F and H do, F:G is a merge (the template visually merges them).
+def _promote_int_format(template_fmt: str) -> str:
+    """Force-promote an integer-only format to optional-decimal."""
+    if template_fmt in _INTEGER_ONLY_FORMATS:
+        return "#,##0.##"
+    return template_fmt
+
+
+def _format_for_value(template_fmt: str, value: Any, force_decimal: bool = False) -> str:
+    """Promote integer-only number formats to optional-decimal when needed.
+
+    Strings (non-formula) never get promoted — strings ignore number_format
+    in Excel anyway. Formula strings (start with "=") are treated as numeric
+    because Excel evaluates them.
     """
-    merges: list[tuple[int, int]] = []
-
-    # Method 1: explicit merge ranges on the first product row
-    for mr in ws.merged_cells.ranges:
-        if mr.min_row == first_row and mr.max_row == first_row:
-            merges.append((mr.min_col, mr.max_col))
-
-    # Method 2: infer from gaps in col_map
-    if not merges and col_map:
-        mapped_cols = sorted(column_index_from_string(c) for c in col_map)
-        for i in range(len(mapped_cols) - 1):
-            gap = mapped_cols[i + 1] - mapped_cols[i]
-            if gap > 1:
-                # Columns between mapped_cols[i] and mapped_cols[i+1] are skipped
-                merges.append((mapped_cols[i], mapped_cols[i + 1] - 1))
-
-    if merges:
-        logger.info(
-            "Detected %d product-row merge pattern(s): %s",
-            len(merges),
-            [(get_column_letter(s), get_column_letter(e)) for s, e in merges],
-        )
-    return merges
+    if isinstance(value, str) and not value.startswith("="):
+        return template_fmt
+    if force_decimal:
+        return _promote_int_format(template_fmt)
+    if not isinstance(value, (int, float)):
+        return template_fmt
+    if value == int(value):
+        return template_fmt
+    return _promote_int_format(template_fmt)
 
 
-def _get_products(order_data: dict, sid: str) -> list[dict]:
-    """Extract product list for a supplier from order_data."""
-    supplier = order_data.get("suppliers", {}).get(sid, {})
-    return supplier.get("products", [])
-
+def _resolve_data_path(order_data: dict, path: str, sid: str) -> Any:
+    """Resolve a dotted data path like 'suppliers.{sid}.supplier_name'."""
+    if not path:
+        return None
+    expanded = path.replace("{sid}", sid)
+    cursor: Any = order_data
+    for part in expanded.split("."):
+        if isinstance(cursor, dict):
+            cursor = cursor.get(part)
+        else:
+            return None
+        if cursor is None:
+            return None
+    return cursor
 
 
 def _resolve_product_field(
@@ -493,19 +484,19 @@ def _resolve_product_field(
     index: int,
     po_number: str,
     currency: str,
-    order_data: dict | None = None,
+    order_context: dict | None = None,
 ) -> Any:
-    """Resolve a product column value from the product dict.
+    """Resolve a product cell value, falling back to order-level context.
 
-    For flat-table templates (Korean-style), order-level fields like ship_name,
-    delivery_date, supplier_name are repeated on every product row. These are
-    resolved from order_data when the product dict doesn't have them.
+    Mirrors services/template_engine.py::_resolve_product_field so that flat-
+    table templates (which repeat ship_name / supplier_name / delivery_date
+    on every product row) work correctly.
     """
-    if field_name == "line_number" or field_name == "__line_number__":
+    if field_name in ("line_number", "__line_number__"):
         return index + 1
-    if field_name == "po_number" or field_name == "__po_number__":
+    if field_name in ("po_number", "__po_number__"):
         return po_number
-    if field_name == "currency" or field_name == "__currency__":
+    if field_name in ("currency", "__currency__"):
         return product.get("currency") or currency
 
     if field_name == "product_code":
@@ -516,13 +507,10 @@ def _resolve_product_field(
         return product.get("product_name_jp", "")
     if field_name == "description":
         return product.get("pack_size", "")
-
     if field_name == "quantity":
-        val = product.get("quantity")
-        return _to_number(val)
+        return product.get("quantity")
     if field_name == "unit_price":
-        val = product.get("unit_price")
-        return _to_number(val)
+        return product.get("unit_price")
     if field_name == "unit":
         return product.get("unit", "CT")
 
@@ -531,72 +519,14 @@ def _resolve_product_field(
     if val is not None and val != "":
         return val
 
-    # Fallback to order_data for order-level fields repeated per row
-    # (e.g., ship_name, delivery_date, supplier_name in flat-table templates)
-    if order_data:
-        val = order_data.get(field_name)
+    # Fallback to order-level context for repeated fields
+    if order_context:
+        val = order_context.get(field_name)
         if val is not None:
             return val
 
     return ""
 
 
-def _to_number(val: Any) -> int | float | None:
-    """Convert value to number, keeping None as None."""
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return val
-    if isinstance(val, str):
-        try:
-            f = float(val)
-            return int(f) if f == int(f) else f
-        except (ValueError, TypeError):
-            return val
-    return val
-
-
-# Minimum column widths by field type (in Excel character units).
-# Templates with merged headers often leave data columns too narrow;
-# after filling and unmerging, content overflows visually.
-# These minimums ensure readability without disrupting intentional layout.
-_FIELD_MIN_WIDTHS: dict[str, float] = {
-    "line_number": 4.5,
-    "po_number": 14,
-    "product_code": 14,
-    "product_name": 28,
-    "product_name_en": 28,
-    "product_name_jp": 20,
-    "description": 12,
-    "quantity": 8,
-    "unit": 6,
-    "unit_price": 10,
-    "currency": 7,
-}
-
-# Formula columns (amounts, totals) also need readable width.
-_FORMULA_MIN_WIDTH: float = 12
-
-
-def _ensure_column_widths(
-    ws,
-    col_map: dict[str, str],
-    formula_cols: dict[str, str],
-) -> None:
-    """Widen columns that are narrower than the minimum for their field type.
-
-    Only increases width — never shrinks columns that are already wide enough.
-    This preserves the template's intended layout while preventing overflow.
-    """
-    for col_letter, field_name in col_map.items():
-        min_w = _FIELD_MIN_WIDTHS.get(field_name)
-        if min_w is None:
-            min_w = 10  # sensible default for unknown fields
-        current = ws.column_dimensions[col_letter].width or 0
-        if current < min_w:
-            ws.column_dimensions[col_letter].width = min_w
-
-    for col_letter in formula_cols:
-        current = ws.column_dimensions[col_letter].width or 0
-        if current < _FORMULA_MIN_WIDTH:
-            ws.column_dimensions[col_letter].width = _FORMULA_MIN_WIDTH
+# Re-export for convenient imports
+__all__ = ["compose_render", "ZoneConfigValidationError"]

@@ -26,10 +26,12 @@ from database import get_db, SessionLocal
 from models import AgentSession, AgentMessage, User
 from routes.auth import get_current_user
 from security import require_role
+from services.agent.scenarios import resolve_tools_for_scenario
 from services.agent.stream_queue import (
     get_or_create_queue, get_queue, remove_queue, push_event,
     get_or_create_cancel_event, set_cancelled, remove_cancel_event,
 )
+from services.document_context_package import build_document_context_injection
 
 require_chat_user = require_role("superadmin", "admin", "employee")
 
@@ -124,7 +126,7 @@ def _build_system_prompt(enabled_tools: set[str] | None, ctx,
 
 def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None = None,
                        scenario: str | None = None, user_role: str = "employee",
-                       user_id: int | None = None):
+                       user_id: int | None = None, user_message: str | None = None):
     """Create a ReAct agent configured for chat with general-purpose + query tools.
 
     DeerFlow 2.0 aligned middleware chain (16 middlewares → 10 for our use case):
@@ -162,6 +164,7 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
 
     # Load enabled tools from DB
     enabled_tools = _load_enabled_tools(db)
+    scenario_tools = resolve_tools_for_scenario(scenario, enabled_tools)
 
     # Workspace for generated files (bash tool defaults cwd here)
     workspace_dir = os.path.join(settings.AGENT_WORKSPACE_ROOT, session_id)
@@ -180,7 +183,11 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     # Tools — general-purpose + business query tools
     ctx = ToolContext(db=db, file_bytes=file_bytes, pipeline_session_id=session_id,
                       workspace_dir=workspace_dir,
-                      user_id=user_id, session_id=session_id)
+                      user_id=user_id, user_role=user_role, session_id=session_id)
+    ctx._scenario_context_injection = build_document_context_injection(
+        db, user_message or "", scenario,
+        user_id=user_id, user_role=user_role,
+    )
 
     # Tracer: token + tool performance tracking
     from services.agent.tracer import AgentTracer
@@ -193,19 +200,34 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     # No more tool whitelist filtering — tools never "disappear"
     registry = create_chat_registry(ctx)
 
-    # Role-based permissions
+    # Make scenario tools visible to the LLM and hide irrelevant tools from
+    # tool declarations. This keeps document/order workflows narrow and fast.
+    if scenario_tools is not None:
+        for tool_name in list(registry.names()):
+            if tool_name in scenario_tools:
+                registry.activate(tool_name)
+            else:
+                registry.defer(tool_name)
+
+    # Role + scenario-based permissions. Scenario-specific sessions should only
+    # expose the narrow tool set needed for that workflow.
+    permission_rules: list[dict[str, str]] = []
     if user_role == "employee":
-        registry.set_permissions([
+        permission_rules.extend([
             {"tool": "bash", "permission": "deny"},
             {"tool": "execute_upload", "permission": "deny"},
-            {"tool": "*", "permission": "allow"},
         ])
     elif user_role == "admin":
-        registry.set_permissions([
-            {"tool": "bash", "permission": "deny"},
-            {"tool": "*", "permission": "allow"},
-        ])
-    # superadmin: default all allow
+        permission_rules.append({"tool": "bash", "permission": "deny"})
+
+    if scenario_tools is not None:
+        for tool_name in sorted(scenario_tools):
+            permission_rules.append({"tool": tool_name, "permission": "allow"})
+        permission_rules.append({"tool": "*", "permission": "deny"})
+    else:
+        permission_rules.append({"tool": "*", "permission": "allow"})
+
+    registry.set_permissions(permission_rules)
 
     # ─── Middleware chain (DeerFlow 2.0 aligned, order-dependent) ───
     from services.agent.hooks import MiddlewareChain, SqlReadOnlyHook, OutputSanitizationHook
@@ -265,7 +287,7 @@ def _create_chat_agent(session_id: str, db: DBSession, file_bytes: bytes | None 
     # Build dynamic system prompt AFTER registry (knows registered_tool_names)
     # DeerFlow: inject memory into prompt context
     system_prompt = _build_system_prompt(
-        None, ctx, scenario=scenario,
+        scenario_tools, ctx, scenario=scenario,
         registered_tool_names=set(registry.names()),
     )
 
@@ -604,11 +626,15 @@ async def stream_messages(
 
         max_idle = 240  # 240 consecutive empty reads * 0.5s = 120s inactivity timeout
         idle_count = 0
+        heartbeat_interval = 30  # Send heartbeat every 30 idle polls (15s)
         while idle_count < max_idle:
             try:
                 event = await loop.run_in_executor(None, lambda: q.get(True, 0.5))
             except Empty:
                 idle_count += 1
+                # Send heartbeat to keep connection alive (every 15s)
+                if idle_count % heartbeat_interval == 0:
+                    yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
                 continue
 
             idle_count = 0  # Reset on successful read
@@ -653,7 +679,7 @@ def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None
     try:
         agent = _create_chat_agent(session_id, db, file_bytes=file_bytes,
                                    scenario=scenario, user_role=user_role,
-                                   user_id=user_id)
+                                   user_id=user_id, user_message=user_message)
         if cancel_event:
             agent.ctx.cancel_event = cancel_event
 
@@ -661,6 +687,8 @@ def _run_chat_agent(session_id: str, user_message: str, file_bytes: bytes | None
         # Skill content is injected as a transient system message (not in user message)
         # so the user's message stays clean in the UI
         _SCENARIO_SKILL_MAP = {
+            "document_processing": "process-document",
+            "order_processing": "process-order",
             "inquiry": "generate-inquiry",
             "data_upload": "data-upload",
             "fulfillment": "fulfillment",

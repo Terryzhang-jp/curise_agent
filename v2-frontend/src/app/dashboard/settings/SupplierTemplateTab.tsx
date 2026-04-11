@@ -986,8 +986,8 @@ export default function SupplierTemplateTab() {
             <Label className="text-xs mb-2 block">上传询价模板 Excel（可选）</Label>
             <FileDropZone
               onFile={handleFileUpload}
-              accept=".xlsx,.pdf"
-              label="拖拽供应商的询价模板 .xlsx / .pdf 文件"
+              accept=".xlsx,.xls"
+              label="拖拽供应商的询价模板 .xlsx / .xls 文件"
             />
             {loading && (
               <div className="flex items-center justify-center gap-2 text-muted-foreground text-xs mt-3">

@@ -9,6 +9,7 @@ export type OrderStatus =
   | "uploading"
   | "pending_template"
   | "extracting"
+  | "extracted"
   | "matching"
   | "ready"
   | "error";
@@ -107,7 +108,7 @@ export interface GeneratedFile {
 
 export interface VerifyResult {
   cell: string;
-  annotation: string;
+  annotation?: string;
   value: string;
   status: "pass" | "fail" | "unchecked";
   reason?: string;
@@ -311,6 +312,7 @@ export interface DeliveryEnvironment {
 export interface Order {
   id: number;
   user_id?: number;
+  document_id?: number | null;
   filename: string;
   file_url: string | null;
   file_type: string;
@@ -432,11 +434,44 @@ export async function reviewOrder(
   return handleResponse(res);
 }
 
+export interface PortItem {
+  id: number;
+  name: string;
+  code: string | null;
+  country_id: number | null;
+  country_name: string | null;
+  location: string | null;
+  status: boolean | null;
+}
+
+export interface CountryItem {
+  id: number;
+  name: string;
+  code: string | null;
+  status: boolean | null;
+}
+
+export async function getPortsList(): Promise<PortItem[]> {
+  const res = await fetchWithAuth(`${API_BASE}/api/data/ports`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
+}
+
+export async function getCountriesList(): Promise<CountryItem[]> {
+  const res = await fetchWithAuth(`${API_BASE}/api/data/countries`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
+}
+
 export async function updateOrder(
   orderId: number,
   payload: {
     order_metadata?: Record<string, unknown>;
     products?: OrderProduct[];
+    port_id?: number | null;
+    country_id?: number | null;
   }
 ): Promise<Order> {
   const res = await fetchWithAuth(`${API_BASE}/api/orders/${orderId}`, {
@@ -520,7 +555,7 @@ export async function generateInquiry(orderId: number): Promise<Order> {
 // ─── Streaming Inquiry API ──────────────────────────────────
 
 export interface InquiryStep {
-  type: "tool_call" | "tool_result" | "thinking" | "preview" | "supplier_start" | "supplier_done";
+  type: "tool_call" | "tool_result" | "thinking" | "preview" | "supplier_start" | "supplier_done" | "cancelled";
   tool_name?: string;
   tool_label?: string;
   content?: string;
@@ -537,14 +572,30 @@ export interface InquiryStep {
 
 export async function startGenerateInquiry(
   orderId: number,
-  templateOverrides?: Record<number, number | null>
+  templateOverrides?: Record<number, number | null>,
+  supplierIds?: number[],
 ): Promise<{ status: string; stream_key: string }> {
   const res = await fetchWithAuth(
     `${API_BASE}/api/orders/${orderId}/generate-inquiry`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ template_overrides: templateOverrides }),
+      body: JSON.stringify({ template_overrides: templateOverrides, supplier_ids: supplierIds }),
+    }
+  );
+  return handleResponse<{ status: string; stream_key: string }>(res);
+}
+
+export async function cancelGenerateInquiry(
+  orderId: number,
+  streamKey?: string,
+): Promise<{ status: string; stream_key: string }> {
+  const res = await fetchWithAuth(
+    `${API_BASE}/api/orders/${orderId}/cancel-inquiry`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stream_key: streamKey }),
     }
   );
   return handleResponse<{ status: string; stream_key: string }>(res);
@@ -595,6 +646,9 @@ export function streamInquiryProgress(
             const event = JSON.parse(jsonStr);
             if (event.type === "done") {
               onDone(event.data || {});
+              return;
+            } else if (event.type === "cancelled") {
+              onError(new Error(event.message || "询价生成已停止"));
               return;
             } else if (event.type === "error") {
               onError(new Error(event.message || "生成失败"));
@@ -724,6 +778,9 @@ export function streamInquiryProgressWithKey(
             if (event.type === "done") {
               onDone(event.data || {});
               return;
+            } else if (event.type === "cancelled") {
+              onError(new Error(event.message || "询价生成已停止"));
+              return;
             } else if (event.type === "error") {
               onError(new Error(event.message || "生成失败"));
               return;
@@ -769,6 +826,7 @@ export interface SupplierReadiness {
     name: string | null;
     method: string;
     has_zone_config: boolean;
+    candidate_count?: number;
   };
   gaps: FieldGap[];
   gap_summary: {

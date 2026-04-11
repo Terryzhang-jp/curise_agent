@@ -63,7 +63,8 @@ class ToolContext:
     _referenced_order_ids: set[int] = field(default_factory=set)
 
     # --- Memory (DeerFlow alignment) ---
-    user_id: int | None = None                                   # Current user (for memory loading)
+    user_id: int | None = None                                   # Current user (for memory loading + row-level ownership)
+    user_role: str = "employee"                                  # Role for ownership bypass ("superadmin" sees all)
     session_id: str | None = None                                # Current session ID
     memory_text: str = ""                                        # Injected by MemoryMiddleware
     _conversation_log: str = ""                                  # Built during run for memory extraction
@@ -77,6 +78,7 @@ class ToolContext:
     # --- Skill state ---
     skills: dict[str, SkillDef] = field(default_factory=dict)
     skill_paths: list[str] = field(default_factory=list)
+    _scenario_context_injection: str = ""
 
     # ----------------------------------------------------------
     # Artifact tracking — tools register orders they reference

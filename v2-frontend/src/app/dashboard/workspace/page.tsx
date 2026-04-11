@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
 import type { ChatSession, ChatMessage, TokenEvent, TokenDoneEvent } from "@/lib/chat-api";
 import {
   createChatSession,
@@ -18,10 +19,17 @@ import ChatPanel from "./ChatPanel";
 import ArtifactPanel from "@/components/artifact-panel";
 
 export default function WorkspacePage() {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const requestedSessionId = searchParams?.get("session") || null;
+  const requestedPrompt = searchParams?.get("prompt") || null;
+
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
+  const autoSelectedRef = useRef<string | null>(null);
+  const promptDispatchedRef = useRef<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -158,6 +166,35 @@ export default function WorkspacePage() {
   useEffect(() => {
     refreshSessions();
   }, [refreshSessions]);
+
+  // ── Deep-link from Documents page: ?session=X[&prompt=...] ─────
+  // Two-stage handling so we don't race React's state updates:
+  //   1) When sessions list is ready, select the requested session.
+  //   2) After activeSessionId actually equals the requested id (so doSend's
+  //      closure captures the right session id), dispatch the prompt.
+
+  // Stage 1: select session
+  useEffect(() => {
+    if (!requestedSessionId) return;
+    if (sessionsLoading) return;
+    if (autoSelectedRef.current === requestedSessionId) return;
+    autoSelectedRef.current = requestedSessionId;
+    handleSelectSession(requestedSessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedSessionId, sessionsLoading]);
+
+  // Stage 2: dispatch prompt once active session matches
+  useEffect(() => {
+    if (!requestedPrompt) return;
+    if (!autoSelectedRef.current) return;
+    if (activeSessionId !== autoSelectedRef.current) return;
+    if (promptDispatchedRef.current === activeSessionId) return;
+    promptDispatchedRef.current = activeSessionId;
+    doSendRef.current(requestedPrompt, null, null);
+    // Clear query params so refresh doesn't re-trigger
+    router.replace("/dashboard/workspace");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, requestedPrompt]);
 
   // Detect generated_file cards in messages → auto-open artifact panel
   useEffect(() => {

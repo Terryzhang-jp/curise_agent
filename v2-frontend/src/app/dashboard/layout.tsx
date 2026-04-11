@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
+  FolderOpen,
   FileText,
   MessageSquare,
   Database,
@@ -50,6 +51,7 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
+  { label: "文档中心", href: "/dashboard/documents", icon: FolderOpen, roles: ["superadmin", "admin", "finance", "employee"] },
   { label: "订单管理", href: "/dashboard/orders", icon: FileText, roles: ["superadmin", "admin", "finance", "employee"] },
   { label: "AI 助手", href: "/dashboard/workspace", icon: MessageSquare, roles: ["superadmin", "admin", "employee"] },
   { label: "数据管理", href: "/dashboard/data", icon: Database, roles: ["superadmin", "admin", "employee"] },

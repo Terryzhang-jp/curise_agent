@@ -587,11 +587,11 @@ export default function OrdersPage() {
       <div className="shrink-0 px-6 py-4 border-b border-border/50">
         <PageHeader
           title="订单管理"
-          description="上传订单文件，系统自动提取、数字化和匹配产品"
+          description="这里展示已经生成的订单。默认上传入口已切到文档中心，先审核文档再建单。"
           action={
-            <Button size="sm" onClick={() => setShowUpload(true)}>
+            <Button size="sm" onClick={() => router.push("/dashboard/documents")}>
               <Plus className="mr-1.5 h-3.5 w-3.5" />
-              上传订单
+              前往文档中心
             </Button>
           }
         />
@@ -655,11 +655,11 @@ export default function OrdersPage() {
             <EmptyState
               icon={FileText}
               title="暂无订单"
-              description="上传订单文件开始使用"
+              description="请先在文档中心上传并审核文档，再创建订单。"
               action={
-                <Button size="sm" variant="outline" onClick={() => setShowUpload(true)}>
+                <Button size="sm" variant="outline" onClick={() => router.push("/dashboard/documents")}>
                   <Plus className="mr-1.5 h-3.5 w-3.5" />
-                  上传订单
+                  前往文档中心
                 </Button>
               }
             />

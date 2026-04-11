@@ -112,14 +112,59 @@ class ToolRegistry:
         return [self._tools[n] for n in self._deferred if n in self._tools]
 
     def search_deferred(self, query: str) -> list[ToolDef]:
-        """Search deferred tools by keyword match on name and description."""
-        query_lower = query.lower()
-        results = []
+        """Search deferred tools by fuzzy keyword match on name + description.
+
+        Tokenizes both the query and the tool name (splitting on whitespace,
+        underscores and hyphens) so that multi-word queries like
+        "document order preview" still match `manage_document_order`. Tools
+        are scored by how many distinct query tokens they hit and returned
+        in descending score order. A whole-string substring match is treated
+        as the strongest signal.
+        """
+        import re
+
+        if not query or not query.strip():
+            return [self._tools[n] for n in self._deferred if n in self._tools]
+
+        query_lower = query.lower().strip()
+        # Tokenize query: split on any non-alphanumeric, drop empties
+        query_tokens = [t for t in re.split(r"[^a-z0-9]+", query_lower) if t]
+        if not query_tokens:
+            return []
+
+        scored: list[tuple[int, ToolDef]] = []
         for name in self._deferred:
             td = self._tools.get(name)
-            if td and (query_lower in td.name.lower() or query_lower in td.description.lower()):
-                results.append(td)
-        return results
+            if not td:
+                continue
+            name_lower = td.name.lower()
+            desc_lower = td.description.lower()
+            # Tokenize the tool name the same way so that "document" can hit
+            # `manage_document_order` even though that name has underscores.
+            name_tokens = set(re.split(r"[^a-z0-9]+", name_lower))
+            haystack_tokens = name_tokens | set(re.split(r"[^a-z0-9]+", desc_lower))
+
+            score = 0
+            # Strong signal: full query is a substring of name or description
+            if query_lower in name_lower:
+                score += 10
+            if query_lower in desc_lower:
+                score += 5
+            # Per-token hits — name tokens worth more than description tokens
+            for tok in query_tokens:
+                if tok in name_tokens:
+                    score += 3
+                elif tok in haystack_tokens:
+                    score += 1
+                elif tok in name_lower or tok in desc_lower:
+                    # Substring fallback (handles partial words)
+                    score += 1
+
+            if score > 0:
+                scored.append((score, td))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [td for _, td in scored]
 
     # ----------------------------------------------------------
     # Permissions

@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from services.agent.prompts.layers import (
     identity,
@@ -44,6 +45,7 @@ def build_chat_prompt(ctx: PromptContext) -> str:
         capabilities(ctx),
         domain_knowledge(ctx),
         constraints(ctx),
+        _environment_layer(),
     ]
 
     # Filter empty layers and join with double newline
@@ -55,3 +57,10 @@ def _memory_layer(ctx: PromptContext) -> str:
     if not ctx.memory_text:
         return ""
     return ctx.memory_text
+
+
+def _environment_layer() -> str:
+    """Inject current date/time so the agent doesn't need to call get_current_time."""
+    now = datetime.now()
+    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    return f"# 当前时间\n{now.strftime('%Y-%m-%d %H:%M')} ({weekdays[now.weekday()]})"

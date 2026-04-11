@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from typing import Any
 
@@ -38,6 +39,26 @@ import os
 KIMI_BASE_URL = os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1")
 
 
+# Same retry classification as gemini_provider — only retry transient infra
+# failures, never logic errors (4xx auth/quota are caller bugs).
+_RETRYABLE_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    transient_markers = (
+        "timeout", "timed out", "connection reset", "connection aborted",
+        "temporarily unavailable", "deadline exceeded",
+        "internal error", "service unavailable", "bad gateway",
+    )
+    if any(marker in msg for marker in transient_markers):
+        return True
+    for code in _RETRYABLE_HTTP_CODES:
+        if str(code) in msg:
+            return True
+    return False
+
+
 class KimiProvider(LLMProvider):
     """Kimi K2.5 provider via OpenAI-compatible Moonshot API."""
 
@@ -46,6 +67,7 @@ class KimiProvider(LLMProvider):
         self._client = OpenAI(
             api_key=config.api_key,
             base_url=KIMI_BASE_URL,
+            timeout=180.0,  # 180s timeout to prevent indefinite hangs
         )
         self._model = config.model_name or "kimi-k2.5"
         self._system_prompt: str = ""
@@ -60,8 +82,9 @@ class KimiProvider(LLMProvider):
     def generate(self, history: list[Any]) -> LLMResponse:
         messages = [{"role": "system", "content": self._system_prompt}] + history
 
-        last_error = None
-        for attempt in range(self._config.max_retries + 1):
+        last_error: Exception | None = None
+        max_attempts = self._config.max_retries + 1
+        for attempt in range(max_attempts):
             try:
                 kwargs: dict[str, Any] = dict(
                     model=self._model,
@@ -76,11 +99,29 @@ class KimiProvider(LLMProvider):
                 return self._parse_response(resp)
             except Exception as e:
                 last_error = e
-                logger.warning("Kimi API error (attempt %d): %s", attempt + 1, e)
-                if attempt < self._config.max_retries:
-                    time.sleep(self._config.retry_delay * (attempt + 1))
-                    continue
-                raise last_error
+                # 4xx auth/quota errors should fail fast — retrying a 401 is pointless
+                if not _is_retryable_error(e):
+                    logger.warning(
+                        "Kimi non-retryable error on attempt %d/%d: %s",
+                        attempt + 1, max_attempts, e,
+                    )
+                    raise
+                if attempt >= max_attempts - 1:
+                    logger.error(
+                        "Kimi exhausted %d retries, last error: %s",
+                        max_attempts, e,
+                    )
+                    raise
+                base_delay = self._config.retry_delay * (2 ** attempt)
+                jitter = random.uniform(0, base_delay * 0.25)
+                sleep_for = min(base_delay + jitter, 30.0)
+                logger.warning(
+                    "Kimi retryable error on attempt %d/%d (%s), sleeping %.1fs",
+                    attempt + 1, max_attempts, e, sleep_for,
+                )
+                time.sleep(sleep_for)
+        assert last_error is not None
+        raise last_error
 
     def build_user_message(self, text: str) -> Any:
         return {"role": "user", "content": text}

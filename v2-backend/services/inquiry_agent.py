@@ -27,15 +27,25 @@ from typing import Any
 
 from google import genai
 from google.genai import types
-from openpyxl import load_workbook as _load_workbook_raw
+from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 
 from services.agent.config import load_api_key
+from services.agent.stream_queue import get_or_create_cancel_event, push_event
 
 logger = logging.getLogger(__name__)
 
 # Matches external workbook references like [Book1.xlsx] or [RecoveredExternalLink1]
 EXTERNAL_REF_RE = re.compile(r'\[.*?\]')
+
+
+class InquiryCancelledError(RuntimeError):
+    """Raised when an inquiry generation run is cancelled."""
+
+
+def _ensure_not_cancelled(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise InquiryCancelledError("询价生成已取消")
 
 
 def _sanitize_external_refs(ws) -> int:
@@ -115,14 +125,14 @@ def run_inquiry_pre_analysis(order, db) -> dict:
                 pass
 
         # Template resolution
-        template, method, candidates = resolve_template(sid, all_templates)
+        template, method, candidates = select_template(sid, all_templates)
         template_info = None
-        if method == "exact" and template:
-            template_info = {"id": template.id, "name": template.template_name, "method": "exact"}
+        if template:
+            template_info = {"id": template.id, "name": template.template_name, "method": method}
         elif candidates:
-            template_info = {"method": "candidates", "count": len(candidates)}
+            template_info = {"method": method, "count": len(candidates)}
         else:
-            template_info = {"method": "generic"}
+            template_info = {"method": "unavailable"}
 
         # Supplier data completeness
         info = supplier_rows.get(sid, {})
@@ -158,6 +168,10 @@ def resolve_template(supplier_id: int, all_templates: list) -> tuple[Any | None,
     - Exact match found:  (template, "exact", [])
     - No exact match:     (None, "candidates", [{id, name, country_id}, ...])
     """
+    all_templates = get_production_templates(all_templates)
+    if not all_templates:
+        return None, "unavailable", []
+
     # Step 1: exact binding — supplier_ids array
     for t in all_templates:
         if t.supplier_ids and supplier_id in t.supplier_ids:
@@ -177,6 +191,55 @@ def resolve_template(supplier_id: int, all_templates: list) -> tuple[Any | None,
             "country_id": t.country_id,
         })
     return None, "candidates", candidates
+
+
+def template_has_zone_config(template: Any | None) -> bool:
+    """Production templates must carry a root-level zone_config."""
+    if not template:
+        return False
+    styles = getattr(template, "template_styles", None)
+    return isinstance(styles, dict) and isinstance(styles.get("zones"), dict)
+
+
+def get_production_templates(all_templates: list) -> list:
+    """Only zone_config templates are allowed in production inquiry flow."""
+    return [template for template in all_templates if template_has_zone_config(template)]
+
+
+def select_template(
+    supplier_id: int,
+    all_templates: list,
+    template_id_override: int | None = None,
+) -> tuple[Any | None, str, list]:
+    """Choose the production template for a supplier.
+
+    Returns (template, selection_method, candidates). When no exact binding exists,
+    the first production-ready candidate is chosen to preserve the current fallback
+    behavior, but legacy templates are never considered.
+    """
+    production_templates = get_production_templates(all_templates)
+
+    if template_id_override:
+        override = next((t for t in all_templates if t.id == template_id_override), None)
+        if not override:
+            raise ValueError(f"模板 {template_id_override} 不存在")
+        if not template_has_zone_config(override):
+            raise ValueError(
+                f"模板 {template_id_override} 已下架：当前只允许使用带 zone_config 的模板"
+            )
+        return override, "user_selected", []
+
+    template, method, candidates = resolve_template(supplier_id, production_templates)
+    if template:
+        return template, method, candidates
+    if candidates:
+        first_candidate = next(
+            (t for t in production_templates if t.id == candidates[0]["id"]),
+            None,
+        )
+        if first_candidate:
+            return first_candidate, "candidate_auto", candidates
+    return None, "unavailable", []
 
 
 def _try_parse_date(val: str) -> datetime | None:
@@ -490,6 +553,7 @@ def _build_order_data_for_engine(
     products: list[dict], supplier_info: dict,
     company_info: dict | None = None,
     delivery_info: dict | None = None,
+    _db=None,
 ) -> dict:
     """Build order_data dict in the format expected by template_engine.fill_template().
 
@@ -543,6 +607,7 @@ def _generate_single_supplier(
     order_id: int, order_meta: dict, supplier_id: int, products: list[dict],
     stream_key: str, overall_start: float,
     template_id_override: int | None = None,
+    cancel_event=None,
 ) -> dict:
     """Generate inquiry for one supplier via single LLM call + deterministic code.
 
@@ -558,6 +623,7 @@ def _generate_single_supplier(
 
     upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
     os.makedirs(upload_dir, exist_ok=True)
+    _ensure_not_cancelled(cancel_event)
 
     # ── Stage 1: Data loading ──
     _db = SessionLocal()
@@ -632,42 +698,20 @@ def _generate_single_supplier(
     finally:
         _db.close()
 
-    # Resolve template
-    chosen_template = None
-    selection_method = "none"
-
-    if template_id_override:
-        chosen_template = next((t for t in all_templates if t.id == template_id_override), None)
-        if chosen_template:
-            selection_method = "user_selected"
+    chosen_template, selection_method, _ = select_template(
+        supplier_id,
+        all_templates,
+        template_id_override=template_id_override,
+    )
 
     if not chosen_template:
-        template, method, candidates = resolve_template(supplier_id, all_templates)
-        if method == "exact" and template:
-            chosen_template = template
-            selection_method = "exact"
-        elif candidates:
-            # Use first candidate (no Agent to decide)
-            first_candidate_id = candidates[0]["id"]
-            chosen_template = next((t for t in all_templates if t.id == first_candidate_id), None)
-            selection_method = "candidate_auto"
+        raise ValueError(
+            f"供应商 {supplier_id} 没有可用的 zone_config 模板，询价单生成已阻断"
+        )
 
     # Build workbook + fields
     wb = InquiryWorkbook()
-
-    if not chosen_template:
-        # Generic fallback — no LLM needed
-        wb.create_generic(order_meta, products, supplier_id)
-        if stream_key:
-            push_event(stream_key, {
-                "type": "tool_call", "tool_name": "generate", "tool_label": "生成询价单",
-                "content": f"通用格式, {len(products)} 个产品",
-                "elapsed_seconds": round(time.time() - overall_start, 1),
-                "supplier_id": supplier_id,
-            })
-        # Save generic
-        return _save_workbook(wb, None, selection_method, order_meta, supplier_id,
-                              products, upload_dir, {}, stream_key, overall_start)
+    wb._generation_path = "generic"  # Default; overridden below
 
     # ── Fast path: deterministic engine (no LLM) ──
     # If template has zone_config in template_styles, use template_engine
@@ -678,10 +722,18 @@ def _generate_single_supplier(
 
     if zone_config and chosen_template.template_file_url:
         try:
-            from services.template_engine import fill_template as engine_fill
-            from services.template_engine import verify_output as engine_verify
+            from services.template_engine_legacy import fill_template as engine_fill
+            from services.template_engine_legacy import verify_output as engine_verify
+
+            # ── Feature flag: choose renderer ──
+            # INQUIRY_RENDERER=compose (default) → new compose-from-scratch renderer
+            # INQUIRY_RENDERER=fill              → legacy fill_template (kept as fallback)
+            # The legacy path is preserved during the migration window so we can
+            # roll back instantly if compose_render exposes any unforeseen issue.
+            renderer = os.environ.get("INQUIRY_RENDERER", "compose").lower()
 
             engine_start = time.time()
+            _ensure_not_cancelled(cancel_event)
 
             # Download template
             suffix = ".xls" if chosen_template.template_file_url.lower().endswith(".xls") else ".xlsx"
@@ -707,49 +759,65 @@ def _generate_single_supplier(
             finally:
                 _fo_db.close()
 
-            # Fill template
-            excel_bytes = engine_fill(
-                template_bytes, zone_config, engine_order_data, supplier_id,
-                field_overrides=_fo_overrides,
-            )
+            # ── Render via the selected backend ──
+            if renderer == "fill":
+                excel_bytes = engine_fill(
+                    template_bytes, zone_config, engine_order_data, supplier_id,
+                    field_overrides=_fo_overrides,
+                )
+                generation_path = "template_engine_fill"
+            else:  # compose (default)
+                from services.template_engine import compose_render
+                excel_bytes = compose_render(
+                    template_bytes, zone_config, engine_order_data, supplier_id,
+                )
+                generation_path = "template_engine_compose"
+
+            _ensure_not_cancelled(cancel_event)
 
             engine_elapsed = time.time() - engine_start
             logger.info(
-                "Template engine: supplier %d, %d products in %.2fs (no LLM)",
-                supplier_id, len(products), engine_elapsed,
+                "Template engine [%s]: supplier %d, %d products in %.2fs (no LLM)",
+                renderer, supplier_id, len(products), engine_elapsed,
             )
 
             if stream_key:
                 push_event(stream_key, {
                     "type": "tool_call", "tool_name": "generate", "tool_label": "生成询价单",
-                    "content": f"确定性引擎: {chosen_template.template_name}, {len(products)} 产品, {engine_elapsed:.1f}s",
+                    "content": f"{renderer} 引擎: {chosen_template.template_name}, {len(products)} 产品, {engine_elapsed:.1f}s",
                     "elapsed_seconds": round(time.time() - overall_start, 1),
                     "supplier_id": supplier_id,
                 })
 
-            # Verify
+            # Verify (same verify regardless of renderer)
             vr = engine_verify(excel_bytes, zone_config, engine_order_data, supplier_id)
+            verify_results = _engine_verify_to_results(vr)
+            _ensure_not_cancelled(cancel_event)
+
+            # Save and return — deterministic path (0 LLM), whether it passed or failed.
+            # Failed verification enters review/repair instead of silently switching paths.
+            wb = InquiryWorkbook()
+            wb._wb = load_workbook(io.BytesIO(excel_bytes))
+            wb._ws = wb._wb.active
+            wb._generation_path = generation_path
+            saved = _save_workbook(
+                wb, chosen_template, selection_method, order_meta, supplier_id,
+                products, upload_dir, {}, stream_key, overall_start,
+                verify_results=verify_results,
+            )
             if not vr["ok"]:
-                logger.warning(
-                    "Template engine verify: %d errors, falling back to LLM path",
-                    len(vr["errors"]),
+                saved["status"] = "repair_required"
+                saved["error"] = (
+                    f"模板校验失败：{len(vr.get('errors', []))} 项问题，"
+                    "请在 Review/Repair 中修正后重试"
                 )
-                # Fall through to LLM path below
-            else:
-                # Save and return
-                wb = InquiryWorkbook()
-                wb._wb = load_workbook(io.BytesIO(excel_bytes))
-                wb._ws = wb._wb.active
-                return _save_workbook(
-                    wb, chosen_template, selection_method, order_meta, supplier_id,
-                    products, upload_dir, {}, stream_key, overall_start,
-                )
+            return saved
         except Exception as e:
             logger.warning(
-                "Template engine failed for supplier %d, falling back to LLM: %s",
+                "Template engine failed for supplier %d: %s",
                 supplier_id, e, exc_info=True,
             )
-            # Fall through to LLM path
+            raise
 
     # Load template file from Supabase Storage
     template_file_path = None
@@ -823,7 +891,9 @@ def _generate_single_supplier(
         })
 
     # ── Stage 3: Single LLM call for header field mapping ──
+    wb._generation_path = "llm_mapping"
     cell_mapping = {}
+    _ensure_not_cancelled(cancel_event)
 
     if fields:
         order_data = {k: str(v)[:200] for k, v in enriched_meta.items() if v}
@@ -839,6 +909,7 @@ def _generate_single_supplier(
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                _ensure_not_cancelled(cancel_event)
                 llm_start = time.time()
                 response = client.models.generate_content(
                     model="gemini-3-flash-preview",
@@ -876,7 +947,11 @@ def _generate_single_supplier(
                 cell_mapping = parsed
                 break
             except (json.JSONDecodeError, ValueError) as e:
-                logger.warning("Inquiry v6.2: supplier %d attempt %d failed: %s", supplier_id, attempt + 1, e)
+                logger.warning(
+                    "Inquiry v6.2: supplier %d attempt %d parse failed: %s\nLLM raw output (first 500): %s",
+                    supplier_id, attempt + 1, e,
+                    (resp_text or "")[:500],
+                )
                 if attempt == max_retries - 1:
                     raise
             except Exception as e:
@@ -893,6 +968,7 @@ def _generate_single_supplier(
                 date_field_positions.add(f["position"])
 
         for cell_ref, value in list(cell_mapping.items()):
+            _ensure_not_cancelled(cancel_event)
             if value is None or value == "":
                 continue
             val_str = str(value)
@@ -924,6 +1000,7 @@ def _generate_single_supplier(
         logger.info("Inquiry v6.2: supplier %d — no header fields, skipping LLM", supplier_id)
 
     # ── Stage 5: Write workbook ──
+    _ensure_not_cancelled(cancel_event)
     # Write header cells (skip null = preserve template)
     cells_to_write = [
         {"cell": c, "value": str(v)}
@@ -1008,6 +1085,7 @@ def _generate_single_supplier(
                 break
         if desc_col:
             for i, product in enumerate(products):
+                _ensure_not_cancelled(cancel_event)
                 matched = product.get("matched_product") or {}
                 pack_size = matched.get("pack_size", "")
                 if pack_size:
@@ -1023,6 +1101,7 @@ def _generate_single_supplier(
             ann_row_num = int(m.group(2))
             if ann_row_num >= start_row:
                 for ri in range(start_row, start_row + count):
+                    _ensure_not_cancelled(cancel_event)
                     cell_ref = f"{ann_col}{ri}"
                     cell = wb._ws[cell_ref]
                     if isinstance(cell, MergedCell):
@@ -1088,6 +1167,7 @@ def _generate_single_supplier(
         # 1. Per-row formulas: write for each product row
         for col, (formula_template, orig_row) in per_row_formulas.items():
             for row_idx in range(start_row, start_row + count):
+                _ensure_not_cancelled(cancel_event)
                 new_formula = re.sub(str(orig_row), str(row_idx), formula_template)
                 wb.safe_set_cell(f"{col}{row_idx}", new_formula)
             # Clear leftover formula rows (between last product and first summary)
@@ -1113,6 +1193,7 @@ def _generate_single_supplier(
                 row_shift_map[old_row] = new_row
 
         for fc_ref, (orig_formula, new_ref) in summary_formulas.items():
+            _ensure_not_cancelled(cancel_event)
             # Expand range references (e.g., SUM(L22:L32) → SUM(L22:L71))
             new_formula = re.sub(
                 r"([A-Z]+)(\d+):([A-Z]+)(\d+)",
@@ -1142,6 +1223,7 @@ def _generate_single_supplier(
                     logger.info("Header formula %s updated: %s → %s", hf_ref, hf_formula, new_formula)
 
     # ── Stage 6: Save ──
+    _ensure_not_cancelled(cancel_event)
     return _save_workbook(wb, chosen_template, selection_method, order_meta, supplier_id,
                           products, upload_dir, annotations, stream_key, overall_start)
 
@@ -1150,9 +1232,10 @@ def _save_workbook(
     wb, template, selection_method: str, order_meta: dict,
     supplier_id: int, products: list[dict], upload_dir: str,
     annotations: dict[str, str], stream_key: str, overall_start: float,
+    verify_results: list[dict[str, Any]] | None = None,
 ) -> dict:
     """Save workbook + preview HTML, run verify, return result dict."""
-    from services.agent.stream_queue import push_event
+    from services.agent.stream_queue import get_or_create_cancel_event, push_event
 
     excel_bytes = wb.save_bytes()
 
@@ -1191,8 +1274,9 @@ def _save_workbook(
         logger.warning("Preview HTML save failed for supplier %d: %s", supplier_id, e)
 
     # Run verify
-    verify_results = []
-    if annotations and wb._ws:
+    if verify_results is None:
+        verify_results = []
+    if not verify_results and annotations and wb._ws:
         for cell_ref, annotation in annotations.items():
             try:
                 cell = wb._ws[cell_ref]
@@ -1223,6 +1307,7 @@ def _save_workbook(
         "template_name": template.template_name if template else None,
         "template_id": template.id if template else None,
         "selection_method": selection_method,
+        "generation_path": getattr(wb, '_generation_path', "unknown"),  # template_engine / llm_mapping / generic
     }
 
     # SSE: emit "save" step
@@ -1241,12 +1326,77 @@ def _save_workbook(
     }
 
 
+def _engine_verify_to_results(verify_report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert template_engine.verify_output report to frontend-facing verify_results."""
+    errors = verify_report.get("errors", []) or []
+    checks = int(verify_report.get("checks") or 0)
+
+    if not errors:
+        return [{
+            "cell": "SYSTEM",
+            "annotation": "模板结构与字段校验",
+            "value": f"{checks} 项检查",
+            "status": "pass",
+            "reason": "所有检查通过",
+        }]
+
+    results: list[dict[str, Any]] = []
+    for error in errors:
+        if ":" in error:
+            label, reason = error.split(":", 1)
+            cell = _extract_cell_from_error(label) or "SYSTEM"
+            annotation = label.strip()
+            reason_text = reason.strip()
+        else:
+            cell = _extract_cell_from_error(error) or "SYSTEM"
+            annotation = error
+            reason_text = error
+
+        results.append({
+            "cell": cell,
+            "annotation": annotation,
+            "value": "",
+            "status": "fail",
+            "reason": reason_text,
+            "suggestion": _suggest_repair_from_error(annotation, reason_text),
+        })
+    return results
+
+
+def _extract_cell_from_error(text: str) -> str | None:
+    match = re.search(r"\b([A-Z]{1,3}\d+)\b", text)
+    return match.group(1) if match else None
+
+
+def _suggest_repair_from_error(annotation: str, reason: str) -> str:
+    lowered = f"{annotation} {reason}".lower()
+    if "header anchor" in lowered or "header " in lowered:
+        return "检查表头字段映射或在“编辑字段”中补正确值"
+    if "product header" in lowered:
+        return "检查产品列映射与模板表头是否一致"
+    if "formula" in lowered:
+        return "检查模板公式列与汇总区公式配置"
+    if "summary" in lowered:
+        return "检查汇总区标签、税额/总额配置和模板静态文本"
+    if "merge" in lowered:
+        return "检查模板合并单元格结构是否被破坏"
+    if "stale data" in lowered:
+        return "检查汇总区是否残留旧产品数据"
+    return "打开 Review/Repair 检查字段和模板结构后重试"
+
+
 # ─── Orchestrator ─────────────────────────────────────────────
 
 _MAX_INQUIRY_WORKERS = int(os.environ.get("INQUIRY_CONCURRENCY", "3"))
 
 
-def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides=None) -> dict:
+def run_inquiry_orchestrator(
+    order,
+    db,
+    stream_key: str = "",
+    template_overrides=None,
+    supplier_ids: list[int] | None = None,
+) -> dict:
     """Orchestrator: run per-supplier generation in parallel via ThreadPoolExecutor.
 
     Returns inquiry_data dict with per-supplier results.
@@ -1259,6 +1409,7 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
     order_id = order.id
     match_results = order.match_results or []
     order_meta = order.order_metadata or {}
+    cancel_event = get_or_create_cancel_event(stream_key) if stream_key else None
 
     # Normalize matched_product dicts (ensures canonical field names like
     # "unit_price" exist even for orders matched before the normalize fix)
@@ -1273,6 +1424,14 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
         if matched and matched.get("supplier_id"):
             sid = matched["supplier_id"]
             supplier_groups.setdefault(sid, []).append(item)
+
+    if supplier_ids is not None:
+        allowed = set(int(sid) for sid in supplier_ids)
+        supplier_groups = {
+            sid: products
+            for sid, products in supplier_groups.items()
+            if sid in allowed
+        }
 
     unassigned = sum(
         1 for item in match_results
@@ -1315,6 +1474,7 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
     def _worker(sid: int, sid_products: list[dict]) -> tuple[int, dict]:
         """Thread worker: generates one supplier's inquiry and returns (sid, result_dict)."""
         supplier_start = time.time()
+        _ensure_not_cancelled(cancel_event)
 
         info = supplier_info_map.get(sid, {})
 
@@ -1346,13 +1506,23 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
 
         override_tid = (template_overrides or {}).get(sid)
         try:
-            result = _generate_single_supplier(order_id, order_meta, sid, sid_products, stream_key, overall_start, template_id_override=override_tid)
+            result = _generate_single_supplier(
+                order_id,
+                order_meta,
+                sid,
+                sid_products,
+                stream_key,
+                overall_start,
+                template_id_override=override_tid,
+                cancel_event=cancel_event,
+            )
             elapsed = round(time.time() - supplier_start, 1)
 
             fi = result.get("file_info") or {}
+            final_status = "error" if result.get("status") == "repair_required" else "completed"
             supplier_data = {
                 **base_info,
-                "status": "completed",
+                "status": final_status,
                 "file": result.get("file_info"),
                 "template": {
                     "id": fi.get("template_id"),
@@ -1362,7 +1532,17 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
                 "verify_results": result.get("verify_results", []),
                 "elapsed_seconds": elapsed,
             }
+            if result.get("error"):
+                supplier_data["error"] = result["error"]
             logger.info("Inquiry orchestrator: supplier %d completed in %.1fs", sid, elapsed)
+        except InquiryCancelledError as e:
+            elapsed = round(time.time() - supplier_start, 1)
+            supplier_data = {
+                **base_info,
+                "status": "cancelled",
+                "error": str(e),
+                "elapsed_seconds": elapsed,
+            }
         except Exception as e:
             elapsed = round(time.time() - supplier_start, 1)
             logger.error("Inquiry orchestrator: supplier %d failed: %s", sid, e, exc_info=True)
@@ -1392,6 +1572,9 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
 
         for future in as_completed(futures):
             sid = futures[future]
+            if cancel_event is not None and cancel_event.is_set():
+                for pending in futures:
+                    pending.cancel()
             try:
                 _, supplier_data = future.result()
             except Exception as e:
@@ -1425,11 +1608,13 @@ def run_inquiry_orchestrator(order, db, stream_key: str = "", template_overrides
 
 def run_inquiry_single_supplier(order, db, supplier_id: int, stream_key: str = "", template_id: int | None = None) -> dict:
     """Run inquiry for a single supplier (for re-do). Returns per-supplier result dict."""
-    from services.agent.stream_queue import push_event
+    from services.agent.stream_queue import get_or_create_cancel_event, push_event
     from services.tools.product_matching import normalize_matched_product
 
     match_results = order.match_results or []
     order_meta = order.order_metadata or {}
+    cancel_event = get_or_create_cancel_event(stream_key) if stream_key else None
+    _ensure_not_cancelled(cancel_event)
 
     # Normalize matched_product dicts (ensures canonical field names for old orders)
     for item in match_results:
@@ -1487,17 +1672,27 @@ def run_inquiry_single_supplier(order, db, supplier_id: int, stream_key: str = "
             "product_count": len(sid_products),
         })
 
-    result = _generate_single_supplier(order.id, order_meta, supplier_id, sid_products, stream_key, start_time, template_id_override=template_id)
+    result = _generate_single_supplier(
+        order.id,
+        order_meta,
+        supplier_id,
+        sid_products,
+        stream_key,
+        start_time,
+        template_id_override=template_id,
+        cancel_event=cancel_event,
+    )
     elapsed = round(time.time() - start_time, 1)
 
     fi = result.get("file_info") or {}
+    final_status = "error" if result.get("status") == "repair_required" else "completed"
     supplier_result = {
         "supplier_name": supplier_name,
         "product_count": len(sid_products),
         "subtotal": round(subtotal, 2),
         "currency": order_meta.get("currency", ""),
         "missing_fields": missing_fields,
-        "status": "completed",
+        "status": final_status,
         "file": result.get("file_info"),
         "template": {
             "id": fi.get("template_id"),
@@ -1507,12 +1702,14 @@ def run_inquiry_single_supplier(order, db, supplier_id: int, stream_key: str = "
         "verify_results": result.get("verify_results", []),
         "elapsed_seconds": elapsed,
     }
+    if result.get("error"):
+        supplier_result["error"] = result["error"]
 
     if stream_key:
         push_event(stream_key, {
             "type": "supplier_done",
             "supplier_id": supplier_id,
-            "status": "completed",
+            "status": supplier_result["status"],
         })
 
     return supplier_result

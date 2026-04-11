@@ -24,9 +24,21 @@ from typing import Any, Callable
 
 from services.agent.config import LLMConfig, load_api_key, create_provider
 from services.agent.engine import ReActAgent
+from services.agent.hooks import MiddlewareChain
 from services.agent.memory_storage import MemoryStorage
 from services.agent.tool_context import ToolContext
 from services.agent.tool_registry import ToolRegistry
+
+
+@dataclass
+class SubAgentResult:
+    """Structured return type from sub-agent execution."""
+    status: str          # "success" | "timeout" | "error"
+    output: str          # Agent's final text answer
+    elapsed_ms: int = 0  # Execution duration
+    turns_used: int = 0  # How many turns the agent used
+    artifacts: list[str] = field(default_factory=list)  # Generated file paths
+    errors: list[str] = field(default_factory=list)     # Error/warning messages
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +157,7 @@ def run_sub_agent(
     parent_ctx: ToolContext,
     chat_storage: Any | None = None,
     session_id: str | None = None,
-) -> str:
+) -> SubAgentResult:
     """Spawn and run a sub-agent to completion with timeout protection.
 
     Args:
@@ -156,11 +168,7 @@ def run_sub_agent(
         session_id: Parent's session ID (for SSE routing + DB tracking).
 
     Returns:
-        Sub-agent's final text answer.
-
-    Raises:
-        ValueError: If sub-agent name is not registered.
-        RuntimeError: If sub-agent fails or times out.
+        SubAgentResult with structured status, output, and metadata.
     """
     config = SUB_AGENT_REGISTRY.get(name)
     if config is None:
@@ -214,7 +222,17 @@ def run_sub_agent(
             "timeout_seconds": config.timeout_seconds,
         })
 
-    # 6. Build and run ReActAgent with timeout protection
+    # 6. Attach security middlewares (must inherit from parent for safety)
+    from services.agent.middlewares.guardrail import GuardrailMiddleware, DefaultGuardrailProvider
+    from services.agent.middlewares.loop_detection import LoopDetectionMiddleware
+    from services.agent.middlewares.error_recovery import ErrorRecoveryMiddleware
+    child_chain = MiddlewareChain()
+    child_chain.add(GuardrailMiddleware(DefaultGuardrailProvider()))
+    child_chain.add(LoopDetectionMiddleware())
+    child_chain.add(ErrorRecoveryMiddleware())
+    child_registry.set_hooks(child_chain)
+
+    # 7. Build and run ReActAgent with timeout protection
     def _run():
         agent = ReActAgent(
             provider=child_provider,
@@ -225,14 +243,15 @@ def run_sub_agent(
             max_turns=config.max_turns,
             thinking_budget=config.thinking_budget,
         )
-        return agent.run(prompt)
+        result_text = agent.run(prompt)
+        return result_text, getattr(agent, '_turn_count', 0)
 
     try:
         # DeerFlow pattern: ThreadPoolExecutor with timeout
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_run)
             try:
-                result = future.result(timeout=config.timeout_seconds)
+                result_text, turns_used = future.result(timeout=config.timeout_seconds)
             except FuturesTimeoutError:
                 elapsed_ms = round((time.time() - start_time) * 1000)
                 logger.error("[SubAgent:%s] Timed out after %ds", name, config.timeout_seconds)
@@ -242,13 +261,12 @@ def run_sub_agent(
                     _push_sub_agent_event(chat_storage, session_id, name, "timeout", {
                         "timeout_seconds": config.timeout_seconds,
                     })
-                raise RuntimeError(
-                    f"Sub-agent '{name}' timed out after {config.timeout_seconds}s. "
-                    "Task may be too complex — consider breaking it into smaller steps."
+                return SubAgentResult(
+                    status="timeout", output="",
+                    elapsed_ms=elapsed_ms, turns_used=0,
+                    errors=[f"Timed out after {config.timeout_seconds}s"],
                 )
 
-    except RuntimeError:
-        raise  # re-raise timeout
     except Exception as e:
         elapsed_ms = round((time.time() - start_time) * 1000)
         logger.error("[SubAgent:%s] Failed after %.1fs: %s", name, elapsed_ms / 1000, e)
@@ -259,24 +277,43 @@ def run_sub_agent(
                 "error": str(e),
                 "elapsed_seconds": round(elapsed_ms / 1000, 1),
             })
-        raise RuntimeError(f"Sub-agent '{name}' failed: {e}") from e
+        return SubAgentResult(
+            status="error", output="",
+            elapsed_ms=elapsed_ms, turns_used=0,
+            errors=[str(e)],
+        )
 
     elapsed_ms = round((time.time() - start_time) * 1000)
     logger.info("[SubAgent:%s] Completed in %.1fs — result=%s...",
-                name, elapsed_ms / 1000, result[:100])
+                name, elapsed_ms / 1000, result_text[:100])
+
+    # Collect artifacts from workspace
+    artifacts = []
+    if child_ctx.workspace_dir:
+        import os
+        try:
+            for f in os.listdir(child_ctx.workspace_dir):
+                if f.endswith(('.xlsx', '.xls', '.csv', '.pdf')):
+                    artifacts.append(os.path.join(child_ctx.workspace_dir, f))
+        except OSError:
+            pass
 
     # Record success
     _record_task_end(parent_ctx.db, task_id, "completed",
-                     result_preview=result, duration_ms=elapsed_ms)
+                     result_preview=result_text, duration_ms=elapsed_ms)
 
     # Push completion event
     if chat_storage and session_id:
         _push_sub_agent_event(chat_storage, session_id, name, "done", {
             "elapsed_seconds": round(elapsed_ms / 1000, 1),
-            "result_preview": result[:200],
+            "result_preview": result_text[:200],
         })
 
-    return result
+    return SubAgentResult(
+        status="success", output=result_text,
+        elapsed_ms=elapsed_ms, turns_used=turns_used,
+        artifacts=artifacts,
+    )
 
 
 # ============================================================
@@ -352,6 +389,14 @@ def create_delegate_tool(registry: ToolRegistry, ctx: ToolContext,
                 chat_storage=chat_storage,
                 session_id=session_id,
             )
-            return result
-        except (ValueError, RuntimeError) as e:
+            if result.status == "success":
+                output = f"[子Agent '{agent_name}' 完成 ({result.elapsed_ms}ms, {result.turns_used} 轮)]\n{result.output}"
+                if result.artifacts:
+                    output += f"\n\n产出文件: {', '.join(result.artifacts)}"
+                return output
+            elif result.status == "timeout":
+                return f"Error: 子Agent '{agent_name}' 超时 ({result.elapsed_ms}ms)。任务可能太复杂,考虑拆分。"
+            else:
+                return f"Error: 子Agent '{agent_name}' 失败: {'; '.join(result.errors)}"
+        except ValueError as e:
             return f"Error: {e}"

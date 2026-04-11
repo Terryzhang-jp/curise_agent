@@ -2,7 +2,7 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { CheckCircle2, AlertCircle, Loader2, Clock } from "lucide-react";
 
-type OrderStatus = "uploading" | "pending_template" | "extracting" | "matching" | "ready" | "error";
+type OrderStatus = "uploading" | "pending_template" | "extracting" | "extracted" | "matching" | "ready" | "error";
 
 const STATUS_CONFIG: Record<
   OrderStatus,
@@ -11,6 +11,7 @@ const STATUS_CONFIG: Record<
   uploading: { label: "上传中", variant: "secondary", icon: Loader2, className: "animate-spin" },
   pending_template: { label: "待选模板", variant: "secondary", icon: Clock, className: "text-amber-500" },
   extracting: { label: "提取中", variant: "secondary", icon: Loader2, className: "animate-spin" },
+  extracted: { label: "待审核", variant: "outline", icon: Clock, className: "text-amber-500" },
   matching: { label: "匹配中", variant: "secondary", icon: Loader2, className: "animate-spin" },
   ready: { label: "已完成", variant: "default", icon: CheckCircle2, className: "text-emerald-500" },
   error: { label: "出错", variant: "destructive", icon: AlertCircle, className: "" },

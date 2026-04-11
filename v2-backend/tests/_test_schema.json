@@ -22,7 +22,7 @@
           "required": true
         },
         {
-          "key": "vessel_name",
+          "key": "vessel",
           "label": "Vessel",
           "type": "text",
           "sample_value": "CELEBRITY SOLSTICE",
@@ -36,26 +36,19 @@
           "required": false
         },
         {
-          "key": "total_amount",
-          "label": "Total",
-          "type": "currency",
-          "sample_value": "45,648.18",
-          "required": true
-        },
-        {
-          "key": "currency",
-          "label": "Currency",
+          "key": "payment_terms",
+          "label": "Payment Terms",
           "type": "text",
-          "sample_value": "USD",
-          "required": true
+          "sample_value": "Net 75",
+          "required": false
         }
       ]
     },
     {
       "name": "参与方信息",
-      "name_en": "Parties Information",
+      "name_en": "Party Information",
       "type": "single",
-      "description": "Details regarding the supplier, delivery destination, and billing entities.",
+      "description": "Details regarding the supplier, delivery destination, and billing address.",
       "attributes": [
         {
           "key": "supplier_address",
@@ -72,18 +65,11 @@
           "required": true
         },
         {
-          "key": "bill_to_address",
-          "label": "Bill To / Ship To Address",
+          "key": "ship_to_billing",
+          "label": "Ship To / Accounts Payable",
           "type": "text",
-          "sample_value": "Celebrity Cruises Inc. ATTN: Accounts Payable PO Box 025545 Miami, Florida 33102-5545 U.S.A.",
+          "sample_value": "Celebrity Cruises Inc. ATTN: Accounts Payable, PO Box 025545, Miami, Florida 33102-5545 U.S.A.",
           "required": true
-        },
-        {
-          "key": "contact_person",
-          "label": "Contact Person",
-          "type": "text",
-          "sample_value": "JHOMEL HERRERA, PH: 954-517-3564",
-          "required": false
         },
         {
           "key": "purchasing_agent_email",
@@ -91,22 +77,22 @@
           "type": "text",
           "sample_value": "fleetservicesSL@rccl.com",
           "required": false
+        },
+        {
+          "key": "contact_person",
+          "label": "Contact Person",
+          "type": "text",
+          "sample_value": "JHOMEL HERRERA (954-517-3564)",
+          "required": false
         }
       ]
     },
     {
-      "name": "物流与支付条款",
-      "name_en": "Logistics & Payment Terms",
+      "name": "物流详情",
+      "name_en": "Logistics Details",
       "type": "single",
-      "description": "Shipping schedules and financial terms.",
+      "description": "Information regarding the final destination and delivery schedule.",
       "attributes": [
-        {
-          "key": "payment_terms",
-          "label": "Payment Terms",
-          "type": "text",
-          "sample_value": "Net 75",
-          "required": true
-        },
         {
           "key": "final_destination",
           "label": "Final Destination",
@@ -125,7 +111,7 @@
           "key": "loading_date",
           "label": "Loading Date",
           "type": "date",
-          "sample_value": "MARCH 08 2026",
+          "sample_value": "March 08 2026",
           "required": false
         }
       ]
@@ -134,7 +120,7 @@
       "name": "产品列表",
       "name_en": "Product List",
       "type": "repeating",
-      "description": "Detailed list of items ordered including quantities and pricing.",
+      "description": "Line items for products ordered, including quantities and pricing.",
       "columns": [
         {
           "key": "line_number",
@@ -144,13 +130,13 @@
         },
         {
           "key": "product_code",
-          "label": "Item Number",
+          "label": "Item Number (Code)",
           "type": "text",
           "sample_value": "99PRD010588"
         },
         {
           "key": "product_description",
-          "label": "Description",
+          "label": "Item Number (Description)",
           "type": "text",
           "sample_value": "APPLE GRANNY SMITH US EXTRA FANCY"
         },
@@ -170,37 +156,49 @@
           "key": "unit_price",
           "label": "Unit Price",
           "type": "currency",
-          "sample_value": "1.95"
+          "sample_value": "1.38"
         },
         {
           "key": "extended_price",
           "label": "Extended Price",
           "type": "currency",
-          "sample_value": "2659.80"
+          "sample_value": "226.32"
         }
       ],
       "estimated_row_count": 104
     },
     {
+      "name": "合计信息",
+      "name_en": "Totals",
+      "type": "single",
+      "description": "Total monetary value of the order.",
+      "attributes": [
+        {
+          "key": "total_amount",
+          "label": "Total",
+          "type": "currency",
+          "sample_value": "45,648.18",
+          "required": true
+        }
+      ]
+    },
+    {
       "name": "条款与条件",
       "name_en": "Terms & Conditions",
       "type": "text_block",
-      "description": "Legal clauses and standard operating procedures for vendors.",
+      "description": "Legal clauses, shipping instructions, and invoicing requirements.",
       "attributes": [
-        {
-          "key": "vendor_receipt_confirmation",
-          "label": "VENDOR RECEIPT OF ORDER CONFIRMATION",
-          "type": "text"
-        },
         {
           "key": "instructions_and_conditions",
           "label": "INSTRUCTIONS AND CONDITIONS",
-          "type": "text"
+          "type": "text",
+          "sample_value": "Standard shipping and invoicing requirements including PO number on packages and 2 packing lists."
         },
         {
           "key": "legal_terms",
           "label": "PURCHASE ORDER TERMS AND CONDITIONS",
-          "type": "text"
+          "type": "text",
+          "sample_value": "Detailed legal terms covering applicability, price, invoicing, time for performance, title, etc."
         }
       ]
     }
@@ -256,9 +254,9 @@
       38
     ]
   },
-  "notes": "The document is a multi-page Purchase Order for Celebrity Cruises. Product descriptions and item numbers are often combined in the raw text but have been split into separate columns in the schema. Page headers repeat key metadata like PO Number and Vessel across most data pages.",
+  "notes": "The document is a multi-page Purchase Order. Product descriptions and codes are often merged in the 'Item Number' column and require splitting. Page 34 contains the order total and final logistics details. Pages 35-38 contain standardized legal terms.",
   "_timing": {
-    "total": 34.19,
+    "total": 32.59,
     "pages": 38,
     "batch_success_rate": "8/8",
     "pages_observed": 38

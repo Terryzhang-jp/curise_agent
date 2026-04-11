@@ -15,21 +15,30 @@ import re
 _COMMON_TOOLS = {"think", "calculate", "get_current_time", "request_confirmation", "ask_clarification", "modify_excel"}
 
 SCENARIO_TOOL_GROUPS: dict[str, set[str]] = {
+    "document_processing": {
+        "manage_document_order", "manage_order", "match_products", "manage_inquiry",
+        "search_product_database", "modify_excel",
+        "use_skill",
+    } | _COMMON_TOOLS,
+    "order_processing": {
+        "extract_order", "match_products", "manage_order", "manage_inquiry",
+        "search_product_database", "modify_excel",
+        "query_db", "get_db_schema",
+    } | _COMMON_TOOLS,
     "inquiry": {
-        "get_order_overview", "check_inquiry_readiness", "fill_inquiry_gaps",
-        "generate_inquiries", "modify_excel", "query_db", "get_db_schema",
+        "manage_order", "manage_inquiry",
+        "modify_excel", "query_db", "get_db_schema",
     } | _COMMON_TOOLS,
     "data_upload": {
-        "parse_file", "analyze_columns", "prepare_upload", "execute_upload",
-        "create_references", "rollback_batch", "query_db", "get_db_schema",
+        "parse_upload", "manage_upload",
+        "query_db", "get_db_schema",
     } | _COMMON_TOOLS,
     "fulfillment": {
-        "get_order_fulfillment", "update_order_fulfillment",
-        "record_delivery_receipt", "attach_order_file",
+        "manage_fulfillment", "manage_order",
         "query_db", "get_db_schema",
     } | _COMMON_TOOLS,
     "query": {
-        "query_db", "get_db_schema", "get_order_overview",
+        "query_db", "get_db_schema", "manage_order",
     } | _COMMON_TOOLS,
 }
 
@@ -68,6 +77,9 @@ def resolve_tools_for_scenario(
 # ─── Intent detection (regex-based, fast) ─────────────────────
 
 _INTENT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(处理|投影|建单|创建).*(文档|document)", re.IGNORECASE), "document_processing"),
+    (re.compile(r"(处理|提取|解析|读取).*(订单|order|PO)", re.IGNORECASE), "order_processing"),
+    (re.compile(r"(匹配|match).*(产品|product)", re.IGNORECASE), "order_processing"),
     (re.compile(r"(生成|创建|做|发).*(询价|报价|inquiry)", re.IGNORECASE), "inquiry"),
     (re.compile(r"(上传|导入|import).*(产品|报价单|价格表|数据)", re.IGNORECASE), "data_upload"),
     (re.compile(r"(履约|交货|发票|付款|fulfillment|delivery|invoice)", re.IGNORECASE), "fulfillment"),

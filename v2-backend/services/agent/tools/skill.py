@@ -68,4 +68,26 @@ def register(registry, ctx=None):
             except OSError:
                 pass
 
-        return expanded
+        # Wrap the skill body with explicit execution instructions.
+        # Without this, some models (notably Kimi K2.5) treat use_skill as a
+        # delegation — they invoke it once and then stop, assuming the work
+        # has been handed off. There is no separate executor: THIS agent is
+        # still responsible for actually performing every step described
+        # below. The wrapper makes that contract unambiguous for all models.
+        return (
+            f"## ⚠️ ACTIVATED SKILL: {skill_name}\n\n"
+            f"You have just activated the `{skill_name}` skill. The instructions "
+            f"below are now part of YOUR active task — there is no separate executor "
+            f"or sub-agent that will run them for you. You MUST execute every step "
+            f"described in this skill in order, calling the necessary tools, until "
+            f"the entire workflow is complete.\n\n"
+            f"**Do NOT stop after invoking this skill.** Continue calling tools and "
+            f"performing the steps below until you have completed everything the "
+            f"skill describes (or hit a documented pause condition).\n\n"
+            f"---\n\n"
+            f"{expanded}\n\n"
+            f"---\n\n"
+            f"## ▶ Begin executing Step 1 of the skill above NOW.\n"
+            f"Do not summarize, do not ask for permission, do not stop. The next "
+            f"thing you produce should be a tool call that performs the first step."
+        )

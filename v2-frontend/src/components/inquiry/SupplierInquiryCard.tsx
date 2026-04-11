@@ -30,9 +30,8 @@ const SELECTION_METHOD_LABELS: Record<string, string> = {
   supplier: "供应商匹配",
   country: "国家匹配",
   single: "唯一模板",
-  none: "通用格式",
+  none: "未绑定模板",
   candidates: "候选列表",
-  generic: "通用格式",
 };
 
 const GAP_CATEGORY_LABELS: Record<string, string> = {
@@ -61,6 +60,10 @@ export interface SupplierInquiryCardProps {
   fieldOverrideValues?: Record<string, string>;
   /** Whether overrides are being saved */
   savingOverrides?: boolean;
+  /** Inline save feedback text */
+  saveFeedback?: string;
+  /** Inline save feedback tone */
+  saveFeedbackTone?: "idle" | "saving" | "saved" | "error";
 }
 
 export default function SupplierInquiryCard({
@@ -79,6 +82,8 @@ export default function SupplierInquiryCard({
   onFieldOverride,
   fieldOverrideValues = {},
   savingOverrides,
+  saveFeedback,
+  saveFeedbackTone = "idle",
 }: SupplierInquiryCardProps) {
   const file = data.file;
   const template = data.template;
@@ -103,7 +108,10 @@ export default function SupplierInquiryCard({
     if (data.gen_status === "completed") return { label: "完成", variant: "default" as const };
     if (data.gen_status === "generating") return { label: "生成中", variant: "secondary" as const };
     if (data.gen_status === "error") return { label: "失败", variant: "destructive" as const };
-    if (data.status === "blocked") return { label: "缺必填", variant: "destructive" as const };
+    if (data.status === "blocked") {
+      const label = data.error?.includes("zone_config 模板") ? "无模板" : "缺必填";
+      return { label, variant: "destructive" as const };
+    }
     if (data.status === "needs_input") return { label: "需补充", variant: "outline" as const };
     return { label: "待生成", variant: "outline" as const };
   })();
@@ -113,7 +121,7 @@ export default function SupplierInquiryCard({
 
   const templateName = template.name
     || (template.method ? SELECTION_METHOD_LABELS[template.method] : null)
-    || "通用格式";
+    || "未绑定模板";
 
   /** Render a single gap row with optional inline input */
   function GapRow({ g, variant }: { g: FieldGap; variant: "blocking" | "warning" }) {
@@ -253,14 +261,19 @@ export default function SupplierInquiryCard({
               <span className="text-xs text-muted-foreground shrink-0">模板:</span>
               {canChangeTemplate ? (
                 <Select
-                  value={selectedTemplateId != null ? String(selectedTemplateId) : "generic"}
-                  onValueChange={(val) => onTemplateChange(val === "generic" ? null : Number(val))}
+                  value={selectedTemplateId != null ? String(selectedTemplateId) : "__unassigned__"}
+                  onValueChange={(val) => {
+                    if (val === "__unassigned__") return;
+                    onTemplateChange(Number(val));
+                  }}
                 >
                   <SelectTrigger className="h-7 text-xs max-w-[240px]">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="generic">通用格式</SelectItem>
+                    {selectedTemplateId == null && (
+                      <SelectItem value="__unassigned__" disabled>未绑定可用模板</SelectItem>
+                    )}
                     {allTemplates.map((t) => (
                       <SelectItem key={t.id} value={String(t.id)}>
                         {t.template_name}
@@ -290,9 +303,24 @@ export default function SupplierInquiryCard({
                 {warningGaps.length > 0 && (
                   <span className="text-amber-600 dark:text-amber-400">{warningGaps.length} 可选</span>
                 )}
-                {savingOverrides && (
-                  <span className="flex items-center gap-1 text-muted-foreground/60">
-                    <Loader2 className="h-3 w-3 animate-spin" /> 保存中
+                {saveFeedback && (
+                  <span
+                    className={`flex items-center gap-1 ${
+                      saveFeedbackTone === "error"
+                        ? "text-destructive"
+                        : saveFeedbackTone === "saved"
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : "text-muted-foreground/60"
+                    }`}
+                  >
+                    {saveFeedbackTone === "saving" ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : saveFeedbackTone === "saved" ? (
+                      <CheckCircle2 className="h-3 w-3" />
+                    ) : saveFeedbackTone === "error" ? (
+                      <XCircle className="h-3 w-3" />
+                    ) : null}
+                    {saveFeedback}
                   </span>
                 )}
               </div>

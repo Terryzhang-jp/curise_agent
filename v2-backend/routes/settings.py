@@ -378,13 +378,19 @@ def delete_order_template(
 @router.get("/supplier-templates", response_model=list[SupplierTemplateResponse])
 def list_supplier_templates(
     supplier_id: int | None = None,
+    include_legacy: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    from services.inquiry_agent import get_production_templates
+
     q = db.query(SupplierTemplate)
     if supplier_id is not None:
         q = q.filter(SupplierTemplate.supplier_id == supplier_id)
-    return q.order_by(SupplierTemplate.id.desc()).all()
+    templates = q.order_by(SupplierTemplate.id.desc()).all()
+    if include_legacy:
+        return templates
+    return get_production_templates(templates)
 
 
 @router.post("/supplier-templates", response_model=SupplierTemplateResponse, status_code=201)
@@ -556,6 +562,7 @@ async def analyze_supplier_template(
     zone_config = None
     try:
         from services.zone_config_builder import build_zone_config
+        from services.template_contract import build_template_contract
         ptc = result.get("product_table_config", {})
         fp = result.get("field_positions", {})
         if ptc.get("start_row") and (fp or ptc.get("columns")):
@@ -569,6 +576,10 @@ async def analyze_supplier_template(
             if template_styles is None:
                 template_styles = {}
             template_styles.update(zone_config)
+            template_styles["template_contract"] = build_template_contract(
+                file_bytes=file_bytes,
+                zone_config=zone_config,
+            )
     except Exception as zc_err:
         import logging as _log
         _log.getLogger(__name__).warning("Zone config build failed: %s", zc_err)
