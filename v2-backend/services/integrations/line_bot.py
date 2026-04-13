@@ -43,11 +43,37 @@ def _get_messaging_api_blob():
     return MessagingApiBlob(client)
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove markdown syntax that LINE doesn't render."""
+    import re
+    # Bold/italic: **text** → text, *text* → text, __text__ → text, _text_ → text
+    text = re.sub(r'\*{1,3}(.+?)\*{1,3}', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'_{1,2}(.+?)_{1,2}', r'\1', text, flags=re.DOTALL)
+    # Inline code: `code` → code
+    text = re.sub(r'`{1,3}([^`]+)`{1,3}', r'\1', text)
+    # Headers: ### Title → Title
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Horizontal rules
+    text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    # Blockquotes: > text → text
+    text = re.sub(r'^>\s?', '', text, flags=re.MULTILINE)
+    # Links: [text](url) → text
+    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
+    # Images: ![alt](url) → remove
+    text = re.sub(r'!\[.*?\]\(.+?\)', '', text)
+    # Unordered list markers: - item or * item → • item
+    text = re.sub(r'^[\-\*\+]\s+', '• ', text, flags=re.MULTILINE)
+    # Collapse 3+ blank lines to 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def _split_message(text: str, max_len: int = 5000) -> list[str]:
-    """Split text into chunks that fit LINE's 5000-char limit.
+    """Strip markdown then split into chunks that fit LINE's 5000-char limit.
 
     Strategy: split by double-newline → single-newline → hard-cut.
     """
+    text = _strip_markdown(text)
     if len(text) <= max_len:
         return [text]
 
@@ -136,18 +162,78 @@ def _push_message(target_id: str, text: str):
         logger.error("Push message failed for %s: %s", target_id, e)
 
 
-# ─── Image Download ──────────────────────────────────────────
+# ─── File Download ───────────────────────────────────────────
 
-def _download_image(message_id: str) -> bytes | None:
-    """Download image content from LINE servers via MessagingApiBlob."""
+def _download_content(message_id: str, label: str = "file") -> bytes | None:
+    """Download any message content (image, file, etc.) from LINE via MessagingApiBlob."""
     try:
         blob_api = _get_messaging_api_blob()
         content = blob_api.get_message_content(message_id)
-        logger.info("Downloaded image %s (%d bytes)", message_id, len(content))
+        logger.info("Downloaded LINE %s %s (%d bytes)", label, message_id, len(content))
         return bytes(content)
     except Exception as e:
-        logger.error("Failed to download image %s: %s", message_id, e)
+        logger.error("Failed to download LINE %s %s: %s", label, message_id, e)
         return None
+
+
+# ─── Document Processing ─────────────────────────────────────
+
+def _store_and_process_document(
+    file_bytes: bytes,
+    filename: str,
+    file_type: str,
+    user_id: int,
+    db: DBSession,
+) -> tuple[int | None, str]:
+    """Run Document AI on file_bytes, store result as a Document row.
+
+    Returns (document_id, summary_text).
+    summary_text is a human-readable one-liner for the LINE reply.
+    """
+    from core.models import Document
+    from services.documents.document_processor import process_document
+    from services.common.file_storage import storage as file_storage
+
+    # Upload raw file to Supabase Storage
+    safe_name = f"{uuid.uuid4().hex[:8]}_{filename}"
+    try:
+        file_url = file_storage.upload("line", safe_name, file_bytes)
+    except Exception as e:
+        logger.warning("Supabase upload failed for %s: %s", filename, e)
+        file_url = None
+
+    # Run Document AI extraction
+    try:
+        result = process_document(file_bytes, file_type, is_purchase_order=True)
+    except Exception as e:
+        logger.error("process_document failed for %s: %s", filename, e)
+        return None, f"文件解析失败: {e}"
+
+    products = (result.get("extracted_data") or {}).get("products") or []
+    doc_type = result.get("doc_type") or "unknown"
+    extraction_method = result.get("extraction_method") or "document_ai"
+
+    # Store Document record
+    doc = Document(
+        user_id=user_id,
+        filename=filename,
+        file_url=file_url,
+        file_type=file_type,
+        file_size_bytes=len(file_bytes),
+        doc_type=doc_type,
+        content_markdown=result.get("content_markdown"),
+        extracted_data=result.get("extracted_data"),
+        extraction_method=extraction_method,
+        status="ready",
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
+    product_count = len(products)
+    summary = f"文档已解析 (document_id={doc.id})，识别到 {product_count} 个产品行，类型: {doc_type}"
+    logger.info("Stored document #%d for user %d (%s, %d products)", doc.id, user_id, doc_type, product_count)
+    return doc.id, summary
 
 
 # ─── Source Helpers ───────────────────────────────────────────
@@ -284,22 +370,41 @@ def _get_or_create_session(db: DBSession, line_user: LineUser, force_new: bool =
 
 # ─── Agent Invocation ────────────────────────────────────────
 
-def _run_agent_for_line(session_id: str, user_message: str, db: DBSession, file_bytes: bytes | None = None) -> str:
+def _run_agent_for_line(
+    session_id: str,
+    user_message: str,
+    db: DBSession,
+    file_bytes: bytes | None = None,
+    scenario: str | None = None,
+    user_id: int | None = None,
+) -> str:
     """Run the ReAct chat agent and return the final answer text.
 
     Reuses _create_chat_agent from routes/chat.py — same LLM, tools, skills.
     """
     from routes.chat import _create_chat_agent
 
-    agent = _create_chat_agent(session_id, db, file_bytes=file_bytes)
+    agent = _create_chat_agent(
+        session_id, db,
+        file_bytes=file_bytes,
+        scenario=scenario,
+        user_id=user_id,
+        user_message=user_message,
+    )
     result = agent.run(user_message)
     return result or "（Agent 未返回内容）"
 
 
 # ─── Core Message Processing ─────────────────────────────────
 
-def _process_message(event, received_at: float, user_text: str, file_bytes: bytes | None = None):
-    """Shared logic for text and image messages.
+def _process_message(
+    event,
+    received_at: float,
+    user_text: str,
+    file_bytes: bytes | None = None,
+    scenario: str | None = None,
+):
+    """Shared logic for text and image/file messages.
 
     Flow: resolve user → manage session → run agent → deliver reply.
     """
@@ -356,7 +461,12 @@ def _process_message(event, received_at: float, user_text: str, file_bytes: byte
 
         # Run agent
         try:
-            answer = _run_agent_for_line(session.id, user_text, db, file_bytes=file_bytes)
+            answer = _run_agent_for_line(
+                session.id, user_text, db,
+                file_bytes=file_bytes,
+                scenario=scenario,
+                user_id=line_user.user_id,
+            )
         except Exception as e:
             logger.error("Agent error for session %s: %s", session.id, e, exc_info=True)
             answer = f"抱歉，处理您的消息时出错了: {str(e)}"
@@ -411,30 +521,93 @@ def handle_text_message(event, received_at: float):
 
 
 def handle_image_message(event, received_at: float):
-    """Handle an image message — download and pass to agent."""
+    """Handle an image message — download, run Document AI, store, then pass to agent."""
     target_id = _get_reply_target_id(event)
 
-    # In groups, ignore images (no way to @mention with an image easily)
+    # In groups, ignore images (no @mention possible with images)
     if _is_group_source(event):
         return
 
     # Download image from LINE
     message_id = event.message.id
-    file_bytes = _download_image(message_id)
+    file_bytes = _download_content(message_id, label="image")
 
     if not file_bytes:
         deliver_message(event.reply_token, target_id, "图片下载失败，请重试。", received_at)
         return
 
-    # Save to Supabase Storage
-    from services.common.file_storage import storage
-    filename = f"{uuid.uuid4().hex[:8]}_line_image.jpg"
-    storage.upload("line", filename, file_bytes, content_type="image/jpeg")
-    logger.info("Saved LINE image to storage: %s (%d bytes)", filename, len(file_bytes))
+    # Resolve user to get user_id for Document ownership
+    db = SessionLocal()
+    try:
+        line_user = _get_or_create_line_user(db, event.source.user_id)
+        filename = f"line_image_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
+        document_id, summary = _store_and_process_document(
+            file_bytes, filename, "image/jpeg", line_user.user_id, db
+        )
+    finally:
+        db.close()
 
-    # Pass to agent with a prompt
-    user_text = "用户上传了一张图片，请分析图片内容。"
-    _process_message(event, received_at, user_text, file_bytes=file_bytes)
+    if document_id is None:
+        # Parsing failed — fall back to raw image pass-through
+        logger.warning("Document processing failed for LINE image, falling back to raw bytes")
+        user_text = "用户上传了一张图片，请描述图片内容。"
+        _process_message(event, received_at, user_text, file_bytes=file_bytes)
+        return
+
+    # Agent message: include document_id so context package is injected automatically
+    user_text = f"document_id={document_id} 我上传了一张图片，请分析文档内容并告诉我里面有什么。"
+    _process_message(event, received_at, user_text, scenario="document_processing")
+
+
+def handle_file_message(event, received_at: float):
+    """Handle a file message (PDF, Excel, etc.) — download, run Document AI, store, then pass to agent."""
+    target_id = _get_reply_target_id(event)
+
+    # In groups, ignore file uploads
+    if _is_group_source(event):
+        return
+
+    message_id = event.message.id
+    original_filename = getattr(event.message, "file_name", None) or "document.pdf"
+    file_bytes = _download_content(message_id, label="file")
+
+    if not file_bytes:
+        deliver_message(event.reply_token, target_id, "文件下载失败，请重试。", received_at)
+        return
+
+    # Determine file type
+    ext = original_filename.rsplit(".", 1)[-1].lower() if "." in original_filename else "pdf"
+    if ext in ("jpg", "jpeg"):
+        file_type = "image/jpeg"
+    elif ext == "png":
+        file_type = "image/png"
+    elif ext in ("xls", "xlsx"):
+        file_type = "excel"
+    else:
+        file_type = "pdf"
+
+    deliver_message(
+        event.reply_token, target_id,
+        f"收到文件「{original_filename}」，正在解析中，请稍候...",
+        received_at,
+    )
+
+    db = SessionLocal()
+    try:
+        line_user = _get_or_create_line_user(db, event.source.user_id)
+        safe_filename = f"line_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{original_filename}"
+        document_id, summary = _store_and_process_document(
+            file_bytes, safe_filename, file_type, line_user.user_id, db
+        )
+    finally:
+        db.close()
+
+    if document_id is None:
+        _process_message(event, received_at, f"用户上传了文件「{original_filename}」，解析失败，请告知用户: {summary}")
+        return
+
+    user_text = f"document_id={document_id} 我上传了文件「{original_filename}」，{summary}。请分析文档内容并告诉我里面有什么。"
+    _process_message(event, received_at, user_text, scenario="document_processing")
 
 
 def handle_follow_event(event):
@@ -446,8 +619,10 @@ def handle_follow_event(event):
         _get_or_create_line_user(db, line_user_id)
         _push_message(line_user_id,
             "欢迎使用邮轮供应链管理助手！\n\n"
-            "您可以直接发送消息查询产品、订单、供应商等信息。\n"
-            "也可以发送图片让 AI 分析内容。\n\n"
+            "您可以：\n"
+            "• 直接发文字查询产品、订单、供应商信息\n"
+            "• 发送图片或 PDF 发票/订单，AI 自动解析内容\n"
+            "• 发送 Excel 文件进行产品数据处理\n\n"
             "发送「新对话」可以开始新的对话。"
         )
     except Exception as e:
@@ -479,6 +654,6 @@ def handle_non_text_message(event, received_at: float):
     deliver_message(
         event.reply_token,
         target_id,
-        "暂时只支持文字和图片消息，请发送文字或图片。",
+        "暂时只支持文字、图片和 PDF/Excel 文件，请发送以上类型的内容。",
         received_at,
     )
