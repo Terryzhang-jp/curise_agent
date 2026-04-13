@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,13 +21,15 @@ import {
   RotateCw,
   XCircle,
 } from "lucide-react";
-import type { SupplierReadiness, FieldGap, VerifyResult } from "@/lib/orders-api";
+import type { SupplierReadiness, FieldItem, VerifyResult } from "@/lib/orders-api";
 import type { SupplierTemplate } from "@/lib/settings-api";
 
 const SELECTION_METHOD_LABELS: Record<string, string> = {
   exact: "精确绑定",
   user_selected: "手动选择",
+  manual_override: "手动选择",
   agent_selected: "Agent 选择",
+  candidate_auto: "自动匹配",
   supplier: "供应商匹配",
   country: "国家匹配",
   single: "唯一模板",
@@ -41,6 +44,70 @@ const GAP_CATEGORY_LABELS: Record<string, string> = {
   delivery: "交付",
 };
 
+// ── FieldRow lives at module level so its identity is stable across renders ──
+// If it were defined inside SupplierInquiryCard, React would see a new component
+// type on every keystroke re-render → unmount + remount → input loses focus.
+
+interface FieldRowProps {
+  f: FieldItem;
+  overrideValue: string;
+  onChange: (cell: string, value: string) => void;
+}
+
+function FieldRow({ f, overrideValue, onChange }: FieldRowProps) {
+  if (f.status === "resolved") {
+    return (
+      <div className="text-[11px] rounded px-2.5 py-1.5 flex items-center gap-2 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400">
+        <CheckCircle2 className="h-3 w-3 shrink-0" />
+        <span className="shrink-0 min-w-[4rem]">{f.label}</span>
+        <span className="flex-1 truncate text-emerald-600/70 dark:text-emerald-400/60">{f.value ?? "—"}</span>
+        <span className="text-[9px] text-muted-foreground/40 shrink-0">{GAP_CATEGORY_LABELS[f.category] || f.category}</span>
+      </div>
+    );
+  }
+
+  if (f.status === "overridden") {
+    return (
+      <div className="text-[11px] rounded px-2.5 py-1.5 flex items-center gap-2 bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-400">
+        <Pencil className="h-3 w-3 shrink-0" />
+        <span className="shrink-0 min-w-[4rem]">{f.label}</span>
+        <input
+          className="flex-1 min-w-0 bg-white dark:bg-background border border-blue-300 dark:border-blue-700 rounded px-1.5 py-0.5 text-[11px] text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary/20"
+          value={overrideValue || f.value || ""}
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => onChange(f.cell, e.target.value)}
+        />
+        <span className="text-[9px] text-muted-foreground/40 shrink-0">{GAP_CATEGORY_LABELS[f.category] || f.category}</span>
+      </div>
+    );
+  }
+
+  // missing
+  const isBlocking = f.severity === "blocking";
+  return (
+    <div className={`text-[11px] rounded px-2.5 py-1.5 flex items-center gap-2 ${
+      isBlocking
+        ? "bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-400"
+        : "bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400"
+    }`}>
+      {isBlocking ? <XCircle className="h-3 w-3 shrink-0" /> : <AlertTriangle className="h-3 w-3 shrink-0" />}
+      <span className="shrink-0 min-w-[4rem]">{f.label}</span>
+      <input
+        className={`flex-1 min-w-0 bg-white dark:bg-background border rounded px-1.5 py-0.5 text-[11px] outline-none transition-colors ${
+          overrideValue.trim()
+            ? "border-primary/50 text-foreground"
+            : "border-border text-muted-foreground"
+        } focus:border-primary focus:ring-1 focus:ring-primary/20`}
+        placeholder={`输入${f.label}...`}
+        value={overrideValue}
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => onChange(f.cell, e.target.value)}
+      />
+      <span className="text-[9px] text-muted-foreground/50 shrink-0">{GAP_CATEGORY_LABELS[f.category] || f.category}</span>
+    </div>
+  );
+}
+
 export interface SupplierInquiryCardProps {
   supplierId: number;
   data: SupplierReadiness;
@@ -54,16 +121,10 @@ export interface SupplierInquiryCardProps {
   downloadingFile: string | null;
   expanded: boolean;
   onToggle: () => void;
-  /** Inline gap editing: called when user types a value for a missing field */
-  onFieldOverride?: (cell: string, value: string) => void;
-  /** Current inline override values for this supplier */
-  fieldOverrideValues?: Record<string, string>;
-  /** Whether overrides are being saved */
-  savingOverrides?: boolean;
-  /** Inline save feedback text */
-  saveFeedback?: string;
-  /** Inline save feedback tone */
-  saveFeedbackTone?: "idle" | "saving" | "saved" | "error";
+  /** Initial saved override values — used only on mount; card manages edits locally */
+  initialOverrides?: Record<string, string>;
+  /** Called when overrides should be persisted — card debounces this internally */
+  onSaveOverrides: (overrides: Record<string, string>) => Promise<void>;
 }
 
 export default function SupplierInquiryCard({
@@ -79,21 +140,54 @@ export default function SupplierInquiryCard({
   downloadingFile,
   expanded,
   onToggle,
-  onFieldOverride,
-  fieldOverrideValues = {},
-  savingOverrides,
-  saveFeedback,
-  saveFeedbackTone = "idle",
+  initialOverrides,
+  onSaveOverrides,
 }: SupplierInquiryCardProps) {
+  // Local edit state — lives here so typing only re-renders THIS card, not siblings
+  const [localOverrides, setLocalOverrides] = useState<Record<string, string>>(
+    () => initialOverrides || {},
+  );
+  const [saveFeedback, setSaveFeedback] = useState<string>("");
+  const [saveFeedbackTone, setSaveFeedbackTone] = useState<"idle" | "saving" | "saved" | "error">("idle");
+
+  // Ref keeps latest overrides value for the debounced save without adding it
+  // as a dependency of handleFieldChange (which would recreate it on every keystroke).
+  const latestOverridesRef = useRef<Record<string, string>>(initialOverrides || {});
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Stable callback — same function reference across re-renders so FieldRow
+  // receives a stable prop and won't trigger unnecessary DOM remounts.
+  const handleFieldChange = useCallback((cell: string, value: string) => {
+    const next = { ...latestOverridesRef.current, [cell]: value };
+    latestOverridesRef.current = next;
+    setLocalOverrides(next);
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      setSaveFeedback("保存中");
+      setSaveFeedbackTone("saving");
+      try {
+        await onSaveOverrides(latestOverridesRef.current);
+        setSaveFeedback(
+          `已保存 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`,
+        );
+        setSaveFeedbackTone("saved");
+      } catch {
+        setSaveFeedback("保存失败");
+        setSaveFeedbackTone("error");
+      }
+    }, 800);
+  }, [onSaveOverrides]);
+
   const file = data.file;
   const template = data.template;
   const verifyResults = data.verify_results || [];
   const passCount = verifyResults.filter((r: VerifyResult) => r.status === "pass").length;
   const failCount = verifyResults.filter((r: VerifyResult) => r.status === "fail").length;
-  const gaps = data.gaps || [];
-  const blockingGaps = gaps.filter((g: FieldGap) => g.severity === "blocking");
-  const warningGaps = gaps.filter((g: FieldGap) => g.severity === "warning");
-  const hasGaps = gaps.length > 0;
+  const fields = data.fields || [];
+  const blockingGaps = fields.filter((f: FieldItem) => f.status === "missing" && f.severity === "blocking");
+  const warningGaps = fields.filter((f: FieldItem) => f.status === "missing" && f.severity === "warning");
+  const hasFields = fields.length > 0;
 
   // Border color based on readiness status
   const borderColor =
@@ -123,49 +217,6 @@ export default function SupplierInquiryCard({
     || (template.method ? SELECTION_METHOD_LABELS[template.method] : null)
     || "未绑定模板";
 
-  /** Render a single gap row with optional inline input */
-  function GapRow({ g, variant }: { g: FieldGap; variant: "blocking" | "warning" }) {
-    const isBlocking = variant === "blocking";
-    const overrideValue = fieldOverrideValues[g.cell] ?? "";
-    const isFilled = overrideValue.trim().length > 0;
-
-    return (
-      <div
-        className={`text-[11px] rounded px-2.5 py-1.5 flex items-center gap-2 ${
-          isBlocking
-            ? "bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-400"
-            : "bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400"
-        }`}
-      >
-        {isBlocking ? (
-          <XCircle className="h-3 w-3 shrink-0" />
-        ) : (
-          <AlertTriangle className="h-3 w-3 shrink-0" />
-        )}
-        <span className="shrink-0 min-w-[4rem]">{g.label}</span>
-        {/* Inline input for filling the gap */}
-        {onFieldOverride ? (
-          <input
-            className={`flex-1 min-w-0 bg-white dark:bg-background border rounded px-1.5 py-0.5 text-[11px] outline-none transition-colors ${
-              isFilled
-                ? "border-primary/50 text-foreground"
-                : "border-border text-muted-foreground"
-            } focus:border-primary focus:ring-1 focus:ring-primary/20`}
-            placeholder={`输入${g.label}...`}
-            value={overrideValue}
-            onClick={(e) => e.stopPropagation()}
-            onChange={(e) => onFieldOverride(g.cell, e.target.value)}
-          />
-        ) : (
-          <span className="flex-1 text-muted-foreground/50 italic">未填写</span>
-        )}
-        <span className="text-[9px] text-muted-foreground/50 shrink-0">
-          {GAP_CATEGORY_LABELS[g.category] || g.category}
-        </span>
-      </div>
-    );
-  }
-
   return (
     <div
       className={`rounded-lg border-2 transition-all ${borderColor} ${
@@ -180,19 +231,15 @@ export default function SupplierInquiryCard({
           <Badge variant={statusBadge.variant} className="text-[10px] h-5 px-2">
             {statusBadge.label}
           </Badge>
-          {blockingGaps.length > 0 && (
+          {!expanded && blockingGaps.length > 0 && (
             <Badge variant="destructive" className="text-[10px] h-5 px-1.5">
-              {blockingGaps.length} 必填缺失
+              缺 {blockingGaps.length} 必填
             </Badge>
           )}
-          {warningGaps.length > 0 && (
-            <Badge className="text-[10px] h-5 px-1.5 bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/20">
-              {warningGaps.length} 可选缺失
-            </Badge>
-          )}
-          {failCount > 0 && isCompleted && (
-            <Badge className="text-[10px] h-5 px-1.5 bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30 hover:bg-red-500/15">
-              {failCount} 验证失败
+          {template?.method === "candidate_auto" && (
+            <Badge variant="outline" className="text-[10px] h-5 px-1.5 border-amber-400 text-amber-600 dark:text-amber-400">
+              <AlertTriangle className="h-2.5 w-2.5 mr-0.5" />
+              自动匹配
             </Badge>
           )}
         </div>
@@ -292,11 +339,11 @@ export default function SupplierInquiryCard({
             )}
           </div>
 
-          {/* ── Inline editable gaps (P0: core UX improvement) ── */}
-          {hasGaps && (
+          {/* ── Full field list: resolved (green), overridden (blue), missing (input) ── */}
+          {hasFields && (
             <div className="space-y-1.5">
               <div className="text-xs text-muted-foreground flex items-center gap-2">
-                <span>缺失字段</span>
+                <span>模板字段</span>
                 {blockingGaps.length > 0 && (
                   <span className="text-destructive">{blockingGaps.length} 必填</span>
                 )}
@@ -304,29 +351,28 @@ export default function SupplierInquiryCard({
                   <span className="text-amber-600 dark:text-amber-400">{warningGaps.length} 可选</span>
                 )}
                 {saveFeedback && (
-                  <span
-                    className={`flex items-center gap-1 ${
-                      saveFeedbackTone === "error"
-                        ? "text-destructive"
-                        : saveFeedbackTone === "saved"
-                        ? "text-emerald-600 dark:text-emerald-400"
-                        : "text-muted-foreground/60"
-                    }`}
-                  >
-                    {saveFeedbackTone === "saving" ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : saveFeedbackTone === "saved" ? (
-                      <CheckCircle2 className="h-3 w-3" />
-                    ) : saveFeedbackTone === "error" ? (
-                      <XCircle className="h-3 w-3" />
-                    ) : null}
+                  <span className={`flex items-center gap-1 ${
+                    saveFeedbackTone === "error" ? "text-destructive"
+                    : saveFeedbackTone === "saved" ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-muted-foreground/60"
+                  }`}>
+                    {saveFeedbackTone === "saving" ? <Loader2 className="h-3 w-3 animate-spin" />
+                      : saveFeedbackTone === "saved" ? <CheckCircle2 className="h-3 w-3" />
+                      : saveFeedbackTone === "error" ? <XCircle className="h-3 w-3" />
+                      : null}
                     {saveFeedback}
                   </span>
                 )}
               </div>
               <div className="space-y-1">
-                {blockingGaps.map((g) => <GapRow key={g.cell} g={g} variant="blocking" />)}
-                {warningGaps.map((g) => <GapRow key={g.cell} g={g} variant="warning" />)}
+                {fields.map((f: FieldItem) => (
+                  <FieldRow
+                    key={f.cell}
+                    f={f}
+                    overrideValue={localOverrides[f.cell] ?? ""}
+                    onChange={handleFieldChange}
+                  />
+                ))}
               </div>
             </div>
           )}
@@ -381,7 +427,6 @@ export default function SupplierInquiryCard({
 
           {/* Action buttons */}
           <div className="flex items-center gap-2 pt-1 flex-wrap">
-            {/* P0: Renamed from "数据预览" to "编辑字段", highlighted when blocking gaps exist */}
             <Button
               variant={blockingGaps.length > 0 ? "default" : "outline"}
               size="sm"

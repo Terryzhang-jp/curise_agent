@@ -70,6 +70,45 @@ _INTEGER_ONLY_FORMATS = {
 }
 
 
+# OWASP CSV/Excel injection prevention: strings starting with these characters
+# are treated as formulas/DDE commands by Excel on open. To block injection
+# via supplier name, product name, address fields, etc., we prepend a single
+# quote (Excel's text-literal marker) to any user-supplied string whose first
+# char is one of these AND which is not a legitimate number.
+_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_cell_input(value: Any) -> Any:
+    """Escape potentially-dangerous strings to prevent CSV/Excel formula injection.
+
+    Rules:
+      - Non-strings pass through unchanged (numbers, dates, bools)
+      - Empty strings pass through unchanged
+      - Strings starting with dangerous prefixes (= + - @ \\t \\r):
+          * If it parses as a number (e.g. "-50", "+1.5"), leave as-is —
+            Excel will display it as a number
+          * Otherwise prepend a single quote (') which Excel uses as a text-
+            literal marker. The quote is stripped from the display in Excel
+            but prevents formula evaluation.
+
+    This is applied to every value written from user-controlled sources
+    (header_fields resolved from order_data, product row cells resolved from
+    products). It is NOT applied to intentional formulas written from the
+    zone_config (product_row_formulas, summary_formulas, external_refs) —
+    those must remain executable.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value[0] not in _INJECTION_PREFIXES:
+        return value
+    try:
+        float(value)
+        return value  # legitimate numeric string like "-50" or "+1.5"
+    except (ValueError, TypeError):
+        pass
+    return "'" + value
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────
@@ -80,6 +119,7 @@ def compose_render(
     zone_config_dict: dict[str, Any],
     order_data: dict[str, Any],
     supplier_id: str | int,
+    field_overrides: dict[str, str] | None = None,
 ) -> bytes:
     """Render a filled xlsx by composing from a template, never mutating it.
 
@@ -156,21 +196,37 @@ def compose_render(
         _copy_row_cells(src_ws, dst_ws, src_row, src_row)
 
     # ── Phase 1b: apply header_fields (placeholder substitution) ──
+    # If a mapped source resolves to None (order_data missing that field),
+    # we EXPLICITLY clear the cell — otherwise the template's sample value
+    # would survive Phase 1 copy and leak into the output (e.g. a stale
+    # invoice number, stale delivery address, etc).
     for cell_ref, data_path in config.header_fields.items():
         col_letter, row_num = _split_cell_ref(cell_ref)
         if row_num >= prod_start:
             continue  # not in header zone
         col_idx = column_index_from_string(col_letter)
-        value = _resolve_data_path(order_data, data_path, sid)
-        if value is None:
-            continue
         cell = dst_ws.cell(row=row_num, column=col_idx)
         if isinstance(cell, MergedCell):
             continue
-        cell.value = value
-        cell.number_format = _format_for_value(
-            cell.number_format, value, force_decimal=any_fractional
-        )
+        value = _resolve_data_path(order_data, data_path, sid)
+        value = _sanitize_cell_input(value)   # block formula injection
+        cell.value = value  # explicit None clears any copied template sample
+        if value is not None:
+            cell.number_format = _format_for_value(
+                cell.number_format, value, force_decimal=any_fractional
+            )
+
+    # ── Phase 1c: apply user field_overrides (highest priority) ──
+    if field_overrides:
+        for cell_ref, value in field_overrides.items():
+            col_letter, row_num = _split_cell_ref(cell_ref)
+            if row_num >= prod_start:
+                continue  # only header zone
+            col_idx = column_index_from_string(col_letter)
+            cell = dst_ws.cell(row=row_num, column=col_idx)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.value = _sanitize_cell_input(value)
 
     # ── Phase 2: emit N product rows from the template's first product row ──
     template_row = prod_start
@@ -181,15 +237,21 @@ def compose_render(
         dst_row = prod_start + i
         # Copy the template product row's cell formats
         _copy_row_cells(src_ws, dst_ws, template_row, dst_row)
-        # Override values with product data (with order_context fallback)
+        # Override values with product data (with order_context fallback).
+        # If the field name is unrecognized, _resolve_product_field returns the
+        # _USE_TEMPLATE sentinel — we preserve the template row's original value
+        # in that cell (covers static per-row labels like "JPY" / "Submitted").
         for col_letter, field_name in config.product_columns.items():
             col_idx = column_index_from_string(col_letter)
             value = _resolve_product_field(
                 field_name, product, i, po_number, currency, order_context
             )
+            if value is _USE_TEMPLATE:
+                continue  # leave the template's copied value in place
             cell = dst_ws.cell(row=dst_row, column=col_idx)
             if isinstance(cell, MergedCell):
                 continue
+            value = _sanitize_cell_input(value)   # block formula injection
             cell.value = value
             cell.number_format = _format_for_value(
                 cell.number_format, value, force_decimal=any_fractional
@@ -478,6 +540,13 @@ def _resolve_data_path(order_data: dict, path: str, sid: str) -> Any:
     return cursor
 
 
+# Sentinel: means "this field name is unknown — keep whatever the template had".
+# Returned by _resolve_product_field so the caller can distinguish
+# "known field, value is empty" (must clear cell) vs "unknown field name"
+# (should preserve the template's per-row static value like "JPY" or "Submitted").
+_USE_TEMPLATE = object()
+
+
 def _resolve_product_field(
     field_name: str,
     product: dict,
@@ -491,6 +560,10 @@ def _resolve_product_field(
     Mirrors services/template_engine.py::_resolve_product_field so that flat-
     table templates (which repeat ship_name / supplier_name / delivery_date
     on every product row) work correctly.
+
+    Returns `_USE_TEMPLATE` sentinel if the field name is completely
+    unrecognized AND no value is found in product / order_context. The
+    caller should treat this as "preserve the template row's original value".
     """
     if field_name in ("line_number", "__line_number__"):
         return index + 1
@@ -525,7 +598,11 @@ def _resolve_product_field(
         if val is not None:
             return val
 
-    return ""
+    # Unknown field and no value anywhere — let the template's copied value stand.
+    # This covers per-row static labels like "JPY" (currency_label) or
+    # "Submitted" (order_status) that the template author put in every row
+    # but didn't want parameterized.
+    return _USE_TEMPLATE
 
 
 # Re-export for convenient imports

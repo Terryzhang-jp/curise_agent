@@ -647,22 +647,19 @@ def _geo_llm_fallback(order_id: int, metadata: dict, countries: list, ports: lis
 
 
 def _batch_match(products: list[dict], db, country_id, port_id, delivery_date=None) -> tuple[list, list]:
-    """Step 2: Code-based batch matching (0 LLM calls)."""
-    from services.tools.product_matching import _match_products_against_db
+    """Step 2: Exact-code-only matching. No fuzzy scoring, no false positives.
 
-    results = _match_products_against_db(products, db, country_id, port_id, delivery_date)
-    ambiguous = [r for r in results if r["match_status"] in ("possible_match", "not_matched")]
-    return results, ambiguous
+    Each product is either:
+      - matched  (exact supplier code found in DB pool)
+      - pending_llm  (no code match — queued for semantic LLM step)
 
-
-def _refine_with_llm(order_id: int, ambiguous: list[dict], db, country_id, port_id, delivery_date=None) -> list:
-    """Step 3: Single Gemini call to refine ambiguous matches. No Agent loop."""
-    import re
+    Returns (all_results, unmatched_inputs) where unmatched_inputs are the
+    original product dicts that need LLM semantic matching.
+    """
     from core.models import ProductReadOnly
     from sqlalchemy import or_
-    from services.documents.pdf_analyzer import _get_model
 
-    # Pre-fetch candidate products from DB
+    # Build DB pool filtered by port / country / date
     query = db.query(ProductReadOnly).filter(ProductReadOnly.status == True)
     if country_id:
         query = query.filter(ProductReadOnly.country_id == country_id)
@@ -677,78 +674,212 @@ def _refine_with_llm(order_id: int, ambiguous: list[dict], db, country_id, port_
                 ProductReadOnly.effective_to >= delivery_date)
         )
     db_products = query.all()
+    db_by_code = {p.code.upper(): p for p in db_products if p.code}
 
-    # Build candidate list for the prompt (compact format)
-    candidates = []
-    for p in db_products:
-        candidates.append({
-            "id": p.id,
-            "code": p.code or "",
-            "en": p.product_name_en or "",
-            "jp": p.product_name_jp or "",
-            "price": float(p.price) if p.price else None,
-            "currency": p.currency,
-            "supplier_id": p.supplier_id,
-            "category_id": p.category_id,
-            "pack_size": p.pack_size,
-            "unit": p.unit,
-        })
+    all_results: list[dict] = []
+    unmatched_inputs: list[dict] = []   # original product dicts for LLM
 
-    # Build compact ambiguous items
-    items = []
-    for r in ambiguous:
-        item = {"code": r.get("product_code", ""), "name": r.get("product_name", "")}
-        if r.get("matched_product"):
-            item["best_id"] = r["matched_product"].get("id")
-        items.append(item)
+    for prod in products:
+        item_code = (prod.get("product_code") or "").strip()
+        product_name = (prod.get("product_name") or "").strip()
 
-    prompt = f"""你是产品匹配专家。以下 {len(items)} 个订单产品未能自动匹配，请判断每个是否对应数据库中的某个产品。
+        if item_code and item_code.upper() in db_by_code:
+            dbp = db_by_code[item_code.upper()]
+            from services.tools.product_matching import normalize_matched_product
+            mp = normalize_matched_product({
+                "id": dbp.id,
+                "code": dbp.code,
+                "product_name_en": dbp.product_name_en,
+                "product_name_jp": dbp.product_name_jp,
+                "price": float(dbp.price) if dbp.price is not None else None,
+                "currency": dbp.currency,
+                "supplier_id": dbp.supplier_id,
+                "category_id": dbp.category_id,
+                "pack_size": dbp.pack_size,
+                "unit": dbp.unit,
+            })
+            all_results.append({
+                "product_code": item_code,
+                "product_name": product_name,
+                "quantity": prod.get("quantity"),
+                "unit": mp.get("unit") or prod.get("unit"),
+                "unit_price": prod.get("unit_price"),
+                "match_status": "matched",
+                "match_score": 1.0,
+                "match_reason": "产品代码完全匹配",
+                "matched_product": mp,
+            })
+        else:
+            all_results.append({
+                "product_code": item_code,
+                "product_name": product_name,
+                "quantity": prod.get("quantity"),
+                "unit": prod.get("unit"),
+                "unit_price": prod.get("unit_price"),
+                "match_status": "not_matched",
+                "match_score": 0.0,
+                "match_reason": "",   # filled in by LLM step
+                "matched_product": None,
+                "_db_pool": db_products,  # pass pool reference to avoid re-query
+            })
+            unmatched_inputs.append(prod)
 
-## 订单中的待匹配产品
-{json.dumps(items, ensure_ascii=False)}
+    return all_results, unmatched_inputs
 
-## 数据库候选产品（共 {len(candidates)} 个，同一 country/port）
-{json.dumps(candidates, ensure_ascii=False)}
 
-## 规则
-- 产品名称语义相似（考虑缩写、多语言、同义词）且确信 = matched
-- 有一定相似但不确定 = possible_match
-- 完全不同 = not_matched
+def _refine_with_llm(order_id: int, all_results: list[dict], unmatched_inputs: list[dict]) -> None:
+    """Step 3: Structured Gemini call to semantically match remaining items.
 
-返回纯 JSON 数组（不要 markdown 代码块），每个元素：
-{{"product_code":"订单代码","product_name":"订单名","match_status":"matched|possible_match|not_matched","match_reason":"原因","matched_product":{{"id":N,"code":"...","product_name_en":"...","product_name_jp":"...","price":N,"currency":"...","supplier_id":N,"category_id":N,"pack_size":"...","unit":"..."}}}}
-未匹配到的 matched_product 设为 null。"""
+    Modifies all_results in-place for every not_matched entry:
+      - If LLM finds a match → status becomes "matched", matched_product filled
+      - If no match → status stays "not_matched", match_reason set to a human-readable
+        explanation (e.g. "Supplier catalog has no turnip product")
 
-    start = time.time()
-    try:
-        model = _get_model()
-        response = model.generate_content([prompt])
-        elapsed = time.time() - start
-        logger.info("Order %d: Step 3 — single LLM call done in %.1fs", order_id, elapsed)
+    No item cap — processes in chunks of 50. Uses Pydantic structured output so
+    there is no JSON parsing and no possible_match ambiguity.
+    """
+    from typing import Optional
+    from pydantic import BaseModel
+    from google import genai
+    from google.genai import types
+    from core.config import settings
+    from services.tools.product_matching import normalize_matched_product
 
-        # Parse response — handle both raw JSON and markdown-wrapped
-        text = response.text.strip()
-        m = re.search(r"```(?:json)?\s*([\[\{].*?[\]\}])\s*```", text, re.DOTALL)
-        if m:
-            text = m.group(1)
-        result = json.loads(text)
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict) and "match_results" in result:
-            return result["match_results"]
-        return [result] if isinstance(result, dict) else []
-    except Exception as e:
-        elapsed = time.time() - start
-        logger.warning("Order %d: Step 3 — LLM refine failed in %.1fs: %s", order_id, elapsed, e)
-        return []
+    class MatchDecision(BaseModel):
+        product_name: str
+        db_product_id: Optional[int]
+        match_reason: str
+
+    class BatchMatchResult(BaseModel):
+        matches: list[MatchDecision]
+
+    if not unmatched_inputs:
+        return
+
+    # Extract the shared DB pool from the first not_matched result
+    db_pool = None
+    for r in all_results:
+        if r.get("_db_pool") is not None:
+            db_pool = r.pop("_db_pool")
+            break
+    # Clean up _db_pool refs from all results
+    for r in all_results:
+        r.pop("_db_pool", None)
+
+    if not db_pool:
+        for r in all_results:
+            if r["match_status"] == "not_matched" and not r["match_reason"]:
+                r["match_reason"] = "无可用候选产品库"
+        return
+
+    db_by_id = {p.id: p for p in db_pool}
+    candidates = [
+        {"id": p.id, "code": p.code or "", "name": p.product_name_en or ""}
+        for p in db_pool
+    ]
+
+    # Build lookup: product_name → result index
+    name_to_idx: dict[str, int] = {}
+    for i, r in enumerate(all_results):
+        if r["match_status"] == "not_matched":
+            name_to_idx[r["product_name"]] = i
+
+    candidates_text = "\n".join(
+        f"  id={c['id']} [{c['code'] or 'N/A'}] {c['name']}"
+        for c in candidates
+    )
+
+    CHUNK = 50
+    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+
+    for chunk_start in range(0, len(unmatched_inputs), CHUNK):
+        chunk = unmatched_inputs[chunk_start:chunk_start + CHUNK]
+
+        po_list = "\n".join(
+            f"  - {p['product_name']}" + (f" (code: {p['product_code']})" if p.get("product_code") else "")
+            for p in chunk
+        )
+
+        prompt = f"""Match each purchase order product to a supplier database product, or return null if no match.
+
+PURCHASE ORDER PRODUCTS:
+{po_list}
+
+SUPPLIER DATABASE (candidates):
+{candidates_text}
+
+Rules:
+- Match on the core product identity (e.g. "LIMES" → "LIME FRESH")
+- Do NOT match across product types (LIMES ≠ LEMON, BASIL ≠ BAY LEAVES)
+- If a product exists in the DB under a slightly different name/size → match it
+- If the product genuinely does not exist in this supplier's catalog → db_product_id = null
+- match_reason must be in English, concise, human-readable:
+  - Matched: "Exact code match" or "LIME FRESH matches LIMES"
+  - Not matched: "No turnip in supplier catalog" or "Red Bull energy drink not carried"
+
+Return one decision per PO product in the same order."""
+
+        t0 = time.time()
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[prompt],
+                config={"response_mime_type": "application/json", "response_schema": BatchMatchResult},
+            )
+            elapsed = time.time() - t0
+            logger.info(
+                "Order %d: LLM chunk %d-%d done in %.1fs",
+                order_id, chunk_start, chunk_start + len(chunk), elapsed,
+            )
+            decisions: BatchMatchResult = response.parsed
+            for prod, dec in zip(chunk, decisions.matches):
+                idx = name_to_idx.get(prod["product_name"])
+                if idx is None:
+                    continue
+                r = all_results[idx]
+                if dec.db_product_id and dec.db_product_id in db_by_id:
+                    dbp = db_by_id[dec.db_product_id]
+                    mp = normalize_matched_product({
+                        "id": dbp.id,
+                        "code": dbp.code,
+                        "product_name_en": dbp.product_name_en,
+                        "product_name_jp": dbp.product_name_jp,
+                        "price": float(dbp.price) if dbp.price is not None else None,
+                        "currency": dbp.currency,
+                        "supplier_id": dbp.supplier_id,
+                        "category_id": dbp.category_id,
+                        "pack_size": dbp.pack_size,
+                        "unit": dbp.unit,
+                    })
+                    r["match_status"] = "matched"
+                    r["match_score"] = 0.9
+                    r["match_reason"] = dec.match_reason
+                    r["matched_product"] = mp
+                    if mp.get("unit"):
+                        r["unit"] = mp["unit"]
+                else:
+                    r["match_status"] = "not_matched"
+                    r["match_score"] = 0.0
+                    r["match_reason"] = dec.match_reason or "No match in supplier catalog"
+        except Exception as e:
+            elapsed = time.time() - t0
+            logger.warning(
+                "Order %d: LLM chunk %d-%d failed in %.1fs: %s",
+                order_id, chunk_start, chunk_start + len(chunk), elapsed, e,
+            )
+            # Leave match_reason blank for failed chunk — already "not_matched"
+            for prod in chunk:
+                idx = name_to_idx.get(prod["product_name"])
+                if idx is not None and not all_results[idx]["match_reason"]:
+                    all_results[idx]["match_reason"] = "LLM matching unavailable"
 
 
 def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
-    """3-step matching: deterministic geo → batch code match → single LLM refine."""
+    """3-step matching: deterministic geo → exact code → LLM semantic."""
     metadata = extracted_data.get("order_metadata", {})
     products = extracted_data.get("products", [])
 
-    logger.info("Order %d: starting optimized matching (%d products)", order_id, len(products))
+    logger.info("Order %d: starting matching (%d products)", order_id, len(products))
     total_start = time.time()
 
     # Step 1: Deterministic geo matching + LLM fallback
@@ -756,7 +887,7 @@ def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
     country_id = geo.get("country_id")
     port_id = geo.get("port_id")
     delivery_date = geo.get("delivery_date")
-    logger.info("Order %d: geo result — country_id=%s, port_id=%s, delivery_date=%s",
+    logger.info("Order %d: geo — country_id=%s, port_id=%s, delivery_date=%s",
                 order_id, country_id, port_id, delivery_date)
 
     # Parse delivery_date for effective_date filtering
@@ -764,7 +895,7 @@ def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
 
     # No delivery_date → skip matching
     if not delivery_date_dt:
-        logger.warning("Order %d: no delivery_date found, skipping matching", order_id)
+        logger.warning("Order %d: no delivery_date, skipping matching", order_id)
         return {
             "country_id": country_id,
             "port_id": port_id,
@@ -774,51 +905,25 @@ def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
             "skipped_reason": "missing_delivery_date",
         }
 
-    # Step 2: Code-based batch matching (~0.4s, 0 LLM calls)
+    # Step 2: Exact code matching only — zero false positives
     step2_start = time.time()
-    all_results, ambiguous = _batch_match(products, db, country_id, port_id, delivery_date_dt)
+    all_results, unmatched_inputs = _batch_match(products, db, country_id, port_id, delivery_date_dt)
     step2_elapsed = time.time() - step2_start
-    logger.info("Order %d: batch match done in %.1fs — %d matched, %d ambiguous",
-                order_id, step2_elapsed,
-                len(all_results) - len(ambiguous), len(ambiguous))
+    code_matched = len(all_results) - len(unmatched_inputs)
+    logger.info("Order %d: exact code done in %.1fs — %d matched, %d to LLM",
+                order_id, step2_elapsed, code_matched, len(unmatched_inputs))
 
-    # Step 3: Single LLM call for ambiguous items (optional)
-    if 0 < len(ambiguous) <= 20:
-        refined = _refine_with_llm(order_id, ambiguous, db, country_id, port_id, delivery_date_dt)
-        if refined:
-            from services.tools.product_matching import normalize_matched_product
+    # Step 3: LLM semantic matching for everything without a code hit
+    if unmatched_inputs:
+        _refine_with_llm(order_id, all_results, unmatched_inputs)
 
-            refined_lookup = {}
-            for r in refined:
-                key = (r.get("product_code", ""), r.get("product_name", ""))
-                refined_lookup[key] = r
-
-            for i, result in enumerate(all_results):
-                key = (result.get("product_code", ""), result.get("product_name", ""))
-                if key in refined_lookup:
-                    ref = refined_lookup[key]
-                    # Only upgrade match status
-                    if ref.get("match_status") == "matched" and result["match_status"] != "matched":
-                        all_results[i]["match_status"] = ref["match_status"]
-                        all_results[i]["match_reason"] = ref.get("match_reason", "")
-                        if ref.get("matched_product"):
-                            all_results[i]["matched_product"] = normalize_matched_product(ref["matched_product"])
-                    elif ref.get("match_status") == "possible_match" and result["match_status"] == "not_matched":
-                        all_results[i]["match_status"] = ref["match_status"]
-                        all_results[i]["match_reason"] = ref.get("match_reason", "")
-                        if ref.get("matched_product"):
-                            all_results[i]["matched_product"] = normalize_matched_product(ref["matched_product"])
-    elif len(ambiguous) > 20:
-        logger.info("Order %d: skipping LLM refine — %d ambiguous items (too many)", order_id, len(ambiguous))
-
-    # Compute statistics
+    # Compute statistics — binary: matched / not_matched only
     matched = sum(1 for r in all_results if r.get("match_status") == "matched")
-    possible = sum(1 for r in all_results if r.get("match_status") == "possible_match")
     not_matched = sum(1 for r in all_results if r.get("match_status") == "not_matched")
     total = len(all_results)
 
     total_elapsed = time.time() - total_start
-    logger.info("Order %d: matching complete in %.1fs — %d/%d matched (%.1f%%)",
+    logger.info("Order %d: matching done in %.1fs — %d/%d matched (%.1f%%)",
                 order_id, total_elapsed, matched, total,
                 round(matched / total * 100, 1) if total else 0)
 
@@ -830,7 +935,6 @@ def run_agent_matching(order_id: int, extracted_data: dict, db) -> dict:
         "statistics": {
             "total": total,
             "matched": matched,
-            "possible_match": possible,
             "not_matched": not_matched,
             "match_rate": round(matched / total * 100, 1) if total else 0,
         },
@@ -1216,18 +1320,26 @@ def run_anomaly_check(order: Order) -> dict:
     }
 
 
-def run_financial_analysis(order: Order, base_currency: str | None = None) -> dict:
+def run_financial_analysis(
+    order: Order,
+    base_currency: str | None = None,
+    order_currency_override: str | None = None,
+) -> dict:
     """Run financial analysis on an order's matched products. Returns financial_data dict.
 
     Calculates per-product revenue/cost/profit/margin, aggregated by supplier and category.
     Only processes products with match_status == "matched" and valid prices.
     Supports exchange rate conversion when currencies differ.
+
+    order_currency_override: explicit order price currency, overrides order_metadata.currency.
     """
     from datetime import date as date_type, timedelta
 
     match_results = order.match_results or []
     order_meta = order.order_metadata or {}
-    order_currency = (order_meta.get("currency") or "").strip().upper()
+
+    # Priority: explicit override > order metadata > ""
+    order_currency = (order_currency_override or order_meta.get("currency") or "").strip().upper()
 
     # Determine analysis base currency
     analysis_currency = (base_currency or order_currency or "").strip().upper()
@@ -1514,6 +1626,8 @@ def run_financial_analysis(order: Order, base_currency: str | None = None) -> di
             "overall_margin": overall_margin,
             "currency": analysis_currency or order_currency or "",
             "base_currency": analysis_currency or "",
+            "order_currency": order_currency or "",
+            "order_currency_unknown": not bool(order_currency),
             "analyzed_count": len(product_analyses),
             "skipped_unmatched": skipped_unmatched,
             "skipped_currency_mismatch": skipped_currency_mismatch,

@@ -25,6 +25,7 @@ import {
   updateOrder,
   rematchOrder,
   downloadOrderFile,
+  getOrderFilePreview,
   getPortsList,
   getCountriesList,
   type Order,
@@ -76,6 +77,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "sonner";
+import { MarkdownContent } from "@/components/markdown-content";
 import {
   ArrowLeft,
   MoreHorizontal,
@@ -95,14 +97,35 @@ import {
   Waves,
   CloudSun,
   Clock,
+  FileText,
+  Maximize2,
+  MessageSquare,
+  ChevronDown,
+  Send,
+  StopCircle,
+  Wrench,
+  CheckCheck,
+  AlertCircle,
+  Sparkles,
+  SquarePen,
+  Eye,
+  RotateCw,
+  Pencil,
+  XCircle,
 } from "lucide-react";
+import {
+  createChatSession,
+  sendChatMessage,
+  streamChatMessages,
+  cancelChatAgent,
+  type ChatMessage,
+} from "@/lib/chat-api";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import OrderDataPreview from "@/app/dashboard/workspace/artifacts/OrderDataPreview";
 import MatchResultsPreview from "@/app/dashboard/workspace/artifacts/MatchResultsPreview";
 import AnomalyPreview from "@/app/dashboard/workspace/artifacts/AnomalyPreview";
 import FinancialPreview from "@/app/dashboard/workspace/artifacts/FinancialPreview";
 import { listSupplierTemplates, type SupplierTemplate } from "@/lib/settings-api";
-import SupplierInquiryCard from "@/components/inquiry/SupplierInquiryCard";
 
 const PROCESSING_STATUSES: OrderStatus[] = ["uploading", "extracting", "matching"];
 
@@ -146,12 +169,28 @@ export default function OrderDetailPage() {
 
   // Confirm dialogs
   const [showRematchDialog, setShowRematchDialog] = useState(false);
-  const [showInquiryOverwriteDialog, setShowInquiryOverwriteDialog] = useState(false);
 
   // Financial analysis currency change
   const [changingCurrency, setChangingCurrency] = useState(false);
   const [showCurrencyDialog, setShowCurrencyDialog] = useState(false);
-  const [selectedCurrency, setSelectedCurrency] = useState("USD");
+  const [selectedCurrency, setSelectedCurrency] = useState("JPY");
+  const [orderCurrency, setOrderCurrency] = useState("AUD");
+
+  // PDF preview
+  const [pdfPreviewOpen, setPdfPreviewOpen] = useState(false);
+  const [pdfPreviewFullscreen, setPdfPreviewFullscreen] = useState(false);
+  const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null);
+  const [pdfPreviewLoading, setPdfPreviewLoading] = useState(false);
+
+  // AI assistant drawer
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [agentStatus, setAgentStatus] = useState<"idle" | "running" | "stopping" | "done" | "error">("idle");
+  const [agentMessages, setAgentMessages] = useState<ChatMessage[]>([]);
+  const [agentSessionId, setAgentSessionId] = useState<string | null>(null);
+  const [agentInput, setAgentInput] = useState("");
+  const [agentBusy, setAgentBusy] = useState(false);
+  const agentAbortRef = useRef<(() => void) | null>(null);
+  const assistantScrollRef = useRef<HTMLDivElement>(null);
 
   // Inquiry streaming
   const [inquiryGenerating, setInquiryGenerating] = useState(false);
@@ -220,7 +259,8 @@ export default function OrderDetailPage() {
   const handleChangeCurrency = async (currency: string) => {
     setChangingCurrency(true);
     try {
-      const result = await runFinancialAnalysis(orderId, currency);
+      const knownOrderCurrency = order?.financial_data?.summary?.order_currency || orderCurrency || undefined;
+      const result = await runFinancialAnalysis(orderId, currency, knownOrderCurrency);
       setOrder(result);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "切换币种失败");
@@ -228,6 +268,165 @@ export default function OrderDetailPage() {
       setChangingCurrency(false);
     }
   };
+
+  async function openPdfPreview() {
+    if (pdfPreviewUrl) {
+      setPdfPreviewOpen(true);
+      return;
+    }
+    setPdfPreviewLoading(true);
+    setPdfPreviewOpen(true);
+    try {
+      const { url } = await getOrderFilePreview(orderId);
+      setPdfPreviewUrl(url);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "无法加载预览");
+      setPdfPreviewOpen(false);
+    } finally {
+      setPdfPreviewLoading(false);
+    }
+  }
+
+  // Auto-scroll assistant on new messages
+  useEffect(() => {
+    if (assistantScrollRef.current) {
+      assistantScrollRef.current.scrollTop = assistantScrollRef.current.scrollHeight;
+    }
+  }, [agentMessages]);
+
+  async function sendOrderAgentMessage() {
+    const text = agentInput.trim();
+    if (!text || agentBusy) return;
+    setAgentInput("");
+    setAgentBusy(true);
+    setAgentStatus("running");
+
+    try {
+      // Lazy-create session
+      let sid = agentSessionId;
+      if (!sid) {
+        const session = await createChatSession("订单助手");
+        sid = session.id;
+        setAgentSessionId(sid);
+      }
+
+      // Build context prefix on first message
+      const unmatchedItems = order?.match_results?.filter(
+        (r) => r.match_status === "not_matched"
+      ) ?? [];
+      const unmatchedNames = unmatchedItems
+        .slice(0, 10)
+        .map((r) => r.product_name)
+        .filter(Boolean)
+        .join(", ");
+
+      const isFirstMessage = agentMessages.length === 0;
+      const contextPrefix = isFirstMessage
+        ? `[订单上下文] 订单ID=${orderId}, 文件=${order?.filename || ""}, 未匹配产品数=${unmatchedItems.length}${unmatchedNames ? `, 未匹配产品: ${unmatchedNames}` : ""}.\n\n`
+        : "";
+
+      const fullContent = contextPrefix + text;
+
+      // Optimistically append user message
+      const userMsg: ChatMessage = {
+        id: Date.now(),
+        role: "user",
+        content: text,
+        msg_type: "user_input",
+        created_at: new Date().toISOString(),
+      };
+      setAgentMessages((prev) => [...prev, userMsg]);
+
+      const { last_msg_id } = await sendChatMessage(sid, fullContent, null, "order_processing");
+
+      const abort = streamChatMessages(
+        sid,
+        last_msg_id,
+        (msg) => {
+          setAgentMessages((prev) => {
+            const existing = prev.find((m) => m.id === msg.id);
+            if (existing) return prev.map((m) => (m.id === msg.id ? msg : m));
+            return [...prev, msg];
+          });
+        },
+        () => {
+          setAgentStatus("done");
+          setAgentBusy(false);
+          agentAbortRef.current = null;
+        },
+        (err) => {
+          setAgentStatus("error");
+          setAgentBusy(false);
+          agentAbortRef.current = null;
+          toast.error(err.message || "助手出错");
+        },
+        (token) => {
+          setAgentMessages((prev) => {
+            const existing = prev.find((m) => m.id === token.msg_id);
+            if (existing) {
+              return prev.map((m) =>
+                m.id === token.msg_id
+                  ? { ...m, content: m.content + token.content, streaming: true }
+                  : m
+              );
+            }
+            return [
+              ...prev,
+              {
+                id: token.msg_id,
+                role: "assistant" as const,
+                content: token.content,
+                msg_type: "text" as const,
+                created_at: new Date().toISOString(),
+                streaming: true,
+              },
+            ];
+          });
+        },
+        (done) => {
+          setAgentMessages((prev) =>
+            prev.map((m) =>
+              m.id === done.msg_id
+                ? { ...m, content: done.full_content, streaming: false }
+                : m
+            )
+          );
+        }
+      );
+      agentAbortRef.current = abort;
+    } catch (err) {
+      setAgentStatus("error");
+      setAgentBusy(false);
+      toast.error(err instanceof Error ? err.message : "发送失败");
+    }
+  }
+
+  async function stopOrderAgent() {
+    if (!agentSessionId || agentStatus !== "running") return;
+    setAgentStatus("stopping");
+    try {
+      await cancelChatAgent(agentSessionId);
+    } catch {
+      // ignore
+    } finally {
+      setAgentBusy(false);
+      agentAbortRef.current?.();
+      agentAbortRef.current = null;
+    }
+  }
+
+  async function newOrderAgentSession() {
+    // Stop any running agent first
+    if (agentStatus === "running") {
+      agentAbortRef.current?.();
+      agentAbortRef.current = null;
+    }
+    setAgentMessages([]);
+    setAgentInput("");
+    setAgentSessionId(null);
+    setAgentStatus("idle");
+    setAgentBusy(false);
+  }
 
   function resetInquiryRun() {
     setInquiryGenerating(false);
@@ -564,6 +763,29 @@ export default function OrderDetailPage() {
 
           {/* Actions */}
           {!isEditing && (
+            <div className="flex items-center gap-2">
+            {order.file_url && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 text-xs"
+                onClick={openPdfPreview}
+              >
+                <FileText className="h-3.5 w-3.5" />
+                原始文档
+              </Button>
+            )}
+            {canEdit && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 text-xs"
+                onClick={enterEditMode}
+              >
+                <Edit3 className="h-3.5 w-3.5" />
+                编辑
+              </Button>
+            )}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" size="sm" disabled={!!actionLoading}>
@@ -575,11 +797,6 @@ export default function OrderDetailPage() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                {canEdit && (
-                  <DropdownMenuItem onClick={enterEditMode}>
-                    <Edit3 className="mr-2 h-3.5 w-3.5" /> 编辑数据
-                  </DropdownMenuItem>
-                )}
                 {(isReady || isError) && (
                   <DropdownMenuItem onClick={() => handleAction("rematch", () => rematchOrder(orderId))}>
                     <RefreshCw className="mr-2 h-3.5 w-3.5" /> 重新匹配
@@ -592,24 +809,14 @@ export default function OrderDetailPage() {
                 )}
                 {isReady && order.match_results && (
                   <DropdownMenuItem onClick={() => {
-                    const currency = order.order_metadata?.currency || order.financial_data?.summary?.base_currency || "USD";
-                    setSelectedCurrency(currency);
+                    const knownOrderCurrency = order.order_metadata?.currency || order.financial_data?.summary?.order_currency || "";
+                    if (knownOrderCurrency) setOrderCurrency(knownOrderCurrency);
+                    const analysisCurrency = order.financial_data?.summary?.base_currency || "JPY";
+                    setSelectedCurrency(analysisCurrency);
                     setShowCurrencyDialog(true);
                   }}>
                     <DollarSign className="mr-2 h-3.5 w-3.5" />
                     {order.financial_data ? "重新计算财务分析" : "运行财务分析"}
-                  </DropdownMenuItem>
-                )}
-                {isReady && order.match_statistics && !inquiryGenerating && (
-                  <DropdownMenuItem onClick={() => {
-                    if (order.inquiry_data) {
-                      setShowInquiryOverwriteDialog(true);
-                    } else {
-                      handleGenerateInquiry();
-                    }
-                  }}>
-                    <FileSpreadsheet className="mr-2 h-3.5 w-3.5" />
-                    {order.inquiry_data ? "重新生成询价单" : "生成询价单"}
                   </DropdownMenuItem>
                 )}
                 {isReady && order.port_id && order.delivery_date && (
@@ -632,6 +839,7 @@ export default function OrderDetailPage() {
                 )}
               </DropdownMenuContent>
             </DropdownMenu>
+            </div>
           )}
         </div>
       </div>
@@ -672,16 +880,6 @@ export default function OrderDetailPage() {
       {/* Fulfillment progress bar */}
       {!isProcessing && (
         <FulfillmentProgressBar status={(order.fulfillment_status || "pending") as FulfillmentStatus} />
-      )}
-
-      {/* Inquiry generation progress */}
-      {inquiryGenerating && (
-        <InquiryProgress
-          steps={inquirySteps}
-          order={order}
-          onCancel={cancelInquiryRun}
-          stopping={inquiryStopping}
-        />
       )}
 
       {/* Tabs */}
@@ -779,6 +977,8 @@ export default function OrderDetailPage() {
                   onGenerateAll={handleGenerateInquiry}
                   inquiryGenerating={inquiryGenerating}
                   inquiryStopping={inquiryStopping}
+                  inquirySteps={inquirySteps}
+                  onCancelInquiry={cancelInquiryRun}
                 />
               )}
             </TabsContent>
@@ -851,26 +1051,43 @@ export default function OrderDetailPage() {
       <Dialog open={showCurrencyDialog} onOpenChange={setShowCurrencyDialog}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
-            <DialogTitle>选择基准币种</DialogTitle>
+            <DialogTitle>财务分析设置</DialogTitle>
           </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            订单价格将按此币种计算，供应商价格会自动转换。
-          </p>
-          <Select value={selectedCurrency} onValueChange={setSelectedCurrency}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {["USD", "JPY", "AUD", "EUR", "GBP", "KRW", "THB", "SGD", "CNY", "NZD"].map((c) => (
-                <SelectItem key={c} value={c}>{c}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="space-y-4 py-1">
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">订单价格币种</label>
+              <p className="text-xs text-muted-foreground">邮轮公司 PO 中的价格单位（即你的收入币种）</p>
+              <Select value={orderCurrency} onValueChange={setOrderCurrency}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {["USD", "JPY", "AUD", "EUR", "GBP", "KRW", "THB", "SGD", "CNY", "NZD"].map((c) => (
+                    <SelectItem key={c} value={c}>{c}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">分析输出币种</label>
+              <p className="text-xs text-muted-foreground">所有金额统一换算到该币种输出</p>
+              <Select value={selectedCurrency} onValueChange={setSelectedCurrency}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {["USD", "JPY", "AUD", "EUR", "GBP", "KRW", "THB", "SGD", "CNY", "NZD"].map((c) => (
+                    <SelectItem key={c} value={c}>{c}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowCurrencyDialog(false)}>取消</Button>
             <Button onClick={() => {
               setShowCurrencyDialog(false);
-              handleAction("financial", () => runFinancialAnalysis(orderId, selectedCurrency));
+              handleAction("financial", () => runFinancialAnalysis(orderId, selectedCurrency, orderCurrency));
             }}>
               开始分析
             </Button>
@@ -878,22 +1095,95 @@ export default function OrderDetailPage() {
         </DialogContent>
       </Dialog>
 
-      <AlertDialog open={showInquiryOverwriteDialog} onOpenChange={setShowInquiryOverwriteDialog}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>重新生成询价单</AlertDialogTitle>
-            <AlertDialogDescription>
-              将覆盖现有询价单，确认重新生成？
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction onClick={() => { setShowInquiryOverwriteDialog(false); handleGenerateInquiry(); }}>
-              确认生成
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      {/* AI Assistant Drawer */}
+      <AssistantDrawer
+        open={assistantOpen}
+        onToggle={() => setAssistantOpen((v) => !v)}
+        messages={agentMessages}
+        input={agentInput}
+        onInputChange={setAgentInput}
+        onSend={sendOrderAgentMessage}
+        onStop={stopOrderAgent}
+        onNewSession={newOrderAgentSession}
+        busy={agentBusy}
+        agentStatus={agentStatus}
+        scrollRef={assistantScrollRef}
+        unmatchedCount={
+          order?.match_results?.filter(
+            (r) => r.match_status === "not_matched"
+          ).length ?? 0
+        }
+        pdfOpen={pdfPreviewOpen}
+      />
+
+      {/* PDF Preview Side Panel */}
+      {pdfPreviewOpen && (
+        <div className="fixed right-0 top-0 h-full w-[44%] bg-background border-l border-border/60 shadow-2xl z-40 flex flex-col">
+          <div className="shrink-0 px-4 py-3 border-b border-border/50 flex items-center gap-3">
+            <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
+            <span className="text-sm font-medium truncate flex-1">{order.filename}</span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 text-muted-foreground hover:text-foreground shrink-0"
+              title="全屏查看"
+              onClick={() => setPdfPreviewFullscreen(true)}
+            >
+              <Maximize2 className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 text-muted-foreground hover:text-foreground shrink-0"
+              onClick={() => setPdfPreviewOpen(false)}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+          <div className="flex-1 overflow-hidden">
+            {pdfPreviewLoading ? (
+              <div className="flex items-center justify-center h-full">
+                <Loader2 className="animate-spin h-5 w-5 text-muted-foreground" />
+              </div>
+            ) : pdfPreviewUrl && order.file_type === "pdf" ? (
+              <iframe
+                src={pdfPreviewUrl}
+                className="w-full h-full border-none"
+                title="原始文档预览"
+              />
+            ) : pdfPreviewUrl ? (
+              <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-6">
+                <FileText className="h-10 w-10 text-muted-foreground/50" />
+                <p className="text-sm text-muted-foreground">Excel 文件不支持在线预览</p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => downloadOrderFile(orderId, order.filename)}
+                >
+                  <Download className="mr-1.5 h-3.5 w-3.5" />
+                  下载文件
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {/* PDF Preview Full Screen Dialog */}
+      <Dialog open={pdfPreviewFullscreen} onOpenChange={setPdfPreviewFullscreen}>
+        <DialogContent className="max-w-[96vw] w-[96vw] h-[94vh] p-0 flex flex-col gap-0">
+          <DialogHeader className="shrink-0 px-4 py-3 border-b border-border/50">
+            <DialogTitle className="text-sm font-medium truncate">{order.filename}</DialogTitle>
+          </DialogHeader>
+          {pdfPreviewUrl && order.file_type === "pdf" ? (
+            <iframe
+              src={pdfPreviewUrl}
+              className="flex-1 w-full border-none min-h-0"
+              title="原始文档全屏预览"
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -1048,10 +1338,9 @@ function OverviewTab({
             <CardTitle className="text-sm">匹配统计</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-4 gap-3 mb-4">
+            <div className="grid grid-cols-3 gap-3 mb-4">
               <StatBlock value={stats.total} label="总计" />
               <StatBlock value={stats.matched} label="已匹配" className="text-emerald-500" />
-              <StatBlock value={stats.possible_match} label="可能匹配" className="text-amber-500" />
               <StatBlock value={stats.not_matched} label="未匹配" className="text-destructive" />
             </div>
             <div className="space-y-1.5">
@@ -1641,34 +1930,53 @@ function LegacyInquiryProgress({
 
 // ─── Inquiry Tab ────────────────────────────────────────────
 
+const GAP_CATEGORY_LABELS: Record<string, string> = {
+  order: "订单", supplier: "供应商", company: "公司", delivery: "交付",
+};
+
+const INQUIRY_TEMPLATE_METHOD_LABELS: Record<string, string> = {
+  exact: "精确绑定", user_selected: "手动", manual_override: "手动",
+  agent_selected: "Agent", candidate_auto: "自动匹配",
+  supplier: "供应商匹配", country: "国家匹配", single: "唯一模板", none: "未绑定",
+};
+
 function InquiryTab({
   order,
   onRedoSupplier,
   onGenerateAll,
   inquiryGenerating,
   inquiryStopping,
+  inquirySteps,
+  onCancelInquiry,
 }: {
   order: Order;
   onRedoSupplier?: (supplierId: number, templateId?: number) => void;
   onGenerateAll?: (templateOverrides?: Record<number, number | null>, supplierIds?: number[]) => void;
   inquiryGenerating?: boolean;
   inquiryStopping?: boolean;
+  inquirySteps?: InquiryStep[];
+  onCancelInquiry?: () => void;
 }) {
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
   const [previewSupplierId, setPreviewSupplierId] = useState<number | null>(null);
+  const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewHtml, setPreviewHtml] = useState<string>("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [allTemplates, setAllTemplates] = useState<SupplierTemplate[]>([]);
   const [templateOverrides, setTemplateOverrides] = useState<Record<number, number | null>>({});
-  const [expandedSupplierId, setExpandedSupplierId] = useState<number | null>(null);
+  // master-detail: selectedSupplierId replaces expandedSupplierId
+  const [selectedSupplierId, setSelectedSupplierId] = useState<number | null>(null);
+  // field editing state for the detail panel
+  const [detailEdits, setDetailEdits] = useState<Record<string, string>>({});
+  const [detailDirty, setDetailDirty] = useState(false);
+  const [detailSaving, setDetailSaving] = useState(false);
   const [dataPreview, setDataPreview] = useState<InquiryDataPreview | null>(null);
   const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
   const [dataPreviewOpen, setDataPreviewOpen] = useState(false);
-  const [fieldEdits, setFieldEdits] = useState<Record<string, string>>({});
-  const [fieldEditsDirty, setFieldEditsDirty] = useState(false);
-  const [savingOverrides, setSavingOverrides] = useState(false);
   const [confirmGenerateOpen, setConfirmGenerateOpen] = useState(false);
+  const [confirmAutoMatchOpen, setConfirmAutoMatchOpen] = useState(false);
+  const [confirmOverwriteOpen, setConfirmOverwriteOpen] = useState(false);
 
   // ── Readiness data (primary data source) ──
   const [readiness, setReadiness] = useState<InquiryReadiness | null>(null);
@@ -1676,21 +1984,11 @@ function InquiryTab({
   const [readinessError, setReadinessError] = useState<string | null>(null);
   const prevGeneratingRef = useRef(false);
 
-  // ── Inline gap editing: per-supplier override values + debounce timers ──
-  const [inlineOverrides, setInlineOverrides] = useState<Record<number, Record<string, string>>>({});
-  const [inlineSaving, setInlineSaving] = useState<Record<number, boolean>>({});
-  const [inlineSaveError, setInlineSaveError] = useState<Record<number, string | null>>({});
-  const [inlineSavedAt, setInlineSavedAt] = useState<Record<number, string>>({});
-  const saveTimerRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
-  // Ref keeps latest overrides accessible inside stale closures (setTimeout)
-  const inlineOverridesRef = useRef(inlineOverrides);
-  inlineOverridesRef.current = inlineOverrides;
-
-  const loadReadiness = useCallback(async () => {
+  const loadReadiness = useCallback(async (overrides?: Record<number, number | null>) => {
     setReadinessLoading(true);
     setReadinessError(null);
     try {
-      const data = await getInquiryReadiness(order.id);
+      const data = await getInquiryReadiness(order.id, overrides);
       setReadiness(data);
     } catch (err) {
       setReadinessError(err instanceof Error ? err.message : "加载询价工作台失败");
@@ -1705,24 +2003,18 @@ function InquiryTab({
 
   useEffect(() => {
     if (order.match_results && order.match_results.length > 0) {
-      loadReadiness();
+      loadReadiness(templateOverrides);
     }
-  }, [order.id, order.match_results?.length, loadReadiness]);
+  }, [order.id, order.match_results?.length, loadReadiness, templateOverrides]);
 
   // Reload readiness once after generation completes (true → false transition)
   useEffect(() => {
     if (prevGeneratingRef.current && !inquiryGenerating) {
-      loadReadiness();
+      loadReadiness(templateOverrides);
     }
     prevGeneratingRef.current = !!inquiryGenerating;
   }, [inquiryGenerating, loadReadiness]);
 
-  // Cleanup debounce timers on unmount
-  useEffect(() => {
-    return () => {
-      Object.values(saveTimerRef.current).forEach(clearTimeout);
-    };
-  }, []);
 
   // Derive supplier list
   const inquiry = order.inquiry_data;
@@ -1769,59 +2061,49 @@ function InquiryTab({
     return displaySupplierIds.filter((sid) => readinessSuppliers[String(sid)]?.status !== "blocked");
   }, [displaySupplierIds, readinessSuppliers]);
 
-  // ── Inline gap editing: debounced save ──
-  async function flushInlineOverrides(supplierId: number) {
-    const overrides = inlineOverridesRef.current[supplierId];
-    if (!overrides || Object.keys(overrides).length === 0) return;
+  // Suppliers using auto-matched template (no exact binding) — need user confirmation
+  const autoMatchSuppliers = useMemo(() => {
+    return displaySupplierIds
+      .filter((sid) => readinessSuppliers[String(sid)]?.template?.method === "candidate_auto")
+      .map((sid) => {
+        const item = readinessSuppliers[String(sid)];
+        return {
+          supplierId: sid,
+          name: item?.supplier_name || `#${sid}`,
+          templateName: item?.template?.name || "未知模板",
+        };
+      });
+  }, [displaySupplierIds, readinessSuppliers]);
 
-    setInlineSaving((prev) => ({ ...prev, [supplierId]: true }));
-    setInlineSaveError((prev) => ({ ...prev, [supplierId]: null }));
+  // Initialize detail edits when selected supplier changes OR readiness finishes loading
+  useEffect(() => {
+    if (selectedSupplierId == null) return;
+    if (readinessLoading) return; // wait for data before initializing
+    const rd = readinessSuppliers[String(selectedSupplierId)];
+    if (!rd) return;
+    const init: Record<string, string> = {};
+    for (const f of rd.fields || []) {
+      if (f.status === "overridden" && f.value) init[f.cell] = f.value;
+    }
+    setDetailEdits(init);
+    setDetailDirty(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSupplierId, readinessLoading]);
+
+  // Save detail edits (explicit button)
+  async function handleDetailSave() {
+    if (selectedSupplierId == null) return;
+    setDetailSaving(true);
     try {
-      await saveInquiryFieldOverrides(order.id, supplierId, overrides);
-      setInlineSavedAt((prev) => ({
-        ...prev,
-        [supplierId]: new Date().toLocaleTimeString("zh-CN", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }),
-      }));
-      loadReadiness();
+      await saveInquiryFieldOverrides(order.id, selectedSupplierId, detailEdits);
+      setDetailDirty(false);
+      toast.success("已保存");
+      loadReadiness(templateOverrides);
     } catch (err) {
-      setInlineSaveError((prev) => ({
-        ...prev,
-        [supplierId]: err instanceof Error ? err.message : "自动保存失败",
-      }));
-      toast.error("自动保存失败");
+      toast.error(err instanceof Error ? err.message : "保存失败");
     } finally {
-      setInlineSaving((prev) => ({ ...prev, [supplierId]: false }));
+      setDetailSaving(false);
     }
-  }
-
-  function handleInlineOverride(supplierId: number, cell: string, value: string) {
-    setInlineOverrides((prev) => ({
-      ...prev,
-      [supplierId]: { ...(prev[supplierId] || {}), [cell]: value },
-    }));
-    setInlineSaveError((prev) => ({ ...prev, [supplierId]: null }));
-
-    // Debounce: save after 800ms of no typing
-    if (saveTimerRef.current[supplierId]) {
-      clearTimeout(saveTimerRef.current[supplierId]);
-    }
-    saveTimerRef.current[supplierId] = setTimeout(() => {
-      flushInlineOverrides(supplierId);
-    }, 800);
-  }
-
-  // Flush pending overrides when collapsing a card
-  function handleToggleCard(sid: number) {
-    // If collapsing the currently expanded card, flush its pending overrides
-    if (expandedSupplierId === sid && saveTimerRef.current[sid]) {
-      clearTimeout(saveTimerRef.current[sid]);
-      flushInlineOverrides(sid);
-    }
-    setExpandedSupplierId((prev) => (prev === sid ? null : sid));
   }
 
   async function handleDownload(filename: string) {
@@ -1889,54 +2171,32 @@ function InquiryTab({
       toast.error("当前没有可生成询价单的供应商");
       return;
     }
-    if (blockedSuppliers.length > 0) {
+    if (order.inquiry_data) {
+      setConfirmOverwriteOpen(true);
+      return;
+    }
+    if (autoMatchSuppliers.length > 0) {
+      setConfirmAutoMatchOpen(true);
+    } else if (blockedSuppliers.length > 0) {
       setConfirmGenerateOpen(true);
     } else {
       onGenerateAll?.(buildOverridesForGenerate());
     }
   }
 
-  async function handleDataPreview(sid: number) {
+  // Product data dialog (read-only view of product rows)
+  async function handleProductDataPreview(sid: number) {
     setDataPreviewLoading(true);
     setDataPreviewOpen(true);
-    setFieldEditsDirty(false);
     try {
       const tid = getSelectedTemplateId(sid);
       const preview = await getInquiryDataPreview(order.id, sid, tid);
       setDataPreview(preview);
-      const initial: Record<string, string> = {};
-      for (const f of preview.header_fields) {
-        initial[f.cell] = preview.field_overrides[f.cell] ?? f.value ?? "";
-      }
-      setFieldEdits(initial);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "加载失败");
       setDataPreviewOpen(false);
     } finally {
       setDataPreviewLoading(false);
-    }
-  }
-
-  async function handleSaveOverrides() {
-    if (!dataPreview) return;
-    setSavingOverrides(true);
-    try {
-      const overrides: Record<string, string> = {};
-      for (const f of dataPreview.header_fields) {
-        const edited = fieldEdits[f.cell] ?? "";
-        const original = f.value ?? "";
-        if (edited !== original) {
-          overrides[f.cell] = edited;
-        }
-      }
-      await saveInquiryFieldOverrides(order.id, dataPreview.supplier_id, overrides);
-      setFieldEditsDirty(false);
-      toast.success("字段修改已保存");
-      loadReadiness();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存失败");
-    } finally {
-      setSavingOverrides(false);
     }
   }
 
@@ -1960,7 +2220,7 @@ function InquiryTab({
                 </p>
               </div>
               {readinessError && (
-                <Button variant="outline" size="sm" className="text-xs" onClick={loadReadiness}>
+                <Button variant="outline" size="sm" className="text-xs" onClick={() => loadReadiness(templateOverrides)}>
                   重试加载
                 </Button>
               )}
@@ -1975,177 +2235,332 @@ function InquiryTab({
   const blockedCount = (summary?.blocked ?? 0) + (summary?.needs_input ?? 0);
   const totalCount = summary?.total ?? displaySupplierIds.length;
 
+  // selected supplier data
+  const selectedRd = selectedSupplierId != null ? readinessSuppliers[String(selectedSupplierId)] : null;
+  const selectedFields = selectedRd?.fields || [];
+  const selectedBlockingGaps = selectedFields.filter((f) => f.status === "missing" && f.severity === "blocking");
+
   return (
-    <div className="h-full overflow-y-auto px-6 py-5 space-y-4">
-      {/* ── Summary bar ── */}
-      <div className="flex items-center justify-between gap-3">
+    <div className="h-full flex flex-col overflow-hidden">
+      {/* ── Progress bar (when generating) ── */}
+      {inquiryGenerating && inquirySteps && (
+        <InquiryProgress
+          steps={inquirySteps}
+          order={order}
+          onCancel={onCancelInquiry}
+          stopping={inquiryStopping}
+        />
+      )}
+
+      {/* ── Top bar ── */}
+      <div className="flex items-center justify-between gap-3 px-4 py-3 border-b shrink-0">
         <div className="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
-          <FileSpreadsheet className="h-4 w-4 text-emerald-500" />
-          <span className="font-medium text-foreground">询价单</span>
-          <span>{displaySupplierIds.length} 个供应商</span>
-          <span>&middot;</span>
+          <span className="font-medium text-foreground text-sm">询价单</span>
+          <span className="text-muted-foreground/50">&middot;</span>
+          <span>{displaySupplierIds.length} 供应商</span>
+          <span className="text-muted-foreground/50">&middot;</span>
           <span>{totalProducts} 产品</span>
-          {totalElapsed != null && (
-            <>
-              <span>&middot;</span>
-              <span>耗时 {totalElapsed}s</span>
-            </>
-          )}
-          {(inquiry?.unassigned_count ?? 0) > 0 && (
-            <span className="text-amber-500">({inquiry?.unassigned_count} 未分配)</span>
-          )}
-          {summary && (
-            <>
-              <span className="text-muted-foreground/40">|</span>
-              {summary.ready > 0 && (
-                <span className="flex items-center gap-0.5 text-emerald-600">
-                  <CheckCircle2 className="h-3 w-3" />
-                  {summary.ready} 就绪
-                </span>
-              )}
-              {summary.needs_input > 0 && (
-                <span className="flex items-center gap-0.5 text-amber-600">
-                  <AlertTriangle className="h-3 w-3" />
-                  {summary.needs_input} 需补充
-                </span>
-              )}
-              {summary.blocked > 0 && (
-                <span className="flex items-center gap-0.5 text-destructive">
-                  <X className="h-3 w-3" />
-                  {summary.blocked} 阻塞
-                </span>
-              )}
-            </>
-          )}
-          {readinessLoading && (
-            <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-          )}
+          {totalElapsed != null && <><span className="text-muted-foreground/50">&middot;</span><span>{totalElapsed}s</span></>}
+          {summary && <>
+            <span className="text-muted-foreground/50">&middot;</span>
+            {summary.ready > 0 && <span className="text-emerald-600 flex items-center gap-0.5"><CheckCircle2 className="h-3 w-3" />{summary.ready} 就绪</span>}
+            {summary.needs_input > 0 && <span className="text-amber-600 flex items-center gap-0.5"><AlertTriangle className="h-3 w-3" />{summary.needs_input} 需补充</span>}
+            {summary.blocked > 0 && <span className="text-destructive flex items-center gap-0.5"><X className="h-3 w-3" />{summary.blocked} 阻塞</span>}
+          </>}
+          {readinessLoading && <Loader2 className="h-3 w-3 animate-spin" />}
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {/* P1: Download all */}
           {completedFiles.length > 1 && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="text-xs h-7"
-              disabled={downloadingAll}
-              onClick={handleDownloadAll}
-            >
-              {downloadingAll ? (
-                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-              ) : (
-                <Download className="mr-1 h-3 w-3" />
-              )}
+            <Button variant="outline" size="sm" className="text-xs h-7" disabled={downloadingAll} onClick={handleDownloadAll}>
+              {downloadingAll ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <Download className="mr-1 h-3 w-3" />}
               全部下载 ({completedFiles.length})
             </Button>
           )}
-          {/* P1: Generate button with blocked handling */}
           {onGenerateAll && (
-            <Button
-              size="sm"
-              className="text-xs h-7"
-              disabled={inquiryGenerating || inquiryStopping}
-              onClick={handleGenerateClick}
-            >
-              {inquiryGenerating || inquiryStopping ? (
-                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-              ) : (
-                <FileSpreadsheet className="mr-1 h-3 w-3" />
-              )}
-              {inquiryStopping
-                ? "停止中..."
-                : inquiryGenerating
-                ? "生成中..."
-                : blockedCount > 0
-                ? `生成 ${readyCount}/${totalCount} 就绪`
-                : "全部生成"}
+            <Button size="sm" className="text-xs h-7" disabled={inquiryGenerating || inquiryStopping} onClick={handleGenerateClick}>
+              {inquiryGenerating || inquiryStopping ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <FileSpreadsheet className="mr-1 h-3 w-3" />}
+              {inquiryStopping ? "停止中..." : inquiryGenerating ? "生成中..." : blockedCount > 0 ? `生成 ${readyCount}/${totalCount}` : "全部生成"}
             </Button>
           )}
         </div>
       </div>
 
       {readinessError && (
-        <div className="flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/20 dark:bg-amber-950/30 dark:text-amber-300">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span>{readinessError}</span>
-          </div>
-          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={loadReadiness}>
-            重试
-          </Button>
+        <div className="flex items-center justify-between gap-3 mx-4 mt-3 rounded-md border border-amber-500/30 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/20 dark:bg-amber-950/30 dark:text-amber-300 shrink-0">
+          <div className="flex items-center gap-2"><AlertTriangle className="h-3.5 w-3.5 shrink-0" /><span>{readinessError}</span></div>
+          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => loadReadiness(templateOverrides)}>重试</Button>
         </div>
       )}
 
-      {/* ── Supplier cards grid ── */}
-      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-        {displaySupplierIds.map((sid) => {
-          const rd = readinessSuppliers[String(sid)];
-          if (!rd) return null;
-          return (
-            <SupplierInquiryCard
-              key={sid}
-              supplierId={sid}
-              data={rd}
-              allTemplates={allTemplates}
-              selectedTemplateId={getSelectedTemplateId(sid)}
-              onTemplateChange={(tid) =>
-                setTemplateOverrides((prev) => ({ ...prev, [sid]: tid }))
-              }
-              expanded={expandedSupplierId === sid}
-              onToggle={() => handleToggleCard(sid)}
-              onPreview={() => handlePreview(sid)}
-              onDataPreview={() => handleDataPreview(sid)}
-              onDownload={(f) => handleDownload(f)}
-              onRedo={() =>
-                onRedoSupplier?.(
-                  sid,
-                  templateOverrides[sid] !== undefined
-                    ? templateOverrides[sid] ?? undefined
-                    : undefined
-                )
-              }
-              downloadingFile={downloadingFile}
-              onFieldOverride={(cell, value) => handleInlineOverride(sid, cell, value)}
-              fieldOverrideValues={inlineOverrides[sid] || {}}
-              savingOverrides={inlineSaving[sid]}
-              saveFeedback={
-                inlineSaving[sid]
-                  ? "保存中"
-                  : inlineSaveError[sid]
-                  ? inlineSaveError[sid] || "保存失败"
-                  : inlineSavedAt[sid]
-                  ? `已保存 ${inlineSavedAt[sid]}`
-                  : undefined
-              }
-              saveFeedbackTone={
-                inlineSaving[sid]
-                  ? "saving"
-                  : inlineSaveError[sid]
-                  ? "error"
-                  : inlineSavedAt[sid]
-                  ? "saved"
-                  : "idle"
-              }
-            />
-          );
-        })}
+      {/* ── Master-detail layout ── */}
+      <div className="flex flex-1 min-h-0">
+        {/* Left: supplier list */}
+        <div className="w-64 shrink-0 border-r overflow-y-auto">
+          {displaySupplierIds.map((sid) => {
+            const rd = readinessSuppliers[String(sid)];
+            if (!rd) return null;
+            const isSelected = selectedSupplierId === sid;
+            const blocking = (rd.fields || []).filter((f) => f.status === "missing" && f.severity === "blocking").length;
+            const warning = (rd.fields || []).filter((f) => f.status === "missing" && f.severity === "warning").length;
+            const statusColor =
+              rd.gen_status === "completed" ? "text-emerald-600 dark:text-emerald-400" :
+              rd.gen_status === "error" ? "text-destructive" :
+              rd.status === "blocked" ? "text-destructive" :
+              rd.status === "needs_input" ? "text-amber-600" :
+              "text-muted-foreground";
+            const statusLabel =
+              rd.gen_status === "completed" ? "已完成" :
+              rd.gen_status === "generating" ? "生成中" :
+              rd.gen_status === "error" ? "失败" :
+              rd.status === "blocked" ? "无模板" :
+              rd.status === "needs_input" ? `缺 ${blocking} 必填` :
+              "待生成";
+            return (
+              <button
+                key={sid}
+                onClick={() => setSelectedSupplierId(sid)}
+                className={`w-full text-left px-4 py-3 border-b transition-colors ${
+                  isSelected ? "bg-primary/5 border-l-2 border-l-primary" : "hover:bg-muted/50 border-l-2 border-l-transparent"
+                }`}
+              >
+                <div className="text-sm font-medium truncate">{rd.supplier_name || `供应商 #${sid}`}</div>
+                <div className="flex items-center gap-2 mt-0.5">
+                  <span className="text-[11px] text-muted-foreground">{rd.product_count ?? 0} 产品</span>
+                  <span className={`text-[11px] ${statusColor}`}>{statusLabel}</span>
+                  {warning > 0 && rd.gen_status !== "completed" && (
+                    <span className="text-[11px] text-amber-500">{warning} 可选</span>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Right: detail panel */}
+        {selectedRd ? (
+          <div className="flex-1 overflow-y-auto flex flex-col">
+            {/* Detail header */}
+            <div className="px-5 py-4 border-b shrink-0">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 className="text-base font-semibold truncate">{selectedRd.supplier_name || `供应商 #${selectedSupplierId}`}</h2>
+                  <div className="flex items-center gap-2 mt-1 flex-wrap">
+                    <span className="text-xs text-muted-foreground">{selectedRd.product_count ?? 0} 产品</span>
+                    {selectedRd.subtotal != null && selectedRd.subtotal > 0 && (
+                      <span className="text-xs text-muted-foreground">&middot; {selectedRd.currency || "¥"}{selectedRd.subtotal.toLocaleString()}</span>
+                    )}
+                    {selectedRd.gen_status === "completed" && selectedRd.elapsed_seconds != null && (
+                      <span className="text-xs text-muted-foreground">&middot; {selectedRd.elapsed_seconds}s</span>
+                    )}
+                  </div>
+                </div>
+                {/* Action buttons */}
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {selectedRd.file?.filename && (
+                    <>
+                      <Button variant="outline" size="sm" className="text-xs h-7" onClick={() => selectedSupplierId != null && handlePreview(selectedSupplierId)}>
+                        <Eye className="mr-1 h-3 w-3" /> 预览
+                      </Button>
+                      <Button
+                        variant="outline" size="sm" className="text-xs h-7"
+                        disabled={downloadingFile === selectedRd.file.filename}
+                        onClick={() => selectedRd.file?.filename && handleDownload(selectedRd.file.filename)}
+                      >
+                        {downloadingFile === selectedRd.file.filename
+                          ? <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                          : <Download className="mr-1 h-3 w-3" />}
+                        下载
+                      </Button>
+                    </>
+                  )}
+                  <Button
+                    variant="outline" size="sm" className="text-xs h-7"
+                    onClick={() => selectedSupplierId != null && onRedoSupplier?.(selectedSupplierId, templateOverrides[selectedSupplierId] ?? undefined)}
+                  >
+                    <RotateCw className="mr-1 h-3 w-3" /> 重做
+                  </Button>
+                  {selectedRd.gen_status === "completed" && (
+                    <Button variant="outline" size="sm" className="text-xs h-7"
+                      onClick={() => selectedSupplierId != null && handleProductDataPreview(selectedSupplierId)}>
+                      <FileSpreadsheet className="mr-1 h-3 w-3" /> 产品明细
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {/* Template selector */}
+              <div className="flex items-center gap-2 mt-3">
+                <span className="text-xs text-muted-foreground shrink-0">模板:</span>
+                {selectedRd.gen_status !== "generating" ? (
+                  <Select
+                    value={getSelectedTemplateId(selectedSupplierId!) != null ? String(getSelectedTemplateId(selectedSupplierId!)) : "__none__"}
+                    onValueChange={(val) => {
+                      if (val === "__none__") return;
+                      setTemplateOverrides((prev) => ({ ...prev, [selectedSupplierId!]: Number(val) }));
+                    }}
+                  >
+                    <SelectTrigger className="h-7 text-xs max-w-[220px]">
+                      <SelectValue placeholder="未选择" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {getSelectedTemplateId(selectedSupplierId!) == null && (
+                        <SelectItem value="__none__" disabled>未绑定可用模板</SelectItem>
+                      )}
+                      {allTemplates.map((t) => (
+                        <SelectItem key={t.id} value={String(t.id)}>{t.template_name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <span className="text-xs">{selectedRd.template?.name || "—"}</span>
+                )}
+                {selectedRd.template?.method && (
+                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                    {INQUIRY_TEMPLATE_METHOD_LABELS[selectedRd.template.method] || selectedRd.template.method}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Error */}
+            {selectedRd.error && (
+              <div className="mx-5 mt-4 flex items-start gap-1.5 text-xs text-destructive bg-destructive/5 rounded-md px-3 py-2 shrink-0">
+                <XCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                <span className="break-all">{selectedRd.error}</span>
+              </div>
+            )}
+
+            {/* Field list */}
+            {selectedFields.length > 0 && (
+              <div className="px-5 py-4 flex-1">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium">表头字段</span>
+                    {selectedBlockingGaps.length > 0 && (
+                      <span className="text-xs text-destructive">{selectedBlockingGaps.length} 必填缺失</span>
+                    )}
+                  </div>
+                  <Button
+                    size="sm"
+                    className="text-xs h-7"
+                    disabled={!detailDirty || detailSaving}
+                    onClick={handleDetailSave}
+                  >
+                    {detailSaving ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <Save className="mr-1 h-3 w-3" />}
+                    保存字段
+                  </Button>
+                </div>
+                <div className="space-y-1.5">
+                  {selectedFields.map((f) => {
+                    const editVal = detailEdits[f.cell] ?? "";
+                    if (f.status === "resolved") {
+                      return (
+                        <div key={f.cell} className="flex items-center gap-3 px-3 py-2 rounded-md bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 text-xs">
+                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                          <span className="w-28 shrink-0 text-emerald-700/80 dark:text-emerald-400/70">{f.label}</span>
+                          <span className="flex-1 truncate">{f.value ?? "—"}</span>
+                          <span className="text-[10px] text-muted-foreground/40 shrink-0">{GAP_CATEGORY_LABELS[f.category] || f.category}</span>
+                        </div>
+                      );
+                    }
+                    const isBlocking = f.severity === "blocking";
+                    const inputBg = f.status === "overridden"
+                      ? "bg-blue-50 dark:bg-blue-950/30"
+                      : isBlocking ? "bg-red-50 dark:bg-red-950/40" : "bg-amber-50 dark:bg-amber-950/40";
+                    const labelColor = f.status === "overridden"
+                      ? "text-blue-700 dark:text-blue-400"
+                      : isBlocking ? "text-red-700 dark:text-red-400" : "text-amber-700 dark:text-amber-400";
+                    return (
+                      <div key={f.cell} className={`flex items-center gap-3 px-3 py-1.5 rounded-md ${inputBg} text-xs`}>
+                        {f.status === "overridden"
+                          ? <Pencil className={`h-3.5 w-3.5 shrink-0 ${labelColor}`} />
+                          : isBlocking ? <XCircle className={`h-3.5 w-3.5 shrink-0 ${labelColor}`} />
+                          : <AlertTriangle className={`h-3.5 w-3.5 shrink-0 ${labelColor}`} />}
+                        <span className={`w-28 shrink-0 ${labelColor}`}>{f.label}</span>
+                        <input
+                          className="flex-1 min-w-0 bg-white dark:bg-background border border-border rounded px-2 py-1 text-xs text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition-colors"
+                          placeholder={`输入${f.label}...`}
+                          value={editVal || (f.status === "overridden" ? f.value ?? "" : "")}
+                          onChange={(e) => {
+                            setDetailEdits((prev) => ({ ...prev, [f.cell]: e.target.value }));
+                            setDetailDirty(true);
+                          }}
+                        />
+                        <span className="text-[10px] text-muted-foreground/40 shrink-0">{GAP_CATEGORY_LABELS[f.category] || f.category}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Verify results */}
+            {(selectedRd.verify_results || []).filter((r) => r.status === "fail").length > 0 && (
+              <div className="px-5 pb-4 shrink-0">
+                <p className="text-xs font-medium text-muted-foreground mb-2">校验失败</p>
+                <div className="space-y-1">
+                  {(selectedRd.verify_results || []).filter((r) => r.status === "fail").map((r, i) => (
+                    <div key={i} className="text-[11px] text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950 rounded px-2.5 py-1.5 flex items-center gap-1.5">
+                      <XCircle className="h-3 w-3 shrink-0" />
+                      <span>{r.annotation || r.cell}</span>
+                      {r.reason && <span className="text-muted-foreground">— {r.reason}</span>}
+                      {r.suggestion && <span className="ml-auto text-emerald-600 dark:text-emerald-400 shrink-0">→ {r.suggestion}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
+            <div className="text-center space-y-2">
+              <FileSpreadsheet className="h-8 w-8 mx-auto text-muted-foreground/30" />
+              <p>选择左侧供应商查看详情</p>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* P1: Confirm dialog for generating with blocked suppliers */}
+      {/* ── Dialogs ── */}
+
+      {/* Confirm auto-matched templates */}
+      <AlertDialog open={confirmAutoMatchOpen} onOpenChange={setConfirmAutoMatchOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>以下供应商未绑定模板</AlertDialogTitle>
+            <AlertDialogDescription>
+              以下供应商没有精确绑定的模板，系统将自动选择候选模板生成。
+              <span className="block mt-2 space-y-1">
+                {autoMatchSuppliers.map((item) => (
+                  <span key={item.supplierId} className="block text-xs text-foreground">
+                    {item.name}：将使用「{item.templateName}」
+                  </span>
+                ))}
+              </span>
+              <span className="block mt-2">是否继续？</span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={() => {
+              setConfirmAutoMatchOpen(false);
+              if (blockedSuppliers.length > 0) setConfirmGenerateOpen(true);
+              else onGenerateAll?.(buildOverridesForGenerate());
+            }}>继续生成</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Confirm blocked suppliers */}
       <AlertDialog open={confirmGenerateOpen} onOpenChange={setConfirmGenerateOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>部分供应商缺必填字段</AlertDialogTitle>
             <AlertDialogDescription>
               以下供应商当前不参与生成：
-              <span className="block mt-2 font-medium text-foreground">
-                {blockedSuppliers.map((item) => item.name).join("、")}
-              </span>
               <span className="block mt-2 space-y-1">
                 {blockedSuppliers.map((item) => (
-                  <span key={item.supplierId} className="block text-xs text-muted-foreground">
-                    {item.name}: {item.reason}
-                  </span>
+                  <span key={item.supplierId} className="block text-xs text-muted-foreground">{item.name}: {item.reason}</span>
                 ))}
               </span>
               <span className="block mt-2">是否跳过这些供应商，只生成其余可用供应商？</span>
@@ -2153,10 +2568,65 @@ function InquiryTab({
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { setConfirmGenerateOpen(false); onGenerateAll?.(buildOverridesForGenerate(), readySupplierIds); }}>继续生成</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Preview side panel */}
+      {previewSupplierId !== null && (
+        <div className="fixed inset-y-0 right-0 z-40 w-[44%] border-l bg-background shadow-2xl flex flex-col">
+          <div className="flex items-center justify-between gap-3 px-4 py-3 border-b">
+            <div className="min-w-0">
+              <p className="text-sm font-medium truncate">{readinessSuppliers[String(previewSupplierId)]?.supplier_name || `供应商 #${previewSupplierId}`}</p>
+              <p className="text-xs text-muted-foreground">询价单预览</p>
+            </div>
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setPreviewFullscreen(true)}><Maximize2 className="h-4 w-4" /></Button>
+              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => { setPreviewSupplierId(null); setPreviewFullscreen(false); }}><X className="h-4 w-4" /></Button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-auto">
+            {previewLoading ? <div className="flex items-center justify-center py-10"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+              : <div className="excel-preview p-2" dangerouslySetInnerHTML={{ __html: previewHtml }} />}
+          </div>
+        </div>
+      )}
+
+      <Dialog open={previewFullscreen} onOpenChange={setPreviewFullscreen}>
+        <DialogContent className="max-w-[95vw] w-[95vw] max-h-[95vh] overflow-hidden flex flex-col">
+          <DialogHeader>
+            <DialogTitle className="text-sm">
+              {previewSupplierId != null ? readinessSuppliers[String(previewSupplierId)]?.supplier_name || `供应商 #${previewSupplierId}` : "询价单预览"}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex-1 overflow-auto">
+            {previewLoading ? <div className="flex items-center justify-center py-10"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+              : <div className="excel-preview p-2" dangerouslySetInnerHTML={{ __html: previewHtml }} />}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog open={confirmOverwriteOpen} onOpenChange={setConfirmOverwriteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>重新生成询价单</AlertDialogTitle>
+            <AlertDialogDescription>
+              当前订单已生成过询价单，重新生成将覆盖已有结果。是否继续？
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                setConfirmGenerateOpen(false);
-                onGenerateAll?.(buildOverridesForGenerate(), readySupplierIds);
+                setConfirmOverwriteOpen(false);
+                if (autoMatchSuppliers.length > 0) {
+                  setConfirmAutoMatchOpen(true);
+                } else if (blockedSuppliers.length > 0) {
+                  setConfirmGenerateOpen(true);
+                } else {
+                  onGenerateAll?.(buildOverridesForGenerate());
+                }
               }}
             >
               继续生成
@@ -2165,127 +2635,31 @@ function InquiryTab({
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Preview dialog */}
-      <Dialog
-        open={previewSupplierId !== null}
-        onOpenChange={(open) => {
-          if (!open) setPreviewSupplierId(null);
-        }}
-      >
-        <DialogContent className="max-w-4xl max-h-[85vh] overflow-hidden flex flex-col">
-          <DialogHeader>
-            <DialogTitle className="text-sm">
-              询价单预览 — 供应商 #{previewSupplierId}
-            </DialogTitle>
-          </DialogHeader>
-          <div className="flex-1 overflow-auto">
-            {previewLoading ? (
-              <div className="flex items-center justify-center py-10">
-                <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-              </div>
-            ) : (
-              <div
-                className="excel-preview p-2"
-                dangerouslySetInnerHTML={{ __html: previewHtml }}
-              />
-            )}
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* P0: Renamed from "数据预览" to "编辑字段", removed engine/LLM badge */}
+      {/* Product data dialog (read-only) */}
       <Dialog open={dataPreviewOpen} onOpenChange={setDataPreviewOpen}>
-        <DialogContent className="max-w-6xl w-[90vw] max-h-[90vh] overflow-hidden flex flex-col">
+        <DialogContent className="max-w-5xl w-[90vw] max-h-[90vh] overflow-hidden flex flex-col">
           <DialogHeader>
             <DialogTitle className="text-sm flex items-center gap-2">
               <FileSpreadsheet className="h-4 w-4" />
-              编辑字段 — {dataPreview?.supplier_name || "加载中..."}
+              产品明细 — {dataPreview?.supplier_name || "加载中..."}
               {dataPreview?.template.name && (
-                <span className="text-xs font-normal text-muted-foreground ml-1">
-                  模板: {dataPreview.template.name}
-                </span>
+                <span className="text-xs font-normal text-muted-foreground ml-1">模板: {dataPreview.template.name}</span>
               )}
             </DialogTitle>
           </DialogHeader>
-
           {dataPreviewLoading ? (
-            <div className="flex items-center justify-center py-10">
-              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-            </div>
+            <div className="flex items-center justify-center py-10"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
           ) : dataPreview ? (
             <div className="flex-1 overflow-y-auto space-y-4 pr-1">
-              {/* Warnings */}
               {dataPreview.warnings.length > 0 && (
                 <div className="space-y-1">
                   {dataPreview.warnings.map((w, i) => (
-                    <div key={i} className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/50 rounded px-3 py-1.5">
-                      <AlertTriangle className="h-3 w-3 shrink-0" />
-                      <span>{w}</span>
+                    <div key={i} className="flex items-center gap-1.5 text-xs text-amber-600 bg-amber-50 dark:bg-amber-950/50 rounded px-3 py-1.5">
+                      <AlertTriangle className="h-3 w-3 shrink-0" /><span>{w}</span>
                     </div>
                   ))}
                 </div>
               )}
-
-              {/* P1: Header fields — label-first, cell ref as secondary */}
-              {dataPreview.header_fields.length > 0 && (
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <h4 className="text-xs font-medium text-muted-foreground">表头字段</h4>
-                    <Button
-                      size="sm"
-                      className="text-xs h-7"
-                      disabled={!fieldEditsDirty || savingOverrides}
-                      onClick={handleSaveOverrides}
-                    >
-                      {savingOverrides ? (
-                        <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                      ) : (
-                        <Save className="mr-1 h-3 w-3" />
-                      )}
-                      保存修改
-                    </Button>
-                  </div>
-                  <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-                    {dataPreview.header_fields.map((f) => {
-                      const isOverridden = dataPreview.field_overrides[f.cell] != null;
-                      const editedValue = fieldEdits[f.cell] ?? "";
-                      return (
-                        <div key={f.cell} className="flex items-center gap-2 text-xs py-1 border-b border-border/30">
-                          <span className="text-muted-foreground shrink-0 w-24 truncate" title={`${f.label} (${f.cell})`}>
-                            {f.label}
-                          </span>
-                          <input
-                            className={`flex-1 min-w-0 bg-transparent border-b px-1 py-0.5 text-xs outline-none transition-colors ${
-                              editedValue !== (f.value ?? "")
-                                ? "border-primary text-primary"
-                                : isOverridden
-                                ? "border-amber-500/50 text-foreground"
-                                : editedValue
-                                ? "border-transparent text-foreground hover:border-border"
-                                : "border-destructive/30 text-destructive/60 italic hover:border-border"
-                            } focus:border-primary`}
-                            value={editedValue}
-                            placeholder="未填写"
-                            onChange={(e) => {
-                              setFieldEdits((prev) => ({ ...prev, [f.cell]: e.target.value }));
-                              setFieldEditsDirty(true);
-                            }}
-                          />
-                          <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
-                            f.source === "order" ? "bg-blue-500/10 text-blue-500" :
-                            f.source === "supplier" ? "bg-orange-500/10 text-orange-500" :
-                            f.source === "company" ? "bg-purple-500/10 text-purple-500" :
-                            "bg-emerald-500/10 text-emerald-500"
-                          }`}>
-                            {f.source === "order" ? "订单" : f.source === "supplier" ? "供应商" : f.source === "company" ? "公司" : "交付"}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
               {/* Product data */}
               {dataPreview.products.length > 0 && (
                 <div>
@@ -2598,6 +2972,248 @@ function FulfillmentTab({ order }: { order: Order }) {
         <div className="text-center py-10 text-xs text-muted-foreground">
           <p>暂无履约数据。</p>
           <p className="mt-1">可以在 AI 助手中通过对话更新履约状态。</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Assistant Drawer ───────────────────────────────────────
+
+type ActivityItemType =
+  | { type: "user"; content: string; id: number }
+  | { type: "answer"; content: string; id: number; streaming?: boolean }
+  | { type: "thinking"; content: string; id: number }
+  | { type: "tool_running"; label: string; id: number }
+  | { type: "tool_done"; label: string; id: number }
+  | { type: "tool_error"; label: string; id: number }
+  | { type: "error"; content: string; id: number };
+
+function messagesToActivityItems(messages: ChatMessage[]): ActivityItemType[] {
+  const items: ActivityItemType[] = [];
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      items.push({ type: "user", content: msg.content, id: msg.id });
+    } else if (msg.msg_type === "thinking") {
+      items.push({ type: "thinking", content: msg.content, id: msg.id });
+    } else if (msg.msg_type === "action") {
+      let label = msg.content;
+      try {
+        const parsed = JSON.parse(msg.content);
+        label = parsed.tool_name ? `调用工具: ${parsed.tool_name}` : label;
+      } catch { /* ok */ }
+      items.push({ type: "tool_running", label, id: msg.id });
+    } else if (msg.msg_type === "observation") {
+      // Find matching action
+      const actionItem = items.findLast?.((i) => i.type === "tool_running");
+      const label = actionItem?.type === "tool_running" ? actionItem.label : "工具调用完成";
+      items.push({ type: "tool_done", label, id: msg.id });
+    } else if (msg.msg_type === "error_observation") {
+      items.push({ type: "tool_error", label: msg.content.slice(0, 80), id: msg.id });
+    } else if (msg.msg_type === "error" || msg.role === "tool") {
+      items.push({ type: "error", content: msg.content, id: msg.id });
+    } else if (msg.role === "assistant") {
+      items.push({ type: "answer", content: msg.content, id: msg.id, streaming: msg.streaming });
+    }
+  }
+  return items;
+}
+
+function AssistantDrawer({
+  open,
+  onToggle,
+  messages,
+  input,
+  onInputChange,
+  onSend,
+  onStop,
+  onNewSession,
+  busy,
+  agentStatus,
+  scrollRef,
+  unmatchedCount,
+  pdfOpen,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  messages: ChatMessage[];
+  input: string;
+  onInputChange: (v: string) => void;
+  onSend: () => void;
+  onStop: () => void;
+  onNewSession?: () => void;
+  busy: boolean;
+  agentStatus: "idle" | "running" | "stopping" | "done" | "error";
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  unmatchedCount: number;
+  pdfOpen: boolean;
+}) {
+  const items = messagesToActivityItems(messages);
+  const rightOffset = pdfOpen ? "right-[calc(44%+16px)]" : "right-4";
+
+  return (
+    <div
+      className={`fixed bottom-0 ${rightOffset} z-50 w-[360px] transition-all duration-200`}
+      style={{ maxHeight: open ? "460px" : "44px" }}
+    >
+      {/* Header / toggle bar */}
+      <div className="w-full h-11 px-4 flex items-center gap-2 bg-card border border-border/60 rounded-t-xl shadow-lg">
+        <button
+          type="button"
+          className="flex items-center gap-2 flex-1 min-w-0 hover:opacity-70 transition-opacity"
+          onClick={onToggle}
+        >
+          <Sparkles className="h-3.5 w-3.5 text-primary shrink-0" />
+          <span className="text-xs font-medium flex-1 text-left">AI 助手</span>
+        </button>
+        {unmatchedCount > 0 && !open && (
+          <span className="text-[10px] bg-destructive/10 text-destructive px-1.5 py-0.5 rounded-full font-medium shrink-0">
+            {unmatchedCount} 未匹配
+          </span>
+        )}
+        {agentStatus === "running" && (
+          <Loader2 className="h-3 w-3 text-primary animate-spin shrink-0" />
+        )}
+        {open && onNewSession && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onNewSession(); }}
+            className="p-1 rounded hover:bg-muted/50 transition-colors shrink-0"
+            title="新建对话"
+          >
+            <SquarePen className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
+          </button>
+        )}
+        <ChevronDown
+          className={`h-3.5 w-3.5 text-muted-foreground shrink-0 transition-transform duration-200 ${open ? "rotate-0" : "rotate-180"}`}
+          onClick={onToggle}
+        />
+      </div>
+
+      {/* Body */}
+      {open && (
+        <div className="flex flex-col bg-card border-x border-b border-border/60 shadow-lg rounded-b-xl overflow-hidden"
+          style={{ height: "416px" }}>
+          {/* Messages */}
+          <div
+            ref={scrollRef}
+            className="flex-1 overflow-y-auto px-3 py-3 space-y-2 text-xs"
+          >
+            {items.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full gap-2 text-center px-4">
+                <MessageSquare className="h-8 w-8 text-muted-foreground/30" />
+                <p className="text-muted-foreground text-[11px]">
+                  和 AI 助手对话，查询产品信息、分析未匹配原因或更新履约状态
+                </p>
+                {unmatchedCount > 0 && (
+                  <p className="text-destructive/70 text-[10px]">
+                    当前有 {unmatchedCount} 个未匹配产品
+                  </p>
+                )}
+              </div>
+            ) : (
+              items.map((item) => {
+                if (item.type === "user") {
+                  return (
+                    <div key={item.id} className="flex justify-end">
+                      <div className="max-w-[85%] bg-primary/10 text-foreground rounded-lg px-3 py-1.5 text-[11px] leading-relaxed">
+                        {item.content}
+                      </div>
+                    </div>
+                  );
+                }
+                if (item.type === "answer") {
+                  return (
+                    <div key={item.id} className="flex gap-2">
+                      <Sparkles className="h-3 w-3 text-primary mt-0.5 shrink-0" />
+                      <div className="flex-1 text-[11px] leading-relaxed text-foreground/90">
+                        {item.streaming ? (
+                          <span className="whitespace-pre-wrap">
+                            {item.content}
+                            <span className="inline-block w-1 h-3 bg-primary/60 animate-pulse ml-0.5 align-middle" />
+                          </span>
+                        ) : (
+                          <MarkdownContent content={item.content} />
+                        )}
+                      </div>
+                    </div>
+                  );
+                }
+                if (item.type === "thinking") {
+                  return (
+                    <div key={item.id} className="flex gap-2 opacity-60">
+                      <Loader2 className="h-3 w-3 text-muted-foreground mt-0.5 shrink-0 animate-spin" />
+                      <span className="text-[10px] text-muted-foreground italic line-clamp-2">{item.content}</span>
+                    </div>
+                  );
+                }
+                if (item.type === "tool_running") {
+                  return (
+                    <div key={item.id} className="flex gap-2 opacity-70">
+                      <Wrench className="h-3 w-3 text-amber-500 mt-0.5 shrink-0" />
+                      <span className="text-[10px] text-muted-foreground line-clamp-1">{item.label}</span>
+                    </div>
+                  );
+                }
+                if (item.type === "tool_done") {
+                  return (
+                    <div key={item.id} className="flex gap-2 opacity-50">
+                      <CheckCheck className="h-3 w-3 text-emerald-500 mt-0.5 shrink-0" />
+                      <span className="text-[10px] text-muted-foreground line-clamp-1">{item.label}</span>
+                    </div>
+                  );
+                }
+                if (item.type === "tool_error" || item.type === "error") {
+                  return (
+                    <div key={item.id} className="flex gap-2">
+                      <AlertCircle className="h-3 w-3 text-destructive mt-0.5 shrink-0" />
+                      <span className="text-[10px] text-destructive line-clamp-2">
+                        {item.type === "tool_error" ? item.label : item.content}
+                      </span>
+                    </div>
+                  );
+                }
+                return null;
+              })
+            )}
+          </div>
+
+          {/* Input */}
+          <div className="shrink-0 px-3 py-2 border-t border-border/40 flex items-center gap-2">
+            <input
+              className="flex-1 bg-muted/40 rounded-lg px-3 py-1.5 text-xs outline-none focus:ring-1 focus:ring-primary/30 placeholder:text-muted-foreground/50"
+              placeholder="输入问题..."
+              value={input}
+              onChange={(e) => onInputChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey && !busy) {
+                  e.preventDefault();
+                  onSend();
+                }
+              }}
+              disabled={busy}
+            />
+            {agentStatus === "running" ? (
+              <button
+                type="button"
+                className="h-7 w-7 flex items-center justify-center rounded-lg text-destructive hover:bg-destructive/10 transition-colors shrink-0"
+                onClick={onStop}
+                title="停止"
+              >
+                <StopCircle className="h-4 w-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="h-7 w-7 flex items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 transition-colors shrink-0"
+                onClick={onSend}
+                disabled={!input.trim() || busy}
+                title="发送"
+              >
+                <Send className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>

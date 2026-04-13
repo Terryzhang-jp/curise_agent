@@ -134,12 +134,7 @@ def run_inquiry_pre_analysis(order, db) -> dict:
         else:
             template_info = {"method": "unavailable"}
 
-        # Supplier data completeness
         info = supplier_rows.get(sid, {})
-        missing_fields = []
-        for field in ["contact", "email", "phone"]:
-            if not info.get(field):
-                missing_fields.append(field)
 
         suppliers[str(sid)] = {
             "status": "pending",
@@ -148,7 +143,6 @@ def run_inquiry_pre_analysis(order, db) -> dict:
             "subtotal": round(subtotal, 2),
             "currency": order_meta.get("currency", ""),
             "template": template_info,
-            "missing_fields": missing_fields if missing_fields else None,
         }
 
     return {
@@ -563,18 +557,54 @@ def _build_order_data_for_engine(
     sid = str(supplier_id)
     currency = order_meta.get("currency") or "JPY"
 
+    # Re-hydrate product fields live from DB using matched_product.id.
+    # match_results are a frozen snapshot from match time; prices / names / pack_sizes
+    # may have changed since then. Fetching live ensures the inquiry always uses
+    # current catalog data. Falls back gracefully to snapshot values if DB lookup fails.
+    live_db: dict[int, object] = {}
+    _data_stale = False
+    if _db:
+        try:
+            from core.models import Product
+            from sqlalchemy import text as sa_text
+            product_ids = [
+                int(p["matched_product"]["id"])
+                for p in products
+                if p.get("matched_product") and p["matched_product"].get("id")
+            ]
+            if product_ids:
+                rows = _db.query(Product).filter(Product.id.in_(product_ids)).all()
+                live_db = {r.id: r for r in rows}
+        except Exception as _e:
+            logger.warning(
+                "_build_order_data_for_engine: DB re-hydration failed for order %s: %s",
+                order_id, _e,
+            )
+            _data_stale = True  # will be surfaced as a warning in inquiry_readiness
+
     # Clean products for engine format
     cleaned = []
     for p in products:
         mp = p.get("matched_product") or {}
+        db_row = live_db.get(int(mp["id"])) if mp.get("id") and live_db else None
+
+        # Prefer live DB value → snapshot mp value → PO-extracted value
+        unit_price = None
+        if db_row is not None and db_row.price is not None:
+            unit_price = float(db_row.price)
+        elif mp.get("price") is not None:
+            unit_price = mp["price"]
+        else:
+            unit_price = p.get("unit_price")
+
         cleaned.append({
-            "product_code": mp.get("code") or p.get("product_code", ""),
+            "product_code": (db_row.code if db_row else None) or mp.get("code") or p.get("product_code", ""),
             "product_name": p.get("product_name", ""),
-            "product_name_jp": mp.get("product_name_jp", ""),
+            "product_name_jp": (db_row.product_name_jp if db_row else None) or mp.get("product_name_jp", ""),
             "quantity": p.get("quantity"),
-            "unit": mp.get("unit") or p.get("unit", ""),
-            "unit_price": mp.get("price") if mp.get("price") is not None else p.get("unit_price"),
-            "pack_size": mp.get("pack_size", ""),
+            "unit": (db_row.unit if db_row else None) or mp.get("unit") or p.get("unit", ""),
+            "unit_price": unit_price,
+            "pack_size": (db_row.pack_size if db_row else None) or mp.get("pack_size", ""),
             "currency": currency,
         })
 
@@ -590,6 +620,7 @@ def _build_order_data_for_engine(
         "voyage": order_meta.get("voyage", ""),
         "company": company_info or {},
         "delivery_location": delivery_info or {},
+        "_data_stale": _data_stale,
         "suppliers": {
             sid: {
                 "supplier_name": supplier_info.get("name", ""),
@@ -770,6 +801,7 @@ def _generate_single_supplier(
                 from services.templates.template_engine import compose_render
                 excel_bytes = compose_render(
                     template_bytes, zone_config, engine_order_data, supplier_id,
+                    field_overrides=_fo_overrides,
                 )
                 generation_path = "template_engine_compose"
 
@@ -1382,7 +1414,7 @@ def _suggest_repair_from_error(annotation: str, reason: str) -> str:
         return "检查模板合并单元格结构是否被破坏"
     if "stale data" in lowered:
         return "检查汇总区是否残留旧产品数据"
-    return "打开 Review/Repair 检查字段和模板结构后重试"
+    return "点击「重做」重新生成，或点击「编辑字段」检查字段映射后重试"
 
 
 # ─── Orchestrator ─────────────────────────────────────────────

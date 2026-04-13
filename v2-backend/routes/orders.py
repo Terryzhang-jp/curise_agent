@@ -32,6 +32,7 @@ from routes.auth import get_current_user
 from core.security import require_role
 from core.schemas import OrderListItem, OrderDetail, OrderReviewRequest, OrderUpdateRequest, OrderRematchRequest
 from services.agent.stream_queue import (
+    get_cancel_event,
     get_or_create_cancel_event,
     get_or_create_queue,
     get_queue,
@@ -238,6 +239,28 @@ def get_order(
     """Get order details."""
     order = _get_order(db, order_id)
     return order
+
+
+@router.get("/{order_id}/file-preview")
+def get_order_file_preview(
+    order_id: int,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    """Return a short-lived signed URL for the order's original file (PDF/Excel).
+
+    The signed URL is valid for 1 hour and can be embedded directly in an
+    <iframe> or <object> tag for in-browser preview.
+    """
+    order = _get_order(db, order_id)
+    if not order.file_url:
+        raise HTTPException(404, "该订单没有关联的原始文件")
+    try:
+        url = storage.get_signed_url(order.file_url, expires_in=3600)
+    except Exception as exc:
+        logger.warning("Failed to sign file URL for order %s: %s", order_id, exc)
+        raise HTTPException(500, "生成预览链接失败，请稍后重试")
+    return {"url": url, "file_type": order.file_type, "filename": order.filename}
 
 
 # ─── Delete ────────────────────────────────────────────────────
@@ -561,7 +584,8 @@ def anomaly_check(
 @router.post("/{order_id}/financial-analysis", response_model=OrderDetail)
 def financial_analysis(
     order_id: int,
-    base_currency: str | None = Query(None, description="基准币种，默认使用订单币种"),
+    base_currency: str | None = Query(None, description="分析输出币种"),
+    order_currency: str | None = Query(None, description="订单价格所用币种（覆盖元数据，用于货币转换）"),
     current_user: User = Depends(require_writer),
     db: DBSession = Depends(get_db),
 ):
@@ -573,7 +597,9 @@ def financial_analysis(
         raise HTTPException(400, "没有匹配结果，无法进行财务分析")
 
     from services.orders.order_processor import run_financial_analysis
-    order.financial_data = run_financial_analysis(order, base_currency=base_currency)
+    order.financial_data = run_financial_analysis(
+        order, base_currency=base_currency, order_currency_override=order_currency
+    )
     db.commit()
     db.refresh(order)
     return order
@@ -647,7 +673,9 @@ def generate_inquiry(
 
     # Prevent duplicate concurrent generation
     if get_queue(stream_key) is not None:
-        raise HTTPException(409, "询价单正在生成中，请稍候")
+        if get_cancel_event(stream_key) is not None:
+            raise HTTPException(409, "询价单正在生成中，请稍候")
+        remove_queue(stream_key)  # stale queue from interrupted SSE
 
     get_or_create_queue(stream_key)
     get_or_create_cancel_event(stream_key)
@@ -785,7 +813,11 @@ def generate_inquiry_single(
     stream_key = f"inquiry-{order_id}-{supplier_id}"
 
     if get_queue(stream_key) is not None:
-        raise HTTPException(409, "该供应商询价单正在生成中")
+        # If cancel event still exists, a background thread is truly active → block
+        if get_cancel_event(stream_key) is not None:
+            raise HTTPException(409, "该供应商询价单正在生成中")
+        # Otherwise it's a stale queue (SSE disconnected before cleanup) → clear it
+        remove_queue(stream_key)
 
     get_or_create_queue(stream_key)
     get_or_create_cancel_event(stream_key)
@@ -969,6 +1001,7 @@ def download_order_file(
 @router.get("/{order_id}/inquiry-readiness")
 def inquiry_readiness(
     order_id: int,
+    template_overrides: str | None = Query(default=None, description="JSON: {supplier_id: template_id}"),
     current_user: User = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
@@ -981,7 +1014,16 @@ def inquiry_readiness(
     from services.orders.inquiry_agent import select_template, _build_order_data_for_engine
     from services.data.field_schema import analyze_gaps, schema_from_zone_config
     from core.models import SupplierTemplate
-    import sqlalchemy
+    import sqlalchemy, json
+
+    # Parse template overrides: {str(supplier_id): template_id}
+    parsed_overrides: dict[int, int] = {}
+    if template_overrides:
+        try:
+            raw = json.loads(template_overrides)
+            parsed_overrides = {int(k): int(v) for k, v in raw.items() if v is not None}
+        except Exception:
+            pass
 
     order = _get_order(db, order_id, current_user)
     if not order.match_results:
@@ -994,19 +1036,57 @@ def inquiry_readiness(
         if sid:
             products_by_supplier.setdefault(sid, []).append(p)
 
-    # Load all templates + supplier info
+    # Load all templates + supplier info (fetch all fields used by templates)
     all_templates = db.query(SupplierTemplate).all()
+    all_templates_by_id = {t.id: t for t in all_templates}
     supplier_ids = list(products_by_supplier.keys())
     supplier_rows = {}
     if supplier_ids:
         rows = db.execute(
-            sqlalchemy.text("SELECT id, name, contact, email, phone FROM suppliers WHERE id = ANY(:ids)"),
+            sqlalchemy.text(
+                "SELECT id, name, contact, email, phone, fax, address, zip_code,"
+                " default_payment_method, default_payment_terms"
+                " FROM suppliers WHERE id = ANY(:ids)"
+            ),
             {"ids": supplier_ids},
         ).fetchall()
         for row in rows:
-            supplier_rows[row[0]] = {"name": row[1], "contact": row[2], "email": row[3], "phone": row[4]}
+            supplier_rows[row[0]] = {
+                "name": row[1] or "", "contact": row[2] or "", "email": row[3] or "",
+                "phone": row[4] or "", "fax": row[5] or "", "address": row[6] or "",
+                "zip_code": row[7] or "", "default_payment_method": row[8] or "",
+                "default_payment_terms": row[9] or "",
+            }
 
-    order_meta = order.order_metadata or {}
+    order_meta = dict(order.order_metadata or {})
+
+    # Enrich order_meta with port location (same as _generate_single_supplier does)
+    if order.port_id:
+        p_row = db.execute(
+            sqlalchemy.text("SELECT name, location, code FROM ports WHERE id = :pid"),
+            {"pid": order.port_id},
+        ).fetchone()
+        if p_row:
+            order_meta.setdefault("port_name", p_row[0] or "")
+            order_meta.setdefault("delivery_address", p_row[1] or "")
+            order_meta.setdefault("port_code", p_row[2] or "")
+
+    # Pre-fetch default delivery location for delivery_info fields
+    delivery_info: dict = {}
+    try:
+        from core.models import DeliveryLocation
+        loc = db.query(DeliveryLocation).filter(DeliveryLocation.is_default == True).first()
+        if loc:
+            delivery_info = {
+                "name": loc.name, "address": loc.address,
+                "contact_person": loc.contact_person,
+                "contact_phone": loc.contact_phone,
+                "delivery_notes": loc.delivery_notes,
+                "ship_name_label": loc.ship_name_label,
+            }
+    except Exception:
+        pass
+
     inquiry_data = order.inquiry_data or {}
     existing_suppliers = inquiry_data.get("suppliers", {})
 
@@ -1017,10 +1097,18 @@ def inquiry_readiness(
 
     for sid, products in products_by_supplier.items():
         sid_str = str(sid)
-        info = supplier_rows.get(sid, {"name": f"供应商 #{sid}", "contact": "", "email": "", "phone": ""})
+        info = supplier_rows.get(sid, {"name": f"供应商 #{sid}", "contact": "", "email": "", "phone": "", "fax": "", "address": "", "zip_code": "", "default_payment_method": "", "default_payment_terms": ""})
 
-        # Template resolution
-        template, method, candidates = select_template(sid, all_templates)
+        # Template resolution — honour frontend override if provided
+        if sid in parsed_overrides:
+            override_tid = parsed_overrides[sid]
+            override_tpl = all_templates_by_id.get(override_tid)
+            if override_tpl:
+                template, method, candidates = override_tpl, "manual_override", [override_tpl]
+            else:
+                template, method, candidates = select_template(sid, all_templates)
+        else:
+            template, method, candidates = select_template(sid, all_templates)
 
         # Check for user template override in inquiry_data
         existing_entry = existing_suppliers.get(sid_str, {})
@@ -1028,7 +1116,8 @@ def inquiry_readiness(
 
         # Build order_data for gap analysis
         order_data = _build_order_data_for_engine(
-            order.id, order_meta, sid, products, info, _db=db,
+            order.id, order_meta, sid, products, info,
+            delivery_info=delivery_info, _db=db,
         )
 
         # Get field_schema
@@ -1047,8 +1136,18 @@ def inquiry_readiness(
                     field_schema = schema_from_zone_config(ts)
 
         # Gap analysis
-        if field_schema:
-            gap_report = analyze_gaps(field_schema, order_data, sid, field_overrides)
+        if has_zone_config and field_schema is not None:
+            if field_schema:
+                # Template has header fields → run gap analysis
+                gap_report = analyze_gaps(field_schema, order_data, sid, field_overrides)
+            else:
+                # Template has zone_config but empty header_fields (flat-table format,
+                # e.g. Korean template) — no header to fill, generation can proceed
+                gap_report = {
+                    "gaps": [],
+                    "summary": {"total": 0, "resolved": 0, "warnings": 0, "blocking": 0},
+                    "ready": True,
+                }
             if gap_report["ready"]:
                 status = "ready"
                 total_ready += 1
@@ -1066,6 +1165,20 @@ def inquiry_readiness(
             }
             status = "blocked"
             total_blocked += 1
+
+        # If product data fell back to snapshot (DB re-hydration failed), add a warning gap
+        if order_data.get("_data_stale"):
+            gap_report["gaps"].append({
+                "key": "data_freshness",
+                "cell": "_stale",
+                "label": "产品数据来自快照，建议重新匹配以获取最新价格",
+                "type": "text",
+                "category": "order",
+                "severity": "warning",
+                "current_value": None,
+            })
+            gap_report["summary"]["warnings"] = gap_report["summary"].get("warnings", 0) + 1
+            gap_report["summary"]["total"] = gap_report["summary"].get("total", 0) + 1
 
         # Compute subtotal
         subtotal = 0.0
@@ -1097,6 +1210,7 @@ def inquiry_readiness(
                 "has_zone_config": has_zone_config,
                 "candidate_count": len(candidates),
             },
+            "fields": gap_report.get("fields", []),
             "gaps": gap_report["gaps"],
             "gap_summary": gap_report["summary"],
             "file": existing_entry.get("file"),
@@ -1275,11 +1389,13 @@ def inquiry_data_preview(
         else:
             warnings.append("当前供应商没有已上架的 zone_config 模板，无法生成询价单")
 
-    # Data completeness warnings
+    # Data completeness warnings — only warn about unit_price if the template uses it
     missing_vals = sum(1 for h in header_fields if h["value"] is None)
-    empty_prices = sum(1 for p in product_preview if p.get("unit_price") is None)
-    if empty_prices:
-        warnings.append(f"{empty_prices} 个产品缺少单价")
+    template_uses_price = zone_config and "unit_price" in (zone_config.get("product_columns") or {}).values()
+    if template_uses_price:
+        empty_prices = sum(1 for p in product_preview if p.get("unit_price") is None)
+        if empty_prices:
+            warnings.append(f"{empty_prices} 个产品缺少单价")
 
     # Load existing field_overrides if any
     inquiry_data = order.inquiry_data or {}

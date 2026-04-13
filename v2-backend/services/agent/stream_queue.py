@@ -42,6 +42,12 @@ def push_event(session_id: str, event: dict[str, Any]) -> None:
 
 # ── Cancel signal ─────────────────────────────────────────────
 
+def get_cancel_event(session_id: str) -> threading.Event | None:
+    """Return existing cancel event without creating one, or None if not found."""
+    with _lock:
+        return _cancel_events.get(session_id)
+
+
 def get_or_create_cancel_event(session_id: str) -> threading.Event:
     with _lock:
         if session_id not in _cancel_events:
